@@ -294,6 +294,12 @@ static const char kCAMetalLayerInternalKey = 0;
 
 #else
 
+// Without Metal the properties are not implemented here: don't let the compiler synthesize them (their _device,
+// _pixelFormat, ... ivars would clash with CAMetalLayerInternal's in this file).
+@dynamic device, preferredDevice, pixelFormat, colorspace, framebufferOnly, drawableSize, presentsWithTransaction,
+	displaySyncEnabled, wantsExtendedDynamicRangeContent, EDRMetadata, maximumDrawableCount, allowsNextDrawableTimeout,
+	developerHUDProperties;
+
 MTL_UNSUPPORTED_CLASS
 
 #endif
