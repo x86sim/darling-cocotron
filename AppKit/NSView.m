@@ -266,18 +266,76 @@ typedef struct __VFlags {
         [coder encodeObject: NS_EXTRA(NSView, self)->_contentFilters forKey: @"NSViewContentFilters"];
         [coder encodeBool: NS_EXTRA(NSView, self)->_wantsBestResolutionOpenGLSurface
                    forKey: @"NSViewWantsBestResolutionOpenGLSurface"];
+
+        // Auto Layout state, under the keys nibs use: a flag for views laid out by constraints,
+        // the constraints that were set up in Interface Builder (the others are rebuilt by code),
+        // and the content hugging and compression resistance priorities when they are not the
+        // defaults, as {horizontal, vertical} sizes.
+        if (![self translatesAutoresizingMaskIntoConstraints])
+            [coder encodeBool: YES forKey: @"NSDoNotTranslateAutoresizingMask"];
+        NSMutableArray *archivedConstraints = nil;
+        for (NSLayoutConstraint *constraint in [self constraints]) {
+            if ([constraint shouldBeArchived]) {
+                if (archivedConstraints == nil)
+                    archivedConstraints = [NSMutableArray array];
+                [archivedConstraints addObject: constraint];
+            }
+        }
+        if (archivedConstraints != nil)
+            [coder encodeObject: archivedConstraints forKey: @"NSViewConstraints"];
+        NSSize hugging = NSMakeSize([self contentHuggingPriorityForOrientation: NSLayoutConstraintOrientationHorizontal],
+                                    [self contentHuggingPriorityForOrientation: NSLayoutConstraintOrientationVertical]);
+        if (hugging.width != NSLayoutPriorityDefaultLow || hugging.height != NSLayoutPriorityDefaultLow)
+            [coder encodeObject: NSStringFromSize(hugging) forKey: @"NSHuggingPriority"];
+        NSSize compression = NSMakeSize([self contentCompressionResistancePriorityForOrientation: NSLayoutConstraintOrientationHorizontal],
+                                        [self contentCompressionResistancePriorityForOrientation: NSLayoutConstraintOrientationVertical]);
+        if (compression.width != NSLayoutPriorityDefaultHigh || compression.height != NSLayoutPriorityDefaultHigh)
+            [coder encodeObject: NSStringFromSize(compression) forKey: @"NSAntiCompressionPriority"];
     } else {
         [NSException raise: NSInvalidArchiveOperationException
                     format: @"TODO: support unkeyed encoding in NSView"];
     }
 }
 
+// The Auto Layout state of a view archive: the translation of the autoresizing mask, the content
+// priorities and the constraints. It is shared with NSCustomView, which makes a view of a custom
+// class from the archive of a stand-in.
+- (void) _decodeAutoLayoutStateFromKeyedCoder: (NSKeyedUnarchiver *) coder {
+    // Auto Layout state. The nib key is the inverse of the property, and is only there for views
+    // that are laid out by constraints.
+    if ([coder containsValueForKey: @"NSDoNotTranslateAutoresizingMask"])
+        NS_EXTRA(NSView, self)->_translatesAutoresizingMaskIntoConstraints =
+                ![coder decodeBoolForKey: @"NSDoNotTranslateAutoresizingMask"];
+    if ([coder containsValueForKey: @"NSHuggingPriority"]) {
+        NSSize priorities = NSSizeFromString([coder decodeObjectForKey: @"NSHuggingPriority"]);
+
+        [self setContentHuggingPriority: priorities.width forOrientation: NSLayoutConstraintOrientationHorizontal];
+        [self setContentHuggingPriority: priorities.height forOrientation: NSLayoutConstraintOrientationVertical];
+    }
+    if ([coder containsValueForKey: @"NSAntiCompressionPriority"]) {
+        NSSize priorities = NSSizeFromString([coder decodeObjectForKey: @"NSAntiCompressionPriority"]);
+
+        [self setContentCompressionResistancePriority: priorities.width
+                                       forOrientation: NSLayoutConstraintOrientationHorizontal];
+        [self setContentCompressionResistancePriority: priorities.height
+                                       forOrientation: NSLayoutConstraintOrientationVertical];
+    }
+    // The items of the constraints are this view and its subviews, which are decoded by now.
+    [self addConstraints: [coder decodeObjectForKey: @"NSViewConstraints"]];
+}
+
 - initWithCoder: (NSCoder *) coder {
+    // Decoding the next responder (the superview) can decode the whole
+    // hierarchy around this view, and the superview then creates the layer of
+    // this still unfinished view from its alpha value. A nib that refers to a
+    // control before its superview (as the connectors of user defined runtime
+    // attributes do) reaches that state, so the alpha value must be set before
+    // the superclass decodes anything.
+    NS_EXTRA(NSView, self)->_alphaValue = 1.0;
     [super initWithCoder: coder];
 
-    // TODO: decode this
+    // The defaults; the Auto Layout state of the archive is decoded below.
     NS_EXTRA(NSView, self)->_translatesAutoresizingMaskIntoConstraints = YES;
-    NS_EXTRA(NSView, self)->_alphaValue = 1.0;
     NS_EXTRA(NSView, self)->_allowedTouchTypes = NSTouchTypeMaskDirect;
     [self _setDefaultLayoutPriorities];
 
@@ -361,7 +419,9 @@ typedef struct __VFlags {
         [self setCanDrawConcurrently:
                         [keyed decodeBoolForKey: @"NSViewCanDrawConcurrently"]];
 
-        // TODO: NSViewConstraints, NSViewLayoutGuides, ...
+        [self _decodeAutoLayoutStateFromKeyedCoder: keyed];
+
+        // TODO: NSViewLayoutGuides, ...
 
         NS_EXTRA(NSView, self)->_needsDisplay = YES;
         NS_EXTRA(NSView, self)->_invalidRectCount = 0;
@@ -1376,6 +1436,16 @@ static BOOL applyFrame(NSView *self, NSRect frame) {
     [NS_EXTRA(NSView, self)->_layerContext setFrame: layerFrame];
 
     invalidateTransform(self);
+
+    // QUIRK: a frame change marks both the view and its superview as needing display; a call that
+    // leaves the frame as it is marks neither. Not documented. Evidence: black-box observation on
+    // Mac OS X 10.14.4 (tier 2, MAC-EVIDENCE "setFrame: marks views for display"). macOS 26.7.3
+    // keeps both flags clear because every view is layer-backed there, but the window shows the
+    // view redrawn at its new size on both. The software window backing needs the repaint,
+    // otherwise a view that layout resizes keeps the pixels of its old size.
+    // Test: tests/appkit-view-set-frame-needs-display.m
+    [self setNeedsDisplay: YES];
+    [self->_superview setNeedsDisplay: YES];
     return YES;
 }
 

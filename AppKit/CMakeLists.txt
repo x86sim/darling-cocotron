@@ -47,8 +47,8 @@ find_package(OpenGL REQUIRED)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PC_CAIRO cairo)
-# The X11 backend exports the main menu on the host's D-Bus session bus, through
-# the dbus wrapper library of the native libdbus-1.
+# The main menu (X11 backend) and the status items (NSStatusItem) are exported on the
+# host's D-Bus session bus, through the dbus wrapper library of the native libdbus-1.
 pkg_check_modules(PC_DBUS REQUIRED dbus-1)
 pkg_check_modules(PC_FONTCONFIG fontconfig)
 
@@ -283,6 +283,8 @@ set(AppKit_sources
 
 	NSDocumentController.m
 	NSStatusItem.m
+	NSStatusItemNotifier.m
+	NSDBusMenu.m
 	NSPathComponentCell.m
 	NSCachedImageRep.m
 	NSWindow-Drag.m
@@ -412,12 +414,6 @@ set(AppKit_sources
 	NSCandidateListTouchBarItem.m
 	NSTouchBarItem.m
 	NSInspectorBarItemIdentifiers.m
-	NSLayoutConstraint.m
-	NSLayoutAnchor.m
-	NSAutoresizingMaskLayoutConstraint.m
-	NSContentSizeLayoutConstraint.m
-	NSIBPrototypingLayoutConstraint.m
-	NSDictionaryOfVariableBindings.m
 	NSSpeechSynthesizer.m
 	NSCustomTouchBarItem.m
 	NSGestureRecognizer.m
@@ -426,6 +422,7 @@ set(AppKit_sources
 	NSGroupTouchBarItem.m
 	NSKeyBindingManager.m
 	NSPasteboardItem.m
+	NSPasteboardHostBridge.m
 	NSPasteboardSupport.m
 	NSPopoverTouchBarItem.m
 	NSSpaceTouchBarItem.m
@@ -461,6 +458,7 @@ set(AppKit_sources
 	NSTabViewController.m
 	NSTableViewRowAction.m
 	NSLayoutGuide.m
+	NSViewLayoutConstants.m
 	NSPressGestureRecognizer.m
 	NSGridView.m
 	NSHaptics.m
@@ -577,6 +575,7 @@ add_framework(AppKit
 		system
 		CoreFoundation
 		Foundation
+		CoreAutoLayout
 		Onyx2D
 		CoreText
 		CoreData
@@ -591,14 +590,20 @@ add_framework(AppKit
 		CoreServices
 		UniformTypeIdentifiers
 		HIToolbox
+		dbus
 )
 
 reexport(AppKit Foundation ${CMAKE_BINARY_DIR}/src/external/foundation/Foundation)
 reexport(AppKit ApplicationServices ${CMAKE_BINARY_DIR}/src/frameworks/ApplicationServices/ApplicationServices)
+# AppKit re-exports the layout classes too, so that programs built for SDKs that declare them in AppKit bind them
+# with AppKit as the library
+reexport(AppKit CoreAutoLayout ${CMAKE_BINARY_DIR}/src/external/cocotron/CoreAutoLayout/CoreAutoLayout)
 reexport(AppKit UIFoundation ${CMAKE_BINARY_DIR}/src/private-frameworks/UIFoundation/UIFoundation)
 
 target_include_directories(AppKit PRIVATE
 	private-include
+	# NSLayoutConstraintInternal.h, the view-facing SPI of CoreAutoLayout's constraint class
+	${CMAKE_CURRENT_SOURCE_DIR}/../CoreAutoLayout
 )
 
 function(add_backend name)
@@ -635,7 +640,6 @@ add_backend(X11
 	SOURCES
 		X11.backend/X11Display.m
 		X11.backend/X11AppMenu.m
-		X11.backend/X11DBusMenu.m
 		X11.backend/X11Window.m
 		X11.backend/X11SubWindow.m
 		X11.backend/X11Event.m
@@ -657,7 +661,6 @@ add_backend(X11
 		QuartzCore
 		# native libraries
                 X11
-		dbus
 		Xext
 		XRandR
 		Xcursor
