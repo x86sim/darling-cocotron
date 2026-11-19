@@ -18,8 +18,10 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSApplication.h>
 #import <AppKit/NSDisplay.h>
+#import "DarlingPortalFileChooser.h"
 #import <AppKit/NSOpenPanel.h>
 #import <Foundation/NSURL.h>
+#import "_NSSavePanelNavigation.h"
 
 @interface NSSavePanel (Private)
 - (void) _setFilename: (NSString *) filename;
@@ -29,13 +31,20 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
 @implementation NSOpenPanel
 
+// QUIRK: an open panel's title is hidden although the window has one, its prompt is "Open", its message is
+// empty and its style mask is 0x8109: titled and resizable with two bits that have no public name. Not
+// documented. Evidence: black-box observation of -title, -prompt, -message, -styleMask and
+// -titleVisibility of a new open panel on macOS 10.14.4 (tier 2). Test: appkit-panel-default-values.m
 - (id) resetToDefaultValues {
     self = [super resetToDefaultValues];
     _filenames = [NSArray new];
-    [_dialogTitle release];
-    _dialogTitle = [NSLocalizedStringFromTableInBundle(
+    NSString *open = NSLocalizedStringFromTableInBundle(
             @"Open", nil, [NSBundle bundleForClass: [NSOpenPanel class]],
-            @"The title of the open panel") copy];
+            @"The title of the open panel");
+    [self setStyleMask: 0x8109];
+    [self setTitleVisibility: NSWindowTitleHidden];
+    [self setTitle: open];
+    [self setPrompt: open];
     _allowsMultipleSelection = NO;
     _canChooseDirectories = NO;
     _canChooseFiles = YES;
@@ -58,6 +67,7 @@ static NSOpenPanel *_newPanel = nil;
                               defer: YES];
     } else {
         [NSBundle loadNibNamed: @"NSOpenPanel" owner: self];
+        [_newPanel _installNavigation];
     }
     // FIXME: release it?
     return [_newPanel resetToDefaultValues];
@@ -105,6 +115,17 @@ static NSOpenPanel *_newPanel = nil;
         _filenames = copy;
     }
     [super _setFilename: [paths firstObject]];
+}
+
+// What the file list lets the user select: folders can always be entered;
+// files need canChooseFiles and a matching allowed type; a package counts as
+// a file, or as a folder when folders may be chosen.
+- (BOOL) _canSelectURL: (NSURL *) url isDirectory: (BOOL) isDirectory {
+    BOOL package = isDirectory && [self _packageAtURL: url];
+    if (isDirectory && !package)
+        return YES;
+    BOOL fileAllowed = _canChooseFiles && [self _fileURLMatchesAllowedTypes: url];
+    return package ? fileAllowed || _canChooseDirectories : fileAllowed;
 }
 
 // Open accepts only what the panel may choose. With nothing selected, a
@@ -157,7 +178,10 @@ static NSOpenPanel *_newPanel = nil;
                                runModalForDirectory: [self directory]
                                                file: [self filename]
                                               types: [self allowedFileTypes]];
+    } else if (DarlingPortalRunModal(self, &res)) {
+        // The desktop's file chooser ran it.
     } else {
+        [[_NSSavePanelNavigation navigationForPanel: self] panelWillShow];
         // Like macOS, show the panel centered rather than at the (screen-clamped) origin saved in its nib.
         [self center];
         res = [NSApp runModalForWindow: self];

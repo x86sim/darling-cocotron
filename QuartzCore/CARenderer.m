@@ -23,23 +23,70 @@ NSString *const kCARendererColorSpace = @"kCARendererColorSpace";
 @implementation CARenderer
 
 - (CGRect) bounds {
-    return _bounds;
+    return NS_EXTRA(CARenderer, self)->_bounds;
 }
 
 - (void) setBounds: (CGRect) value {
-    _bounds = value;
+    NS_EXTRA(CARenderer, self)->_bounds = value;
 }
 
-@synthesize layer = _rootLayer;
+NS_EXTRA_SYNTHESIZE_RETAIN(CARenderer, layer, _rootLayer, CALayer *, layer, setLayer:)
 
 - (void) _setClearsToTransparent: (BOOL) value {
-    _clearsToTransparent = value;
+    NS_EXTRA(CARenderer, self)->_clearsToTransparent = value;
+}
+
+- (void) _setBackdropImage: (CGImageRef) image {
+    if (image != NULL)
+        CGImageRetain(image);
+    CGImageRelease(NS_EXTRA(CARenderer, self)->_backdropImage);
+    NS_EXTRA(CARenderer, self)->_backdropImage = image;
+}
+
+- (void) dealloc {
+    // The texture goes with the GL context, which may not be current here.
+    CGImageRelease(NS_EXTRA(CARenderer, self)->_backdropImage);
+    NS_EXTRA_FREE(CARenderer, self);
+    [super dealloc];
+}
+
+// Draws the backdrop over the whole drawable, in clip coordinates.
+- (void) _drawBackdrop {
+    if (NS_EXTRA(CARenderer, self)->_backdropImage == NULL)
+        return;
+    if (NS_EXTRA(CARenderer, self)->_backdropTexture == 0)
+        glGenTextures(1, &NS_EXTRA(CARenderer, self)->_backdropTexture);
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, NS_EXTRA(CARenderer, self)->_backdropTexture);
+    CATexImage2DCGImage(NS_EXTRA(CARenderer, self)->_backdropImage);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+
+    // Texture row 0 is the top of the image, which is the top of the drawable.
+    static const GLfloat texture[4 * 2] = {0, 1, 1, 1, 0, 0, 1, 0};
+    static const GLfloat vertices[4 * 2] = {-1, -1, 1, -1, -1, 1, 1, 1};
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(2, GL_FLOAT, 0, texture);
+    glVertexPointer(2, GL_FLOAT, 0, vertices);
+    glColor4f(1, 1, 1, 1);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisable(GL_TEXTURE_2D);
+    glPopMatrix();
 }
 
 - initWithCGLContext: (void *) cglContext options: (NSDictionary *) options {
-    _cglContext = cglContext;
-    _bounds = CGRectZero;
-    _rootLayer = nil;
+    NS_EXTRA(CARenderer, self)->_cglContext = cglContext;
+    NS_EXTRA(CARenderer, self)->_bounds = CGRectZero;
+    NS_EXTRA(CARenderer, self)->_rootLayer = nil;
     return self;
 }
 
@@ -70,7 +117,7 @@ static void startAnimationsInLayer(CALayer *layer, CFTimeInterval currentTime) {
 - (void) beginFrameAtTime: (CFTimeInterval) currentTime
                 timeStamp: (CVTimeStamp *) timeStamp
 {
-    startAnimationsInLayer(_rootLayer, currentTime);
+    startAnimationsInLayer(NS_EXTRA(CARenderer, self)->_rootLayer, currentTime);
 }
 
 static CGFloat applyMediaTimingFunction(CAMediaTimingFunction *function,
@@ -500,7 +547,7 @@ static uint32_t texImage2DIOSurface(CGLContextObj context,
 
     if (upload) {
         if (surface != NULL) {
-            [layer _setTextureSeed: texImage2DIOSurface(_cglContext, surface)];
+            [layer _setTextureSeed: texImage2DIOSurface(NS_EXTRA(CARenderer, self)->_cglContext, surface)];
         } else {
             CATexImage2DCGImage((CGImageRef) contents);
         }
@@ -625,14 +672,17 @@ static void displayLayerTreeIfNeeded(CALayer *layer) {
 }
 
 - (void) render {
-    [_rootLayer layoutIfNeeded];
-    displayLayerTreeIfNeeded(_rootLayer);
+    [NS_EXTRA(CARenderer, self)->_rootLayer layoutIfNeeded];
+    displayLayerTreeIfNeeded(NS_EXTRA(CARenderer, self)->_rootLayer);
 
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    glClearColor(0, 0, 0, _clearsToTransparent ? 0 : 1);
+    glClearColor(0, 0, 0, NS_EXTRA(CARenderer, self)->_clearsToTransparent ? 0 : 1);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    [self _drawBackdrop];
 
     // Painter's order instead of depth testing: every layer used to get z+1,
     // which put layers nested two or more deep outside the [-1, 1] depth range
@@ -647,10 +697,10 @@ static void displayLayerTreeIfNeeded(CALayer *layer) {
     glAlphaFunc(GL_GREATER, 0);
     glEnable(GL_ALPHA_TEST);
 
-    [self _renderLayer: _rootLayer
+    [self _renderLayer: NS_EXTRA(CARenderer, self)->_rootLayer
             currentTime: CACurrentMediaTime()
           parentOpacity: 1.0
-          parentFlipped: [_rootLayer.superlayer contentsAreFlipped]];
+          parentFlipped: [NS_EXTRA(CARenderer, self)->_rootLayer.superlayer contentsAreFlipped]];
 
     glFlush();
 }

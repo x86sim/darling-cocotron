@@ -189,43 +189,39 @@ static BOOL KTUIFontSpecForType(CTFontUIFontType type, KTUIFontSpec *spec) {
     }
 }
 
-- (void) getAdvancements: (CGSize *) advancements
-               forGlyphs: (const CGGlyph *) glyphs
-                   count: (NSUInteger) count
-{
-    O2Font_freetype *o2Font = (O2Font_freetype *) _font;
-    @synchronized(o2Font) {
-        FT_Face face = [o2Font face];
-
-        int i;
-        FT_Set_Pixel_Sizes(face, _size, _size);
-
-        for (i = 0; i < count; i++) {
-            FT_Load_Glyph(face, glyphs[i], FT_LOAD_DEFAULT);
-            advancements[i] = CGSizeMake(face->glyph->advance.x / (O2Float)(2 << 5),
-                           face->glyph->advance.y / (O2Float)(2 << 5));
-        }
-    }
-}
-
+// The advance of the glyph for layout: the unscaled and unhinted design width at
+// the exact point size (the layout code takes it as the glyph's own advance).
 - (CGPoint) positionOfGlyph: (CGGlyph) current
             precededByGlyph: (CGGlyph) previous
                   isNominal: (BOOL *) isNominalp
 {
+    *isNominalp = YES;
+
+    if (!current)
+        return NSZeroPoint;
+
+    CGSize advance = CGSizeZero;
+    [self getAdvancements: &advance forGlyphs: &current count: 1];
+    // The kerning with the glyph before is folded into the width of the glyph
+    // that follows it, so the widths of a run still add up to the kerned line.
+    return CGPointMake(advance.width + [self kerningBetweenGlyph: previous andGlyph: current],
+                       advance.height);
+}
+
+// Pair kerning from the face's kern table, in design units scaled to the
+// exact point size. Fonts that carry their pair adjustments only in OpenType
+// layout tables (GPOS) have none here.
+- (CGFloat) kerningBetweenGlyph: (CGGlyph) first andGlyph: (CGGlyph) second {
+    if (first == 0 || second == 0 || _unitsPerEm == 0)
+        return 0;
     O2Font_freetype *o2Font = (O2Font_freetype *) _font;
     @synchronized(o2Font) {
         FT_Face face = [o2Font face];
-
-        *isNominalp = YES;
-
-        if (!current)
-            return NSZeroPoint;
-
-        FT_Set_Pixel_Sizes(face, _size, _size);
-
-        FT_Load_Glyph(face, current, FT_LOAD_DEFAULT);
-        return NSMakePoint(face->glyph->advance.x / (O2Float)(2 << 5),
-                           face->glyph->advance.y / (O2Float)(2 << 5));
+        FT_Vector delta;
+        if (face == NULL || !FT_HAS_KERNING(face) ||
+            FT_Get_Kerning(face, first, second, FT_KERNING_UNSCALED, &delta) != 0)
+            return 0;
+        return delta.x * _size / _unitsPerEm;
     }
 }
 

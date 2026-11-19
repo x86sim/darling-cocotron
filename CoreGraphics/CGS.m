@@ -29,6 +29,10 @@
 #include <stdio.h>
 #include <CoreFoundation/CFNotificationCenter.h>
 #include <notify.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
 
 static NSMutableDictionary<NSNumber*, CGSConnection*>* g_connections = nil;
 static Boolean g_denyConnections = FALSE;
@@ -124,6 +128,8 @@ static void _CGSLoadBackendOnce(void)
 	});
 }
 
+static void registerProcessConnection(void);
+
 CGError CGSNewConnection(CGSDictionaryObj attribs, CGSConnectionID* connId)
 {
 	*connId = -1;
@@ -142,6 +148,7 @@ CGError CGSNewConnection(CGSDictionaryObj attribs, CGSConnectionID* connId)
 	if (conn != nil)
 	{
 		*connId = newConnID;
+		registerProcessConnection();
 		@synchronized(g_connections)
 		{
 			[g_connections setObject: conn forKey: [NSNumber numberWithInt: newConnID]];
@@ -153,10 +160,87 @@ CGError CGSNewConnection(CGSDictionaryObj attribs, CGSConnectionID* connId)
 		return kCGErrorFailure;
 }
 
+// The window server registry of processes that checked in: a process that opened a connection to
+// the window system records itself under a libnotify name of its own pid. The state is the
+// process' start time (in clock ticks since boot), so the entry of a process that ended is not
+// taken for the one that got its pid afterwards. Both sides run without the window system.
+static uint64_t processStartTime(pid_t pid)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/stat", (int) pid);
+	FILE* file = fopen(path, "r");
+	if (file == NULL)
+		return 0;
+
+	char line[1024];
+	size_t length = fread(line, 1, sizeof(line) - 1, file);
+	fclose(file);
+	line[length] = 0;
+
+	// The process name (field 2) is in parentheses and may contain anything; the start time is
+	// field 22, that is the 20th field after the closing parenthesis.
+	char* cursor = strrchr(line, ')');
+	if (cursor == NULL)
+		return 0;
+	for (int field = 0; field < 20 && cursor != NULL; field++)
+	{
+		cursor = strchr(cursor + 1, ' ');
+		if (cursor == NULL)
+			return 0;
+	}
+	return strtoull(cursor + 1, NULL, 10);
+}
+
+static BOOL registryName(pid_t pid, char* name, size_t size)
+{
+	return snprintf(name, size, kCGSProcessConnectionNotificationPrefix "%d", (int) pid) < (int) size;
+}
+
+static void registerProcessConnection(void)
+{
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		char name[64];
+		int token;
+		uint64_t start = processStartTime(getpid());
+
+		if (!registryName(getpid(), name, sizeof(name)) ||
+			notify_register_check(name, &token) != NOTIFY_STATUS_OK)
+			return;
+		notify_set_state(token, start != 0 ? start : 1);
+		// The token stays registered; the entry is replaced by the next process with this pid.
+	});
+}
+
+Boolean _CGSProcessHasConnection(pid_t pid)
+{
+	if (pid <= 0 || (kill(pid, 0) != 0 && errno != EPERM))
+		return false;
+
+	char name[64];
+	int token;
+	uint64_t state = 0;
+
+	if (!registryName(pid, name, sizeof(name)) || notify_register_check(name, &token) != NOTIFY_STATUS_OK)
+		return false;
+	if (notify_get_state(token, &state) != NOTIFY_STATUS_OK)
+		state = 0;
+	notify_cancel(token);
+	if (state == 0)
+		return false;
+
+	uint64_t start = processStartTime(pid);
+	return start == 0 ? state == 1 : state == start;
+}
+
 CGError _CGSActivateProcess(pid_t pid, uint32_t options)
 {
 	if (pid <= 0)
 		return kCGErrorIllegalArgument;
+
+	// A process that never connected to the window system has no windows to activate.
+	if (pid != getpid() && !_CGSProcessHasConnection(pid))
+		return kCGErrorCannotComplete;
 
 	// The display server first, directly. Whatever it cannot do (it has no such request, or the
 	// process has no window of its own kind there, as a Wayland client has none on an X server
@@ -177,6 +261,73 @@ CGError _CGSActivateProcess(pid_t pid, uint32_t options)
 	return kCGErrorSuccess;
 }
 
+#define kCGSProcessHiddenNotificationPrefix "org.darlinghq.process-hidden."
+
+CGError _CGSSendProcessCommand(pid_t pid, uint32_t command)
+{
+	const char* prefix;
+
+	switch (command)
+	{
+		case kCGSProcessCommandHide: prefix = kCGSProcessHideNotificationPrefix; break;
+		case kCGSProcessCommandUnhide: prefix = kCGSProcessUnhideNotificationPrefix; break;
+		case kCGSProcessCommandQuit: prefix = kCGSProcessQuitNotificationPrefix; break;
+		default: return kCGErrorIllegalArgument;
+	}
+	if (pid <= 0)
+		return kCGErrorIllegalArgument;
+	if (pid != getpid() && !_CGSProcessHasConnection(pid))
+		return kCGErrorCannotComplete;
+
+	// libnotify, as the registry and the hidden state: the Darwin center of CFNotificationCenter does
+	// not reach other processes.
+	char name[96];
+	snprintf(name, sizeof(name), "%s%d", prefix, (int) pid);
+	return notify_post(name) == NOTIFY_STATUS_OK ? kCGErrorSuccess : kCGErrorCannotComplete;
+}
+
+// The state of the process' libnotify name is its start time while its application is hidden, else
+// 0, so a later process with the same pid does not inherit it. The process is the only writer.
+void _CGSSetProcessHidden(Boolean hidden)
+{
+	static dispatch_once_t once;
+	static int token = -1;
+
+	dispatch_once(&once, ^{
+		char name[64];
+
+		snprintf(name, sizeof(name), kCGSProcessHiddenNotificationPrefix "%d", (int) getpid());
+		if (notify_register_check(name, &token) != NOTIFY_STATUS_OK)
+			token = -1;
+	});
+	if (token < 0)
+		return;
+	uint64_t start = processStartTime(getpid());
+	notify_set_state(token, hidden ? (start != 0 ? start : 1) : 0);
+}
+
+Boolean _CGSProcessIsHidden(pid_t pid)
+{
+	if (pid <= 0 || (kill(pid, 0) != 0 && errno != EPERM))
+		return false;
+
+	char name[64];
+	int token;
+	uint64_t state = 0;
+
+	snprintf(name, sizeof(name), kCGSProcessHiddenNotificationPrefix "%d", (int) pid);
+	if (notify_register_check(name, &token) != NOTIFY_STATUS_OK)
+		return false;
+	if (notify_get_state(token, &state) != NOTIFY_STATUS_OK)
+		state = 0;
+	notify_cancel(token);
+	if (state == 0)
+		return false;
+
+	uint64_t start = processStartTime(pid);
+	return start == 0 ? state == 1 : state == start;
+}
+
 // The process that was activated last, for a display server that cannot be asked: the state of a
 // libnotify name, which is shared by all processes.
 static int frontProcessToken(void)
@@ -188,6 +339,60 @@ static int frontProcessToken(void)
 			token = -1;
 	});
 	return token;
+}
+
+// Whether each process has the input focus is kept by the process itself, under a libnotify name
+// of its own pid (state: its start time while it has the focus, 0 once it resigned), so that no
+// two processes ever write the same state; the front process name only says who reported last.
+static BOOL focusName(pid_t pid, char* name, size_t size)
+{
+	return snprintf(name, size, "org.darlinghq.process-focus.%d", (int) pid) < (int) size;
+}
+
+static CGError setProcessFocus(pid_t pid, BOOL focused)
+{
+	static pid_t token_pid;
+	static int token = -1;
+	char name[64];
+
+	@synchronized([CGSConnection class])
+	{
+		if (token < 0 || token_pid != pid)
+		{
+			// The names of other processes' pids are only set on their behalf; the token of the
+			// previous pid is not needed any more.
+			if (token >= 0)
+				notify_cancel(token);
+			token = -1;
+			if (!focusName(pid, name, sizeof(name)) || notify_register_check(name, &token) != NOTIFY_STATUS_OK)
+			{
+				token = -1;
+				return kCGErrorCannotComplete;
+			}
+			token_pid = pid;
+		}
+		uint64_t start = processStartTime(pid);
+		if (notify_set_state(token, focused ? (start != 0 ? start : 1) : 0) != NOTIFY_STATUS_OK)
+			return kCGErrorCannotComplete;
+	}
+	return kCGErrorSuccess;
+}
+
+static BOOL processHasFocus(pid_t pid)
+{
+	char name[64];
+	int token;
+	uint64_t state = 0;
+
+	if (!focusName(pid, name, sizeof(name)) || notify_register_check(name, &token) != NOTIFY_STATUS_OK)
+		return NO;
+	if (notify_get_state(token, &state) != NOTIFY_STATUS_OK)
+		state = 0;
+	notify_cancel(token);
+	if (state == 0)
+		return NO;
+	uint64_t start = processStartTime(pid);
+	return start == 0 ? state == 1 : state == start;
 }
 
 CGError _CGSGetFrontProcess(pid_t* pid)
@@ -213,7 +418,7 @@ CGError _CGSGetFrontProcess(pid_t* pid)
 	uint64_t state = 0;
 	if (token < 0 || notify_get_state(token, &state) != NOTIFY_STATUS_OK)
 		return kCGErrorCannotComplete;
-	if (state == 0 || state > INT32_MAX)
+	if (state == 0 || state > INT32_MAX || !processHasFocus((pid_t) state))
 		return kCGErrorNoneAvailable;
 	*pid = (pid_t) state;
 	return kCGErrorSuccess;
@@ -225,8 +430,25 @@ CGError _CGSSetFrontProcess(pid_t pid)
 		return kCGErrorIllegalArgument;
 
 	int token = frontProcessToken();
+	CGError err = setProcessFocus(pid, YES);
+	if (err != kCGErrorSuccess)
+		return err;
 	if (token < 0 || notify_set_state(token, (uint64_t) pid) != NOTIFY_STATUS_OK)
 		return kCGErrorCannotComplete;
+	// Every process that follows the front process (see kCGSFrontProcessNotificationName) asks again.
+	notify_post(kCGSFrontProcessNotificationName);
+	return kCGErrorSuccess;
+}
+
+CGError _CGSResignFrontProcess(pid_t pid)
+{
+	if (pid <= 0)
+		return kCGErrorIllegalArgument;
+
+	CGError err = setProcessFocus(pid, NO);
+	if (err != kCGErrorSuccess)
+		return err;
+	notify_post(kCGSFrontProcessNotificationName);
 	return kCGErrorSuccess;
 }
 
@@ -600,6 +822,45 @@ CGError CGSSetSurfaceBounds(CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID s
 		return err;
 
 	return [surface setBounds: rect];
+}
+
+// QUIRK: a failed CGSGetWindowBounds() reports kCGErrorFailure for a window
+// that does not exist, and sets the result to CGRectNull. Not documented.
+// Evidence: black-box observation on macOS 26.7.3 (tier 2).
+// Test: coregraphics-cgs-bounds.c (test_quirk_missing_window_bounds).
+CGError CGSGetWindowBounds(CGSConnectionID cid, CGSWindowID wid, CGRect *outBounds)
+{
+	if (outBounds == NULL)
+		return kCGErrorIllegalArgument;
+
+	CGSWindow* window;
+	CGError err = getWindow(cid, wid, &window);
+
+	if (err == kCGErrorIllegalArgument) {
+		*outBounds = CGRectNull;
+		return kCGErrorFailure;
+	}
+	if (err != kCGSErrorSuccess)
+		return err;
+
+	return [window getRect: outBounds];
+}
+
+// The bounds last given to CGSSetSurfaceBounds(). QUIRK: until then they are
+// CGRectNull. Not documented. Evidence: black-box observation on macOS 26.7.3
+// (tier 2). Test: coregraphics-cgs-bounds.c (test_quirk_surface_bounds_null).
+CGError CGSGetSurfaceBounds(CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID sid, CGRect *outBounds)
+{
+	if (outBounds == NULL)
+		return kCGErrorIllegalArgument;
+
+	CGSSurface* surface;
+	CGError err = getSurface(cid, wid, sid, &surface);
+
+	if (err != kCGSErrorSuccess)
+		return err;
+
+	return [surface getBounds: outBounds];
 }
 
 CGSConnection* _CGSConnectionFromEventRecord(const CGSEventRecordPtr record)

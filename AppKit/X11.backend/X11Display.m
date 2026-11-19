@@ -51,6 +51,7 @@
 #import "../private-include/AppKit/CarbonKeys.h"
 #import <CoreGraphics/CGSKeySymToUnicodePrivate.h>
 #import "X11KeyEvent.h"
+#import "X11Touch.h"
 #import <X11/XKBlib.h>
 #import <X11/Xutil.h>
 #import <X11/extensions/XKBrules.h>
@@ -198,6 +199,8 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer,
         if (XRRQueryExtension(_display, &_rrEventBase, &errorBase)) {
             XRRSelectInput(_display, DefaultRootWindow(_display), X11_RANDR_EVENT_MASK);
         }
+
+        X11TouchInit(_display);
 
         int xwaylandOpcode, xwaylandEvent, xwaylandError;
         _isXwayland = XQueryExtension(_display, "XWAYLAND", &xwaylandOpcode,
@@ -761,6 +764,23 @@ static void crtcBoundingBox(Display *display, XRRScreenResources *resources, RRC
     return dict;
 }
 
+- (void) textInputCandidateRectChangedInWindow: (NSWindow *) window {
+    X11Window *platformWindow = (X11Window *) [window platformWindow];
+
+    if ([platformWindow isKindOfClass: [X11Window class]])
+        [platformWindow updateInputMethodSpot];
+}
+
+// The file chooser portal names a parent window of an X11 client as "x11:"
+// and the window's id in hexadecimal.
+- (NSString *) portalParentHandleForWindow: (NSWindow *) window {
+    X11Window *platformWindow = (X11Window *) [window platformWindow];
+
+    if (![platformWindow isKindOfClass: [X11Window class]])
+        return nil;
+    return [NSString stringWithFormat: @"x11:%lx", (unsigned long) [platformWindow windowHandle]];
+}
+
 - (int) keyboardLayoutId {
     int major = XkbMajorVersion, minor = XkbMinorVersion;
     XkbStateRec state;
@@ -908,6 +928,12 @@ static void crtcBoundingBox(Display *display, XRRScreenResources *resources, RRC
     // shape = XC_left_ptr;
     else if ([name isEqualToString: @"IBeamCursor"])
         xname = "xterm";
+    else if ([name isEqualToString: @"IBeamCursorForVerticalLayout"])
+        xname = "vertical-text";
+    else if ([name isEqualToString: @"zoomInCursor"])
+        xname = "zoom-in";
+    else if ([name isEqualToString: @"zoomOutCursor"])
+        xname = "zoom-out";
     else if ([name isEqualToString: @"openHandCursor"])
         xname = "fleur";
     else if ([name isEqualToString: @"pointingHandCursor"])
@@ -1105,6 +1131,17 @@ static void crtcBoundingBox(Display *display, XRRScreenResources *resources, RRC
 #endif
 
     return result;
+}
+
+// With ControlKeyActsAsCommand set, Control+C, V and X (without Command or
+// Option; Shift is kept) are the copy, paste and cut shortcuts of macOS; every
+// other Control chord is left alone.
+- (BOOL) controlStandsInForCommand: (NSEventModifierFlags) flags
+                       keyEquivalent: (unichar) key
+{
+    return _controlActsAsCommand && (flags & NSControlKeyMask) &&
+           !(flags & (NSCommandKeyMask | NSAlternateKeyMask)) &&
+           (key == 'c' || key == 'v' || key == 'x');
 }
 
 - (NSEventModifierFlags) modifierFlagsForState: (unsigned int) state {
@@ -1464,6 +1501,29 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
     return NSMakePoint(point.x, point.y);
 }
 
+// The window has the input focus: tell the NSWindow it is active, which makes it the key window unless
+// the rule in -[NSWindow platformWindowActivated:displayIfNeeded:] keeps the key status where it is.
+// Reached by FocusIn, and by -[X11Window makeKey] when the window already held the focus.
+- (void) windowHoldsFocus: (X11Window *) window {
+    id delegate = [window delegate];
+
+    if (lastFocusedWindow) {
+        [lastFocusedWindow platformWindowDeactivated: window
+                             checkForAppDeactivation: NO];
+        lastFocusedWindow = nil;
+    }
+    if (window != nil)
+        window->_receivingFocus = YES;
+    [delegate platformWindowActivated: window displayIfNeeded: YES];
+    if (window != nil)
+        window->_receivingFocus = NO;
+    lastFocusedWindow = delegate;
+    if (window != nil && window->_xic != NULL) {
+        XSetICFocus(window->_xic);
+        [window updateInputMethodSpot];
+    }
+}
+
 - (void) postXEvent: (XEvent *) ev {
     id event = nil;
     NSEventType type;
@@ -1575,19 +1635,17 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
         // Command or Option, arrive as Command+C, V and X, whose characters
         // are the letters rather than control codes. Other Control
         // combinations are left alone.
-        if (_controlActsAsCommand && (modifierFlags & NSControlKeyMask) &&
-            !(modifierFlags & (NSCommandKeyMask | NSAlternateKeyMask))) {
-            KeySym lower = shortcutKeySym;
-            if (lower >= XK_A && lower <= XK_Z)
-                lower += XK_a - XK_A;
-            if (lower == XK_c || lower == XK_v || lower == XK_x) {
-                modifierFlags = (modifierFlags & ~NSControlKeyMask) | NSCommandKeyMask;
-                if (text != buf)
-                    free(text);
-                text = buf;
-                buf[0] = (char) shortcutKeySym;
-                buf[1] = 0;
-            }
+        KeySym lower = shortcutKeySym;
+        if (lower >= XK_A && lower <= XK_Z)
+            lower += XK_a - XK_A;
+        if (lower < 0x100 && [self controlStandsInForCommand: modifierFlags
+                                                keyEquivalent: (unichar) lower]) {
+            modifierFlags = (modifierFlags & ~NSControlKeyMask) | NSCommandKeyMask;
+            if (text != buf)
+                free(text);
+            text = buf;
+            buf[0] = (char) shortcutKeySym;
+            buf[1] = 0;
         }
 
         // Arrow, function and editing keys produce no text; AppKit reports
@@ -1623,6 +1681,19 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
         const int carbonKeyCode = ev->xkey.keycode < 256
                 ? x11ToCarbon[ev->xkey.keycode] : 0;
 
+        // Key events belong to the key window whichever window of the application holds the X focus.
+        // That matters when the key window is one with alpha 0, which does not get the focus once the
+        // window manager moves it to a window that was ordered in. Menus and pop-ups that hold the
+        // focus keep the keys.
+        NSInteger keyEventWindowNumber = [delegate windowNumber];
+        {
+            NSWindow *keyWindow = [NSApp keyWindow];
+            id keyPlatformWindow = [keyWindow platformWindow];
+            if (window != nil && ![window isMenuOrPopup] && keyPlatformWindow != window &&
+                [keyPlatformWindow isKindOfClass: [X11Window class]] && [keyPlatformWindow isMapped])
+                keyEventWindowNumber = [keyWindow windowNumber];
+        }
+
         BOOL isARepeat = NO;
 
         if (ev->type == KeyPress) {
@@ -1637,7 +1708,7 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
                                     location: pos
                                modifierFlags: modifierFlags
                                    timestamp: 0.0
-                                windowNumber: [delegate windowNumber]
+                                windowNumber: keyEventWindowNumber
                                      context: nil
                                   characters: str
                  charactersIgnoringModifiers: strIg
@@ -1922,19 +1993,7 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
             [[delegate attachedSheet] makeKeyAndOrderFront: delegate];
             break;
         }
-        if (lastFocusedWindow) {
-            [lastFocusedWindow platformWindowDeactivated: window
-                                 checkForAppDeactivation: NO];
-            lastFocusedWindow = nil;
-        }
-        if (window != nil)
-            window->_receivingFocus = YES;
-        [delegate platformWindowActivated: window displayIfNeeded: YES];
-        if (window != nil)
-            window->_receivingFocus = NO;
-        lastFocusedWindow = delegate;
-        if (window != nil)
-            XSetICFocus(window->_xic);
+        [self windowHoldsFocus: window];
         [self resyncModifierKeysOnFocusIn: window];
         // Losing the focus released the pointer grab; the application still
         // wants relative mode.
@@ -2167,7 +2226,8 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
         break;
 
     case GenericEvent:
-        NSLog(@"GenericEvent");
+        if (!X11TouchHandleEvent(self, ev))
+            NSLog(@"GenericEvent");
         break;
 
     default:

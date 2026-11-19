@@ -20,6 +20,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/AppKitIvarLayout.h>
 #import <AppKit/NSWindow.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 enum {
     NSUtilityWindowMask = 0x10,
     NSDocModalWindowMask = 0x40,
@@ -52,6 +54,8 @@ enum {
 };
 
 enum { NSCancelButton, NSOKButton };
+
+NS_ASSUME_NONNULL_END
 
 APPKIT_EXPORT NSInteger NSRunAlertPanel(NSString *title, NSString *message,
                                         NSString *defaultButton,

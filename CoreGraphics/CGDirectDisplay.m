@@ -285,6 +285,16 @@ CGError CGDisplayShowCursor(CGDirectDisplayID displayIndex) {
     return kCGErrorSuccess;
 }
 
+// Callers pass the connection id and nothing else, and do not use a result;
+// the function returns nothing on macOS. Seen in use around
+// CGDisplayHideCursor()/CGDisplayShowCursor() pairs, which fits "show the
+// cursor whatever the hide count was". The effect itself is not observable
+// from outside; this is the minimal reading of the name.
+// Test: coregraphics-cgs-force-show-cursor.m.
+void CGSForceShowCursor(CGSConnectionID cid) {
+    [currentDisplay() forceShowCursor];
+}
+
 boolean_t CGDisplayIsInMirrorSet(CGDirectDisplayID display) {
     printf("STUB %s\n", __PRETTY_FUNCTION__);
 
@@ -1230,9 +1240,27 @@ CGColorSpaceRef CGDisplayCopyColorSpace(CGDirectDisplayID display) {
     return CGColorSpaceCreateDeviceRGB();
 }
 
-CGImageRef CGDisplayCreateImage(CGDirectDisplayID displayID) {
-    // Screen capture is not implemented; the function may return NULL.
+CGImageRef CGDisplayCreateImageForRect(CGDirectDisplayID display, CGRect rect) {
+    // Only an existing display and a non-empty part of it can be captured.
+    NSDisplay *host = currentDisplay();
+    if (!host || !screenForDisplayID([host screens], display) ||
+        CGRectIsEmpty(rect) || CGRectIsNull(rect) ||
+        !CGRectIntersectsRect(rect, CGDisplayBounds(display)))
+        return NULL;
+
+    // Reading the display's contents is a screen capture. No backend can read
+    // pixels back, so the function returns NULL, as it does on a Mac where
+    // screen recording is not permitted (see CGPreflightScreenCaptureAccess).
     return NULL;
+}
+
+CGImageRef CGDisplayCreateImage(CGDirectDisplayID displayID) {
+    return CGDisplayCreateImageForRect(displayID, CGDisplayBounds(displayID));
+}
+
+boolean_t CGCursorIsDrawnInFramebuffer(void) {
+    // The pointer is part of the display contents.
+    return true;
 }
 
 bool CGDisplayUsesForceToGray(void) {

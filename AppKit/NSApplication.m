@@ -53,6 +53,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <Foundation/NSAppleEventManager.h>
 #import <Foundation/NSAppleEventDescriptor.h>
 #import <objc/message.h>
+#include <notify.h>
 #import <pthread.h>
 
 // Runs the +[NSEvent addLocalMonitorForEventsMatchingMask:handler:] handlers.
@@ -245,11 +246,41 @@ NS_EXTRA_DEALLOC(NSApplication)
     }
 }
 
+// Another process (NSRunningApplication -hide, -unhide, -terminate) asks this application for the
+// command with a libnotify notification named after this process, see _CGSSendProcessCommand().
+// The requests are handled on the main queue, which the application's run loop serves.
+static void observeProcessCommands(NSApplication *application) {
+    const struct {
+        const char *prefix;
+        SEL action;
+    } commands[] = {
+        {kCGSProcessHideNotificationPrefix, @selector(hide:)},
+        {kCGSProcessUnhideNotificationPrefix, @selector(unhide:)},
+        {kCGSProcessQuitNotificationPrefix, @selector(terminate:)},
+    };
+
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        char name[96];
+        int token;
+        SEL action = commands[i].action;
+
+        snprintf(name, sizeof(name), "%s%d", commands[i].prefix, (int) getpid());
+        // The token stays registered for the life of the process.
+        notify_register_dispatch(name, &token, dispatch_get_main_queue(), ^(int ignored) {
+            [application performSelector: action withObject: nil];
+        });
+    }
+}
+
 - (instancetype) init {
     if (NSApp)
         NSAssert(!NSApp, @"NSApplication is a singleton");
     NSApp = self;
     NS_EXTRA(NSApplication, self)->_display = [[NSDisplay currentDisplay] retain];
+    // An application connects to the window system as it starts, which is also what makes it
+    // known as an application to other processes.
+    (void) CGSMainConnectionID();
+    observeProcessCommands(self);
 
     _windows = [NSMutableArray new];
     _mainMenu = nil;
@@ -337,9 +368,16 @@ static NSArray *pathsOfDocumentsEvent(NSAppleEventDescriptor *event) {
 }
 
 // Every launch receives one initial Apple Event: kAEOpenDocuments or kAEPrintDocuments when the
-// application was started to open documents, otherwise kAEOpenApplication. -finishLaunching waits
-// for it, handles it, and only then posts NSApplicationDidFinishLaunchingNotification.
-enum { InitialEventNone, InitialEventOpenApplication, InitialEventOpenDocuments, InitialEventPrintDocuments };
+// application was started to open documents, kAEGetURL when it was started to open a URL, otherwise
+// kAEOpenApplication. -finishLaunching waits for it, handles it, and only then posts
+// NSApplicationDidFinishLaunchingNotification.
+enum {
+    InitialEventNone,
+    InitialEventOpenApplication,
+    InitialEventOpenDocuments,
+    InitialEventPrintDocuments,
+    InitialEventOpenURLs
+};
 
 // How long -finishLaunching waits for the initial event. The event is expected to arrive; this
 // only keeps an application running when nothing can send it.
@@ -352,8 +390,9 @@ static BOOL initialEventHandled = NO;
 static BOOL launchComplete = NO;
 static BOOL finishLaunchingDeferred = NO;
 static BOOL argumentDocumentsOpened = NO;
-// Documents that arrive during launch after the initial event; opened when launching is done.
+// Documents and URLs that arrive during launch after the initial event; opened when launching is done.
 static NSMutableArray *pendingOpenFiles = nil;
+static NSMutableArray *pendingOpenURLs = nil;
 
 - (void) _launchEvent: (int) kind paths: (NSArray *) paths {
     if (initialEventHandled || (initialEventKind != InitialEventNone && !waitingForInitialEvent)) {
@@ -361,6 +400,10 @@ static NSMutableArray *pendingOpenFiles = nil;
             if (pendingOpenFiles == nil)
                 pendingOpenFiles = [[NSMutableArray alloc] init];
             [pendingOpenFiles addObjectsFromArray: paths];
+        } else if (kind == InitialEventOpenURLs && [paths count] > 0) {
+            if (pendingOpenURLs == nil)
+                pendingOpenURLs = [[NSMutableArray alloc] init];
+            [pendingOpenURLs addObjectsFromArray: paths];
         }
         return;
     }
@@ -392,7 +435,7 @@ static NSMutableArray *pendingOpenFiles = nil;
                                               showPrintPanels:)]) {
         [_delegate application: self
                     printFiles: paths
-                  withSettings: nil
+                  withSettings: @{}
                showPrintPanels: YES];
     } else if ([_delegate respondsToSelector: @selector(application:printFile:)]) {
         for (NSString *path in paths)
@@ -408,6 +451,36 @@ static NSMutableArray *pendingOpenFiles = nil;
         [self _printFileNames: paths];
     else
         [self _launchEvent: InitialEventPrintDocuments paths: paths];
+}
+
+- (void) _openURLs: (NSArray *) urls {
+    if ([urls count] > 0 && [_delegate respondsToSelector: @selector(application:openURLs:)])
+        [_delegate application: self openURLs: urls];
+}
+
+- (void) _handleGetURLEvent: (NSAppleEventDescriptor *) event
+             withReplyEvent: (NSAppleEventDescriptor *) reply
+{
+    NSAppleEventDescriptor *object = [event paramDescriptorForKeyword: keyDirectObject];
+    NSMutableArray *urls = [NSMutableArray array];
+
+    // The direct object is the URL's text, or a list of them.
+    NSInteger count = [object descriptorType] == typeAEList ? [object numberOfItems] : 1;
+    for (NSInteger i = 1; object != nil && i <= count; i++) {
+        NSAppleEventDescriptor *item =
+                [object descriptorType] == typeAEList ? [object descriptorAtIndex: i] : object;
+        NSString *string = [item stringValue];
+        NSURL *url = string != nil ? [NSURL URLWithString: string] : nil;
+
+        if (url != nil)
+            [urls addObject: url];
+    }
+
+    // A URL that launched the application is the launch's own event.
+    if (launchComplete)
+        [self _openURLs: urls];
+    else
+        [self _launchEvent: InitialEventOpenURLs paths: urls];
 }
 
 - (void) _handleOpenApplicationEvent: (NSAppleEventDescriptor *) event
@@ -559,6 +632,20 @@ static NSMutableArray *pendingOpenFiles = nil;
 
 - (BOOL) isHidden {
     return NS_EXTRA(NSApplication, self)->_isHidden;
+}
+
+// Visible when any of the application's windows is visible, which the documentation allows
+// (visible means at least part of some window can be seen). The application's windows are not
+// tracked for being covered by other windows, so a covered window still counts as visible. A hidden
+// application has no visible window.
+- (NSApplicationOcclusionState) occlusionState {
+    if (NS_EXTRA(NSApplication, self)->_isHidden)
+        return 0;
+    for (NSWindow *window in [[_windows copy] autorelease]) {
+        if ([window isVisible])
+            return NSApplicationOcclusionStateVisible;
+    }
+    return 0;
 }
 
 - (BOOL) isRunning {
@@ -953,8 +1040,8 @@ static NSMutableArray *pendingOpenFiles = nil;
 
     // Give us a first event
     [NSTimer scheduledTimerWithTimeInterval: 0.1
-                                     target: nil
-                                   selector: NULL
+                                     target: self
+                                   selector: @selector(_firstEventTimerFired:)
                                    userInfo: nil
                                     repeats: NO];
 
@@ -1039,12 +1126,14 @@ static NSMutableArray *pendingOpenFiles = nil;
             [self _openUntitledFileIfNeeded];
     } else if (kind == InitialEventOpenDocuments) {
         [self _openFileNames: paths];
+    } else if (kind == InitialEventOpenURLs) {
+        [self _openURLs: paths];
     } else {
         [self _printFileNames: paths];
     }
 
     // The did-finish notification follows the open-application event within its handling, but a
-    // documents event once its handling is over.
+    // documents or URL event once its handling is over.
     if (kind == InitialEventOpenApplication)
         [self _finishLaunchingIsDefault: YES];
     else
@@ -1075,6 +1164,12 @@ static NSMutableArray *pendingOpenFiles = nil;
 
         pendingOpenFiles = nil;
         [self _openFileNames: paths];
+    }
+    if ([pendingOpenURLs count] > 0) {
+        NSArray *urls = [pendingOpenURLs autorelease];
+
+        pendingOpenURLs = nil;
+        [self _openURLs: urls];
     }
 }
 
@@ -1222,7 +1317,8 @@ static NSMutableArray *pendingOpenFiles = nil;
     if ([event type] == NSKeyDown) {
         unsigned modifierFlags = [event modifierFlags];
 
-        if (modifierFlags & (NSCommandKeyMask | NSAlternateKeyMask))
+        // A shortcut written with Control (menus show it as such) works too.
+        if (modifierFlags & (NSCommandKeyMask | NSAlternateKeyMask | NSControlKeyMask))
             if ([self _performKeyEquivalent: event])
                 return;
     }
@@ -1518,10 +1614,26 @@ static NSMutableArray *pendingOpenFiles = nil;
 }
 
 - (NSModalResponse) runModalSession: (NSModalSession) session {
+    return [self _runModalSession: session untilDate: [NSDate date]];
+}
+
+// Whether the modal window of the session, or a sheet attached to it (or to a sheet of it), is `window`: the
+// windows the user can work with while the session runs.
+static BOOL isModalWindowOrItsSheet(NSWindow *window, NSWindow *modalWindow) {
+    for (NSWindow *candidate = modalWindow; candidate != nil; candidate = [candidate attachedSheet]) {
+        if (candidate == window)
+            return YES;
+    }
+    return NO;
+}
+
+// Processes the events that arrive until the date; returns the stop code. runModalSession: passes the current date
+// (poll), runModalForWindow: a short time ahead, so that a modal loop sleeps between events instead of spinning.
+- (NSModalResponse) _runModalSession: (NSModalSession) session untilDate: (NSDate *) untilDate {
     while ([session stopCode] == NSRunContinuesResponse) {
         NSAutoreleasePool *pool = [NSAutoreleasePool new];
         NSEvent *event = [self nextEventMatchingMask: NSAnyEventMask
-                                           untilDate: [NSDate date]
+                                           untilDate: untilDate
                                               inMode: NSModalPanelRunLoopMode
                                              dequeue: YES];
 
@@ -1538,7 +1650,7 @@ static NSMutableArray *pendingOpenFiles = nil;
         if ([event type] == NSKeyDown && window == [session modalWindow])
             [self interpretKeyEvents: @[ event ]];
 
-        if (window == [session modalWindow] || [window worksWhenModal])
+        if (isModalWindowOrItsSheet(window, [session modalWindow]) || [window worksWhenModal])
             [self sendEvent: event];
         else if ([event type] == NSLeftMouseDown)
             [[session modalWindow] makeKeyAndOrderFront: self];
@@ -1597,7 +1709,10 @@ static NSMutableArray *pendingOpenFiles = nil;
     NSModalSession session = [self beginModalSessionForWindow: window];
     NSModalResponse result;
 
-    while ((result = [NSApp runModalSession: session]) ==
+    // Wait for events a short while at a time: the window's own stop (from a timer or a button) is noticed within
+    // that time, and the thread is not kept busy in between.
+    while ((result = [self _runModalSession: session
+                                  untilDate: [NSDate dateWithTimeIntervalSinceNow: 0.05]]) ==
            NSRunContinuesResponse)
         ;
     [self endModalSession: session];
@@ -1772,6 +1887,7 @@ static NSMutableArray *pendingOpenFiles = nil;
             postNotificationName: NSApplicationDidHideNotification
                           object: self];
     NS_EXTRA(NSApplication, self)->_isHidden = YES;
+    _CGSSetProcessHidden(true);
 }
 
 - (void) hideOtherApplications: sender {
@@ -1791,6 +1907,7 @@ static NSMutableArray *pendingOpenFiles = nil;
                               object: self];
     }
     NS_EXTRA(NSApplication, self)->_isHidden = NO;
+    _CGSSetProcessHidden(false);
     //[self activateIgnoringOtherApps:NO]
 }
 
@@ -1811,6 +1928,7 @@ static NSMutableArray *pendingOpenFiles = nil;
                               object: self];
     }
     NS_EXTRA(NSApplication, self)->_isHidden = NO;
+    _CGSSetProcessHidden(false);
 }
 
 - (void) stop: sender {
@@ -1955,10 +2073,21 @@ static NSMutableArray *pendingOpenFiles = nil;
 }
 
 - (void) orderFrontStandardAboutPanel: sender {
-    [self orderFrontStandardAboutPanelWithOptions: nil];
+    // No options: show the panel with its defaults.
+    [self _orderFrontStandardAboutPanelWithOptions: nil];
+}
+
+// Only exists to make the run loop deliver a first event after launch.
+- (void) _firstEventTimerFired: (NSTimer *) timer {
 }
 
 - (void) orderFrontStandardAboutPanelWithOptions: (NSDictionary *) options {
+    [self _orderFrontStandardAboutPanelWithOptions: options];
+}
+
+- (void) _orderFrontStandardAboutPanelWithOptions:
+        (nullable NSDictionary *) options
+{
     NSSystemInfoPanel *standardAboutPanel =
             [[NSSystemInfoPanel standardAboutPanel] retain];
     [standardAboutPanel showInfoPanel: self withOptions: options];
@@ -2079,6 +2208,10 @@ static BOOL resignPending;
 
 - (void) _windowDidBecomeActive: (NSWindow *) window {
     resignPending = NO;
+    // A window of this process has the input focus, which is what makes it the front process.
+    // CoreGraphics keeps it for the display servers that cannot be asked who has the focus and
+    // tells the other processes (NSWorkspace's frontmostApplication follows it).
+    _CGSSetFrontProcess(getpid());
     if (!NS_EXTRA(NSApplication, self)->_isActive) {
         NS_EXTRA(NSApplication, self)->_isActive = YES;
         [[NSNotificationCenter defaultCenter]
@@ -2112,6 +2245,7 @@ static BOOL resignPending;
             postNotificationName: NSApplicationWillResignActiveNotification
                           object: self];
     NS_EXTRA(NSApplication, self)->_isActive = NO;
+    _CGSResignFrontProcess(getpid());
 
     // Exposed menus are running tight event tracking loops and would remain
     // visible when the app deactivates (making the UI less than community

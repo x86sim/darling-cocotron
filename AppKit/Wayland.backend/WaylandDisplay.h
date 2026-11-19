@@ -67,6 +67,7 @@ typedef enum {
     WaylandObjectKeyboardSync,
     WaylandObjectLogicalOutput,
     WaylandObjectPinchGesture,
+    WaylandObjectTextInput,
     WaylandObjectDataDevice,
     WaylandObjectDataOffer,
     WaylandObjectDataSource,
@@ -78,6 +79,7 @@ typedef enum {
     WaylandObjectOutputHeadMode,
     WaylandObjectOutputConfiguration,
     WaylandObjectActivationToken,
+    WaylandObjectTouch,
 } WaylandObjectKind;
 
 // The dispatcher installed on every proxy (see WaylandLibrary.h for why listeners
@@ -124,6 +126,16 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     struct wl_proxy *_seat;
     struct wl_proxy *_pointer;
     struct wl_proxy *_pointerGestures, *_pinchGesture;
+    // text-input-v3: the input method's composition and commits for the focused text input
+    // client. The text input object exists once the manager and the seat are both bound.
+    struct wl_proxy *_textInputManager, *_textInput;
+    uint32_t _textInputManagerName;
+    WaylandWindow *_textInputWindow; // the surface the compositor entered; nonretained
+    BOOL _textInputEnabled;
+    NSRect _textInputRect;           // the last cursor rectangle sent, surface coordinates
+    NSString *_textInputPendingPreedit, *_textInputPendingCommit;
+    int _textInputPendingCursorBegin, _textInputPendingCursorEnd;
+    NSString *_textInputPreedit;     // the composition the client currently shows
     uint32_t _pointerGesturesName;
     WaylandWindow *_pinchWindow;
     struct wl_proxy *_pointerConstraints, *_relativePointerManager;
@@ -136,6 +148,9 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     WaylandWindow *_lockWindow; // Nonretained; cleared on unmap.
     CGFloat _pinchScale;
     struct wl_proxy *_keyboard;
+    struct wl_proxy *_touch;
+    // Finger id -> WaylandWindow it went down on (up and motion name no surface).
+    NSMutableDictionary *_touchWindows;
     CFSocketRef _wlSocket;
     CFRunLoopSourceRef _wlSource;
     NSMutableArray *_outputs;
@@ -186,7 +201,7 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 
     struct wl_cursor_theme *_cursorTheme;
     uint32_t _cursorThemeScale120;
-    struct wl_proxy *_cursorSurface, *_cursorFractionalScale, *_cursorViewport;
+    struct wl_proxy *_cursorSurface, *_cursorFractionalScale;
     uint32_t _cursorPreferredScale120;
     struct wl_proxy *_imageCursorBuffer;
     uint32_t _imageCursorBufferScale120;

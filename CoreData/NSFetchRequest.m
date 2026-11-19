@@ -25,6 +25,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 @implementation NSFetchRequest
 
 - init {
+    _includesPendingChanges = YES;
+    _includesPropertyValues = YES;
+    _includesSubentities = YES;
+    _returnsObjectsAsFaults = YES;
     _entity = nil;
     _predicate = nil;
     _sortDescriptors = nil;
@@ -32,6 +36,17 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
     _fetchLimit = 0;
     return self;
 }
+
++ (instancetype)fetchRequestWithEntityName:(NSString *)name {
+    return [[[self alloc] initWithEntityName:name] autorelease];
+}
+
+- (instancetype)initWithEntityName:(NSString *)name {
+    if ((self = [self init])) _entityName = [name copy];
+    return self;
+}
+
+- (NSString *)entityName { return _entity ? [_entity name] : _entityName; }
 
 - initWithCoder: (NSCoder *) coder {
     NSUnimplementedMethod();
@@ -45,6 +60,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - copyWithZone: (NSZone *) zone {
     NSFetchRequest *result = NSCopyObject(self, 0, zone);
 
+    result->_entityName = [_entityName copy];
     result->_entity = [_entity retain];
     result->_predicate = [_predicate copy];
     result->_sortDescriptors = [_sortDescriptors copy];
@@ -57,18 +73,35 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 }
 
 - (void) dealloc {
+    [_entityName release];
     [_entity release];
     [_predicate release];
     [_sortDescriptors release];
-    [_affectedStores release];
     [super dealloc];
+}
+
+- (NSPersistentStoreRequestType) requestType {
+    return NSFetchRequestType;
 }
 
 - (NSFetchRequestResultType) resultType {
     return _resultType;
 }
 
+// QUIRK: -entity on a request created from an entity name raises NSObjectInaccessibleException
+// until the request is used by a context. Not documented. Evidence: black-box observation on
+// macOS 26.7.3 (tier 2).
+// Test: tests/coredata-batch-requests.m (fetchRaised check)
 - (NSEntityDescription *) entity {
+    if (_entity == nil && _entityName != nil)
+        [NSException raise: @"NSObjectInaccessibleException"
+                    format: @"This fetch request was created with a string name (%@) and cannot "
+                             "respond to -entity until used by an NSManagedObjectContext",
+                            _entityName];
+    return _entity;
+}
+
+- (NSEntityDescription *) _entityIfKnown {
     return _entity;
 }
 
@@ -78,10 +111,6 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
 - (NSArray *) sortDescriptors {
     return _sortDescriptors;
-}
-
-- (NSArray *) affectedStores {
-    return _affectedStores;
 }
 
 - (NSUInteger) fetchLimit {
@@ -146,12 +175,6 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
     _sortDescriptors = value;
 }
 
-- (void) setAffectedStores: (NSArray *) value {
-    value = [value copy];
-    [_affectedStores release];
-    _affectedStores = value;
-}
-
 - (void) setFetchLimit: (NSUInteger) value {
     _fetchLimit = value;
 }
@@ -197,8 +220,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 }
 
 - (NSUInteger) _countInContext: (NSManagedObjectContext *) _context {
-    NSLog(@"Stub called: _countInContext in %@", [self class]);
-    return 0;
+    return [_context countForFetchRequest:self error:NULL];
 }
 
 @end

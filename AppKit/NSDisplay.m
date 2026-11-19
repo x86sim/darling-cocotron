@@ -27,6 +27,14 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 // for a posted event; timers alone never end it.
 static void eventPosted(void *info) {}
 
+
+// NSEventMaskAny is NSUIntegerMax, which is only 32 bits wide in a 32-bit
+// process, so it has no bit for the event types from 32 up (direct touch is
+// 37). Such a mask still asks for every event.
+static BOOL EventMatchesMask(NSEvent *event, NSEventMask mask) {
+    return mask == NSEventMaskAny || (NSEventMaskFromType([event type]) & mask) != 0;
+}
+
 @implementation NSDisplay
 
 + (void) initialize {
@@ -176,15 +184,37 @@ static NSDisplay *processDisplay = nil;
     NSInvalidAbstractInvocation();
 }
 
-- (void) hideCursorCounted {
-    if (_cursorHideCount++ == 0)
+// The backend hides the cursor while something hid it.
+- (void) _applyCursorHidden {
+    BOOL hidden = _cursorHideCount > 0;
+
+    if (hidden == _cursorIsHidden)
+        return;
+    _cursorIsHidden = hidden;
+    if (hidden)
         [self hideCursor];
+    else
+        [self unhideCursor];
+}
+
+- (void) hideCursorCounted {
+    _cursorHideCount++;
+    [self _applyCursorHidden];
 }
 
 // An unhide with nothing hidden does nothing.
 - (void) unhideCursorCounted {
-    if (_cursorHideCount > 0 && --_cursorHideCount == 0)
-        [self unhideCursor];
+    if (_cursorHideCount > 0) {
+        _cursorHideCount--;
+        [self _applyCursorHidden];
+    }
+}
+
+// Shows the cursor and forgets every pending hide (CGSForceShowCursor).
+- (void) forceShowCursor {
+    _cursorHideCount = 0;
+    _cursorHiddenUntilMouseMoves = NO;
+    [self _applyCursorHidden];
 }
 
 // The flag is idempotent and counts as one hide, so the hide/unhide pair stays balanced and an
@@ -232,7 +262,7 @@ static NSDisplay *processDisplay = nil;
 
     [_eventQueueLock lock];
     for (NSEvent *candidate in _eventQueue) {
-        if (NSEventMaskFromType([candidate type]) & mask) {
+        if (EventMatchesMask(candidate, mask)) {
             queued = YES;
             break;
         }
@@ -255,7 +285,7 @@ static NSDisplay *processDisplay = nil;
         for (i = 0; i < count; i++) {
             NSEvent *event = _eventQueue[i];
 
-            if (NSEventMaskFromType([event type]) & mask) {
+            if (EventMatchesMask(event, mask)) {
                 result = [[event retain] autorelease];
 
                 if (dequeue)
@@ -296,7 +326,7 @@ static NSDisplay *processDisplay = nil;
         // event whatever its type - and the periodic-event coalescer wipes queued
         // key and mouse events on every tick.
         while (--count >= 0) {
-            if (NSEventMaskFromType([_eventQueue[count] type]) & mask) {
+            if (EventMatchesMask(_eventQueue[count], mask)) {
                 [_eventQueue removeObjectAtIndex: count];
             }
         }
@@ -402,6 +432,12 @@ static NSDisplay *processDisplay = nil;
     return standard;
 }
 
+- (BOOL) controlStandsInForCommand: (NSEventModifierFlags) flags
+                       keyEquivalent: (unichar) key
+{
+    return NO;
+}
+
 - (void) beep {
     NSInvalidAbstractInvocation();
 }
@@ -453,6 +489,10 @@ static NSDisplay *processDisplay = nil;
 
 - (BOOL) implementsCustomPanelForClass: (Class) panelClass {
     return NO;
+}
+
+- (NSString *) portalParentHandleForWindow: (NSWindow *) window {
+    return nil;
 }
 
 - (int) savePanel: (NSSavePanel *) savePanel

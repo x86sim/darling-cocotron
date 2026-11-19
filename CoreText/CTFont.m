@@ -21,6 +21,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <CoreText/CoreText.h>
 #import <CoreText/KTFont.h>
 #import "CTFontSPI.h"
+#import "KTCoreTextInternal.h"
 #import <CoreGraphics/CGContext.h>
 #import <CoreGraphics/CGDataProvider.h>
 #import <CoreGraphics/CGFont.h>
@@ -175,12 +176,20 @@ CTFontRef CTFontCreateWithFontDescriptorAndOptions(CTFontDescriptorRef descripto
     return CTFontCreateWithFontDescriptor(descriptor, size, matrix);
 }
 
+// Set on the fonts made for the system UI font types; see CTFontDescriptorIsSystemUIFont().
+static char systemUIFontKey;
+
 CTFontRef CTFontCreateUIFontForLanguage(CTFontUIFontType uiFontType,
                                         CGFloat size, CFStringRef language)
 {
-    return (CTFontRef)[[KTFont alloc] initWithUIFontType: uiFontType
+    KTFont *font = [[KTFont alloc] initWithUIFontType: uiFontType
                                          size: size
                                      language: (NSString*)language];
+    // The user and the user fixed-pitch fonts are not system UI fonts.
+    if (font != nil && uiFontType != kCTFontUIFontUser && uiFontType != kCTFontUIFontUserFixedPitch)
+        objc_setAssociatedObject(font, &systemUIFontKey, (id) kCFBooleanTrue,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return (CTFontRef) font;
 }
 
 CTFontRef CTFontCreateCopyWithAttributes(CTFontRef font, CGFloat size,
@@ -344,6 +353,8 @@ CTFontDescriptorRef CTFontCopyFontDescriptor(CTFontRef font)
     NSArray *cascade = fontCascade(font);
     if (cascade != nil)
         [attributes setObject: cascade forKey: (NSString *) kCTFontCascadeListAttribute];
+    if (objc_getAssociatedObject(object, &systemUIFontKey) != nil)
+        [attributes setObject: (id) kCFBooleanTrue forKey: (NSString *) KTFontSystemUIAttribute];
     [name release];
     [family release];
     [traits release];
@@ -666,6 +677,12 @@ CGRect CTFontGetBoundingRectsForGlyphs(CTFontRef font, CTFontOrientation orienta
     return total;
 }
 
+CGFloat KTFontGetPairKerning(CTFontRef font, CGGlyph first, CGGlyph second)
+{
+    KTFont *object = ktFont(font);
+    return object != nil ? [object kerningBetweenGlyph: first andGlyph: second] : 0;
+}
+
 double CTFontGetAdvancesForGlyphs(CTFontRef font, CTFontOrientation orientation,
                                 const CGGlyph *glyphs, CGSize *advances,
                                 CFIndex count)
@@ -675,10 +692,14 @@ double CTFontGetAdvancesForGlyphs(CTFontRef font, CTFontOrientation orientation,
         return 0;
 
     // The advances array is optional; the total is returned either way.
+    // Vertical text gets the font's vertical advance as the width, and a height of 0.
     double sum = 0;
     for (CFIndex i = 0; i < count; i++) {
         CGSize advance;
-        [object getAdvancements: &advance forGlyphs: &glyphs[i] count: 1];
+        if (orientation == kCTFontOrientationVertical)
+            [object getVerticalAdvancements: &advance forGlyphs: &glyphs[i] count: 1];
+        else
+            [object getAdvancements: &advance forGlyphs: &glyphs[i] count: 1];
         if (advances != NULL)
             advances[i] = advance;
         sum += advance.width;
@@ -871,6 +892,15 @@ CFDataRef CTFontCopyTable(CTFontRef font, CTFontTableTag table, CTFontTableOptio
     CFDataRef data = CGFontCopyTableForTag(graphicsFont, table);
     CGFontRelease(graphicsFont);
     return data;
+}
+
+bool CTFontHasTable(CTFontRef font, CTFontTableTag table)
+{
+    CFDataRef data = CTFontCopyTable(font, table, kCTFontTableOptionNoOptions);
+    if (data == NULL)
+        return false;
+    CFRelease(data);
+    return true;
 }
 
 CFTypeID CTFontGetTypeID(void)

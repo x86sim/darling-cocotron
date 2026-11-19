@@ -24,7 +24,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSDisplay.h>
 #import <AppKit/NSDraggingManager.h>
 #import <AppKit/NSEvent.h>
+#import <AppKit/NSEvent_mouse.h>
 #import <AppKit/NSEvent_CoreGraphics.h>
+#import <AppKit/NSEvent_touch.h>
+#import <AppKit/NSTouchBackend.h>
 #import <AppKit/NSGraphics.h>
 #import <AppKit/NSImage.h>
 #import <AppKit/NSImageView.h>
@@ -231,6 +234,7 @@ NSInteger NSBitsPerPixelFromDepth(NSWindowDepth depth) {
 
 @interface NSView (NSWindowBackingProperties)
 - (void) _backingPropertiesDidChange;
+- (void) _updateLayerContextFrames;
 @end
 
 @implementation NSWindowSheetCompletion
@@ -1282,6 +1286,9 @@ static BOOL _allowsAutomaticWindowTabbing;
     [_platformWindow setFrame: _frame];
 
     if (didSize) {
+        // The views were resized before the platform window, which places the native windows of root layers
+        // from its own height; place them again now that it has the new size.
+        [_backgroundView _updateLayerContextFrames];
         [self resetCursorRects];
         [self postNotificationName: NSWindowDidResizeNotification];
     }
@@ -2210,6 +2217,9 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
         return YES;
     }
 
+    // a field editor forgets its control once it resigns, so find the control first
+    NSView *previousView = [NSView _focusRingViewForResponder: _firstResponder];
+
     if (![_firstResponder resignFirstResponder]) {
         return NO;
     }
@@ -2217,11 +2227,26 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
     _firstResponder = responder;
 
     if ([_firstResponder becomeFirstResponder]) {
+        [self textInputFirstResponderChanged];
+        // the focus rings of both views are drawn by their superviews
+        [previousView _focusRingStateChanged];
+        [[NSView _focusRingViewForResponder: _firstResponder] _focusRingStateChanged];
         return YES;
     } else {
         _firstResponder = self;
+        [self textInputFirstResponderChanged];
+        [previousView _focusRingStateChanged];
         return NO;
     }
+}
+
+// An input method of the window system follows the first responder: it only wants to compose
+// text for a text input client, next to that client's caret.
+- (void) textInputFirstResponderChanged {
+    NSDisplay *display = [NSDisplay currentDisplay];
+
+    if ([display respondsToSelector: @selector(textInputCandidateRectChangedInWindow:)])
+        [display textInputCandidateRectChangedInWindow: self];
 }
 
 - (void) makeKeyWindow {
@@ -2272,6 +2297,8 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
         [_firstResponder performSelector: _cmd];
 
     [self postNotificationName: NSWindowDidBecomeKeyNotification];
+    // controls draw differently in a window that is not key (see NSGraphicsStyle), so redraw them
+    [[self contentView] setNeedsDisplay: YES];
 }
 
 - (void) resignKeyWindow {
@@ -2279,6 +2306,7 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
         [_firstResponder performSelector: _cmd];
 
     [self postNotificationName: NSWindowDidResignKeyNotification];
+    [[self contentView] setNeedsDisplay: YES];
 }
 
 - (void) becomeMainWindow {
@@ -2318,14 +2346,28 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
     }
 }
 
+// While the new key view is made first responder, -keyViewSelectionDirection
+// tells it which way the selection is moving (a view that tracks an inner
+// selection can start from its first or last item).
+// QUIRK: the direction is NSDirectSelection again once the method returns.
+// Not documented. Evidence: black-box observation (tier 2) on macOS 26.7.3
+// and 10.14.4.
+// Test: tests/appkit-window-key-view-selection-direction.m
+- (void) _makeFirstResponder: (NSResponder *) responder
+                 selecting: (NSSelectionDirection) direction {
+    NSSelectionDirection saved = NS_EXTRA(NSWindow, self)->_keyViewSelectionDirection;
+
+    NS_EXTRA(NSWindow, self)->_keyViewSelectionDirection = direction;
+    [self makeFirstResponder: responder];
+    NS_EXTRA(NSWindow, self)->_keyViewSelectionDirection = saved;
+}
+
 - (void) selectKeyViewFollowingView: (NSView *) view {
-    NSView *next = [view nextValidKeyView];
-    [self makeFirstResponder: next];
+    [self _makeFirstResponder: [view nextValidKeyView] selecting: NSSelectingNext];
 }
 
 - (void) selectKeyViewPrecedingView: (NSView *) view {
-    NSView *next = [view previousValidKeyView];
-    [self makeFirstResponder: next];
+    [self _makeFirstResponder: [view previousValidKeyView] selecting: NSSelectingPrevious];
 }
 
 - (void) recalculateKeyViewLoopIfNeeded {
@@ -2350,9 +2392,8 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
     [self recalculateKeyViewLoopIfNeeded];
 }
 
-// Key view selection is not tracked, so it is always direct.
 - (NSSelectionDirection) keyViewSelectionDirection {
-    return NSDirectSelection;
+    return NS_EXTRA(NSWindow, self)->_keyViewSelectionDirection;
 }
 
 - (void) disableKeyEquivalentForDefaultButtonCell {
@@ -2686,6 +2727,7 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
     if (NS_EXTRA(NSWindow, self)->_isClosed)
         return;
     NS_EXTRA(NSWindow, self)->_isClosed = YES;
+    NSTouchCancelAll(self);
     /*
       I am not sure if orderOut comes before the notification or not. If we
       order out after the notification, Windows sends the window a bunch of
@@ -2933,6 +2975,48 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
     return recognizers;
 }
 
+// A mouse click in a window that is not key makes it key (a click does not wait for the window
+// system's focus, which on its own does not always hand out the key status). A panel that becomes key
+// only if needed takes it only for a click on a view that needs the panel to be key.
+- (void) _makeKeyForMouseDownInView: (NSView *) view {
+    if ([self isKeyWindow] || ![self canBecomeKeyWindow])
+        return;
+    if ([self isKindOfClass: [NSPanel class]] && [(NSPanel *) self becomesKeyOnlyIfNeeded] &&
+        ![view needsPanelToBecomeKey])
+        return;
+    [self makeKeyWindow];
+}
+
+// Each view with a finger that changed hears of it once per phase, began
+// first, as in AppKit. A finger always goes to the view it began in.
+- (void) _sendTouchEvent: (NSEvent *) event {
+    NSMutableArray *views = [NSMutableArray array];
+    NSTouchPhase phases = 0;
+    for (NSTouch *touch in [event allTouches]) {
+        if ([touch phase] == NSTouchPhaseStationary)
+            continue;
+        phases |= [touch phase];
+        if (![views containsObject: [touch _view]])
+            [views addObject: [touch _view]];
+    }
+    if ((phases & NSTouchPhaseBegan) && ![self isKeyWindow])
+        [self makeKeyAndOrderFront: nil];
+    for (NSView *view in views) {
+        NSTouchPhase viewPhases = 0;
+        for (NSTouch *touch in [event allTouches])
+            if ([touch _view] == view)
+                viewPhases |= [touch phase];
+        if (viewPhases & NSTouchPhaseBegan)
+            [view touchesBeganWithEvent: event];
+        if (viewPhases & NSTouchPhaseMoved)
+            [view touchesMovedWithEvent: event];
+        if (viewPhases & NSTouchPhaseEnded)
+            [view touchesEndedWithEvent: event];
+        if (viewPhases & NSTouchPhaseCancelled)
+            [view touchesCancelledWithEvent: event];
+    }
+}
+
 - (void) sendEvent: (NSEvent *) event {
     // Some events can cause our window to be destroyed
     // So make sure self lives at least through this current run loop...
@@ -2982,6 +3066,7 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
     case NSLeftMouseDown: {
         NSView *view = [_backgroundView hitTest: [event locationInWindow]];
 
+        [self _makeKeyForMouseDownInView: view];
         if ([view acceptsFirstResponder]) {
             if ([view needsPanelToBecomeKey]) {
                 [self makeFirstResponder: view];
@@ -3001,6 +3086,7 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
     case NSRightMouseDown: {
         NSView *view = [_backgroundView hitTest: [event locationInWindow]];
 
+        [self _makeKeyForMouseDownInView: view];
         [self _setMouseDownView: view forButton: 1];
         [view rightMouseDown: event];
         break;
@@ -3013,6 +3099,7 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
     case NSOtherMouseDown: {
         NSView *view = [_backgroundView hitTest: [event locationInWindow]];
 
+        [self _makeKeyForMouseDownInView: view];
         [self _setMouseDownView: view forButton: [self _otherButtonOfEvent: event]];
         [view otherMouseDown: event];
         break;
@@ -3087,6 +3174,10 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
     case NSEventTypeRotate:
         [[_backgroundView hitTest: [event locationInWindow]]
                 rotateWithEvent: event];
+        break;
+
+    case NSEventTypeDirectTouch:
+        [self _sendTouchEvent: event];
         break;
 
     case NSAppKitDefined:
@@ -3956,7 +4047,20 @@ static const NSTimeInterval FullScreenConfirmationTimeout = 3.0;
                               withObject: self];
 
     NS_EXTRA(NSWindow, self)->_isActive = YES;
-    if ([self canBecomeKeyWindow]) {
+    // A key window that is fully transparent (alphaValue 0) has no focus of its own on a display
+    // where the focus follows the visible windows; the focus arriving in another window of the
+    // application must not take the key status away from it (ordering a window in does not make
+    // it key). A window the application asked to make key (-makeKeyWindow,
+    // -makeKeyAndOrderFront:, a modal session) does take it.
+    id platform = [self platformWindow];
+    BOOL requested = [platform respondsToSelector: @selector(takeKeyRequest)] &&
+                     [platform takeKeyRequest];
+    NSWindow *currentKey = [NSApp keyWindow];
+    id currentKeyPlatform = currentKey != self ? [currentKey platformWindow] : nil;
+    BOOL keyStays = !requested &&
+                    [currentKeyPlatform respondsToSelector: @selector(isFullyTransparent)] &&
+                    [currentKeyPlatform isFullyTransparent];
+    if ([self canBecomeKeyWindow] && !keyStays) {
         [self becomeKeyWindow];
     }
     if ([self canBecomeMainWindow] && ![self isMainWindow]) {
@@ -4237,7 +4341,7 @@ static const NSTimeInterval FullScreenConfirmationTimeout = 3.0;
                     NSPoint pt = [[area _view] convertPoint: mousePoint
                                                    fromView: nil];
                     tooltip = [owner view: [area _view]
-                            stringForToolTip: area
+                            stringForToolTip: [area _tag]
                                        point: pt
                                     userData: [area userInfo]];
                 } else {
@@ -4354,8 +4458,9 @@ static const NSTimeInterval FullScreenConfirmationTimeout = 3.0;
                               windowNumber: [self windowNumber]
                                    context: [self graphicsContext]
                                eventNumber: 0 // NSEvent currently ignores this.
-                            trackingNumber: (NSInteger) check
+                            trackingNumber: [check _tag]
                                   userData: [check userInfo]];
+            [(NSEvent_mouse *) event _setTrackingArea: check];
             [owner mouseExited: event];
         }
     }
@@ -4373,8 +4478,9 @@ static const NSTimeInterval FullScreenConfirmationTimeout = 3.0;
                               windowNumber: [self windowNumber]
                                    context: [self graphicsContext]
                                eventNumber: 0 // NSEvent currently ignores this.
-                            trackingNumber: (NSInteger) check
+                            trackingNumber: [check _tag]
                                   userData: [check userInfo]];
+            [(NSEvent_mouse *) event _setTrackingArea: check];
             [owner mouseEntered: event];
         }
     }
@@ -4410,8 +4516,9 @@ static const NSTimeInterval FullScreenConfirmationTimeout = 3.0;
                               windowNumber: [self windowNumber]
                                    context: [self graphicsContext]
                                eventNumber: 0 // NSEvent currently ignores this.
-                            trackingNumber: (NSInteger) check
+                            trackingNumber: [check _tag]
                                   userData: [check userInfo]];
+            [(NSEvent_mouse *) event _setTrackingArea: check];
             [owner cursorUpdate: event];
         }
     }

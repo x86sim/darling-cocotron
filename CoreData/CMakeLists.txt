@@ -19,6 +19,7 @@ include_directories(
 	${CMAKE_SOURCE_DIR}/src/external/icu/icuSources/common
 
 	${CMAKE_CURRENT_SOURCE_DIR}
+	${CMAKE_SOURCE_DIR}/src/external/sqlite
 )
 
 set(CoreData_sources
@@ -27,6 +28,8 @@ set(CoreData_sources
     NSAtomicStoreCacheNode.m
     NSAtomicStore.m
     NSAttributeDescription.m
+    NSBatchDeleteRequest.m
+    NSBatchUpdateRequest.m
     NSEntityDescription.m
     NSEntityMapping.m
     NSFetchedPropertyDescription.m
@@ -41,11 +44,15 @@ set(CoreData_sources
     NSManagedObjectSetEnumerator.m
     NSManagedObjectSet.m
     NSMappingModel.m
+    NSPersistentContainer.m
+    NSPersistentStoreDescription.m
     NSPersistentStoreCoordinator.m
     NSPersistentStore.m
+    NSPersistentStoreRequest.m
     NSPropertyDescription.m
     NSPropertyMapping.m
     NSRelationshipDescription.m
+    NSSQLitePersistentStore.m
     NSXMLPersistentStore.m
     NSMergeConflict.m
     NSMergePolicy.m
@@ -74,4 +81,5 @@ add_framework(CoreData
 		system
 		CoreFoundation
 		Foundation
+		sqlite3
 )

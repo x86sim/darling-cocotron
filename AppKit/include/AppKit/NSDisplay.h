@@ -32,6 +32,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
     NSRecursiveLock *_eventQueueLock;
     BOOL _cursorHiddenUntilMouseMoves;
     NSInteger _cursorHideCount;
+    BOOL _cursorIsHidden; // what the backend was last told
     double _mouseDeltaX, _mouseDeltaY;
     CFRunLoopSourceRef _eventSource;
 }
@@ -60,6 +61,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 // +[NSCursor hide], CGDisplayHideCursor and -setCursorHiddenUntilMouseMoves: use these.
 - (void) hideCursorCounted;
 - (void) unhideCursorCounted;
+// Shows the cursor whatever number of hides is pending, and forgets them (CGSForceShowCursor).
+- (void) forceShowCursor;
 // Hides the cursor until the pointer moves (+[NSCursor setHiddenUntilMouseMoves:]).
 // The state is tracked here, so a backend reports motion with -pointerMoved.
 - (void) setCursorHiddenUntilMouseMoves: (BOOL) flag;
@@ -84,6 +87,16 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (NSEventModifierFlags) modifierForDefault: (NSString *) key
                                    standard: (NSEventModifierFlags) standard;
 
+// Whether the host keyboard chord with these modifier flags (as the backend
+// reports them for a key press) and this key is delivered to the application
+// as the same chord with the Command modifier instead of Control, so that the
+// host's Control+C/V/X can be the copy, paste and cut shortcuts. The one place
+// that decides this: input conversion and the key equivalents menus show both
+// ask it. A key is the character a key equivalent or key event reports.
+// NO unless the backend maps Control.
+- (BOOL) controlStandsInForCommand: (NSEventModifierFlags) flags
+                       keyEquivalent: (unichar) key;
+
 - (void) beep;
 
 - (NSSet *) allFontFamilyNames;
@@ -105,6 +118,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
                                              pageRange: (NSRange) pageRange;
 
 - (BOOL) implementsCustomPanelForClass: (Class) panelClass;
+
+// The parent window handle of the desktop file chooser portal for a window
+// ("x11:<id>" with the id in hex), or nil when the window system has none.
+- (NSString *) portalParentHandleForWindow: (NSWindow *) window;
 
 - (int) savePanel: (NSSavePanel *) savePanel
         runModalForDirectory: (NSString *) directory
@@ -139,6 +156,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (int) keyboardLayoutId;
 - (void) keyboardLayoutName: (NSString **) name
                    fullName: (NSString **) fullName;
+
+// The text input client of `window` moved or changed its text: the platform's
+// input method wants to place its candidate window next to the insertion point
+// again. Optional; backends without an input method protocol don't implement it.
+- (void) textInputCandidateRectChangedInWindow: (NSWindow *) window;
 
 // position is in CoreGraphics' global space (origin at the main screen's top-left
 // corner, y down), as CGWarpMouseCursorPosition() takes it.

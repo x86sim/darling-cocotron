@@ -17,9 +17,12 @@ COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import "NSInMemoryPersistentStore.h"
+#import "NSManagedObjectModel-Private.h"
 #import "NSManagedObjectID-Private.h"
 #import "NSXMLPersistentStore.h"
+#import "NSSQLitePersistentStore.h"
 #import <CoreData/NSManagedObject.h>
+#import <CoreData/CoreDataErrors.h>
 #import <CoreData/NSManagedObjectModel.h>
 #import <CoreData/NSPersistentStoreCoordinator.h>
 #import <Foundation/NSRaise.h>
@@ -28,7 +31,7 @@ NSString *const NSStoreTypeKey = @"NSStoreTypeKey";
 NSString *const NSStoreUUIDKey = @"NSStoreUUIDKey";
 
 NSString *const NSXMLStoreType = @"XML";
-NSString *const NSInMemoryStoreType = @"Memory";
+NSString *const NSInMemoryStoreType = @"InMemory";
 NSString *const NSSQLiteStoreType = @"SQLite";
 NSString *const NSBinaryStoreType = @"Binary";
 NSString *const NSMigratePersistentStoresAutomaticallyOption =
@@ -48,6 +51,8 @@ NSString *const NSInferMappingModelAutomaticallyOption =
 NSString *const NSReadOnlyPersistentStoreOption =
         @"NSReadOnlyPersistentStoreOption";
 NSString *const NSSQLiteManualVacuumOption = @"NSSQLiteManualVacuumOption";
+NSString *const NSSQLitePragmasOption = @"NSSQLitePragmasOption";
+NSString *const NSPersistentStoreTimeoutOption = @"NSPersistentStoreTimeoutOption";
 NSString *const NSStoreModelVersionHashesKey =
         @"NSStoreModelVersionHashesKey";
 
@@ -60,6 +65,7 @@ static NSMutableDictionary *_storeTypes = nil;
         _storeTypes = [NSMutableDictionary new];
         [_storeTypes setObject: [NSInMemoryPersistentStore class]
                         forKey: NSInMemoryStoreType];
+        [_storeTypes setObject:[NSSQLitePersistentStore class] forKey:NSSQLiteStoreType];
         [_storeTypes setObject: [NSXMLPersistentStore class]
                         forKey: NSXMLStoreType];
     }
@@ -78,6 +84,7 @@ static NSMutableDictionary *_storeTypes = nil;
 - initWithManagedObjectModel: (NSManagedObjectModel *) model {
     _lock = [[NSLock alloc] init];
     _model = [model retain];
+    [_model _setInUse];
     _stores = [[NSMutableArray alloc] init];
     return self;
 }
@@ -111,7 +118,34 @@ static NSMutableDictionary *_storeTypes = nil;
         }
     }
 
+    if (storeType == nil) {
+        if (error != NULL)
+            *error = [NSError
+                    errorWithDomain: NSCocoaErrorDomain
+                               code: NSPersistentStoreInvalidTypeError
+                           userInfo: [NSDictionary
+                                             dictionaryWithObject:
+                                                     @"unknown or nil storeType argument or otherwise unable to infer storeType argument.  Inference requires an existing file with valid metadata."
+                                                           forKey: @"message"]];
+        return nil;
+    }
+
     Class class = [[[self class] registeredStoreTypes] objectForKey: storeType];
+    if (class == Nil)
+        [NSException raise: NSInvalidArgumentException
+                    format: @"Unsupported store type."];
+    if (storeURL == nil && [storeType isEqual: NSSQLiteStoreType])
+        [NSException raise: NSInvalidArgumentException
+                    format: @"Cannot create an SQL store with a nil URL."];
+    /* File-backed stores need a file URL; the in-memory store takes any URL. */
+    if ([storeType isEqual: NSXMLStoreType] ||
+        [storeType isEqual: NSSQLiteStoreType]) {
+        if (storeURL != nil && ![storeURL isFileURL])
+            [NSException raise: NSInvalidArgumentException
+                        format: @"CoreData %@ stores only support file URLs (got %@).",
+                                [storeType isEqual: NSXMLStoreType] ? @"XML" : @"SQL",
+                                storeURL];
+    }
     NSAtomicStore *store = [[[class alloc]
             initWithPersistentStoreCoordinator: self
                              configurationName: configuration
@@ -256,16 +290,10 @@ static NSMutableDictionary *_storeTypes = nil;
     for (check in _stores) {
         NSString *configurationName = [check configurationName];
 
-        if (configurationName == nil) {
-            NSArray *entities =
-                    [model entitiesForConfiguration: configurationName];
-
-            if ([entities containsObject: entity])
-                return check;
-        }
+        NSArray *entities = [model entitiesForConfiguration:configurationName];
+        if ([entities containsObject:entity]) return check;
     }
-
-    return [_stores objectAtIndex: 0];
+    return nil;
 }
 
 - (NSPersistentStore *) _persistentStoreForObject: (NSManagedObject *) object {
@@ -273,19 +301,30 @@ static NSMutableDictionary *_storeTypes = nil;
 }
 
 - (NSManagedObjectID *) managedObjectIDForURIRepresentation: (NSURL *) URL {
-    NSString *scheme = [URL scheme];
     NSString *host = [URL host];
     NSString *path = [URL path];
-    NSString *referenceObject = [path lastPathComponent];
+    NSString *component = [path lastPathComponent];
     NSString *entityName =
             [[path stringByDeletingLastPathComponent] lastPathComponent];
     NSManagedObjectModel *model = [self managedObjectModel];
     NSEntityDescription *entity =
             [[model entitiesByName] objectForKey: entityName];
 
-    return [(NSAtomicStore *) [self _persistentStoreWithIdentifier: host]
-            objectIDForEntity: entity
-              referenceObject: referenceObject];
+    if (![[URL scheme] isEqualToString: @"x-coredata"] || [host length] == 0 || entity == nil)
+        [NSException raise: NSInvalidArgumentException
+                    format: @"The specified URI is not a valid Core Data URI: %@", URL];
+
+    NSPersistentStore *store = [self _persistentStoreWithIdentifier: host];
+
+    if (![store isKindOfClass: [NSAtomicStore class]])
+        return nil;
+
+    id referenceObject = [store _referenceObjectForURIComponent: component];
+
+    if (referenceObject == nil)
+        return nil;
+    return [(NSAtomicStore *) store objectIDForEntity: entity
+                                      referenceObject: referenceObject];
 }
 
 @end

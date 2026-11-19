@@ -68,6 +68,10 @@ const CGFloat NSTableViewDefaultRowHeight = 16.0f;
 
 @end
 
+@interface NSTableHeaderView (NSTableHeaderViewDefaultHeight)
++ (CGFloat) _defaultHeight;
+@end
+
 @implementation NSTableView
 
 // The accessors are in the NSTableViewStyle category below.
@@ -263,10 +267,9 @@ const CGFloat NSTableViewDefaultRowHeight = 16.0f;
     NS_EXTRA(NSTableView, self)->_allowsEmptySelection = YES;
     NS_EXTRA(NSTableView, self)->_allowsColumnSelection = YES;
 
+    // The default header height is a QUIRK, see +[NSTableHeaderView _defaultHeight].
     _headerView = [[NSTableHeaderView alloc]
-            initWithFrame: NSMakeRect(0, 0, [self bounds].size.width,
-                                      _standardRowHeight +
-                                              _intercellSpacing.height)];
+            initWithFrame: NSMakeRect(0, 0, [self bounds].size.width, [NSTableHeaderView _defaultHeight])];
     [_headerView setTableView: self];
 
     _cornerView = [[NSTableCornerView alloc]
@@ -286,6 +289,7 @@ const CGFloat NSTableViewDefaultRowHeight = 16.0f;
 }
 
 - (void) dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver: self];
     NSZoneFree(NULL, NS_EXTRA(NSTableView, self)->_rowHeights);
     [_headerView release];
     [_cornerView release];
@@ -987,7 +991,7 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
              select: (BOOL) select
 {
     if (_editingCell)
-        [self textDidEndEditing: nil];
+        [self _finishEditingWithTextMovement: NSIllegalTextMovement];
 
     NSCell *editingCell;
     NSTableColumn *editingColumn = [_tableColumns objectAtIndex: column];
@@ -1172,7 +1176,7 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
             if ([NS_EXTRA(NSTableView, self)->_selectedRowIndexes containsIndex: i] !=
                 [newIndexes containsIndex: i]) {
                 if (_editedRow == i && _editingCell != nil)
-                    [self textDidEndEditing: nil];
+                    [self _finishEditingWithTextMovement: NSIllegalTextMovement];
 
                 [self setNeedsDisplay: YES];
                 changed = YES;
@@ -1425,7 +1429,7 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 
     // if there's any editing going on, we'd better stop it.
     if (_editingCell != nil)
-        [self textDidEndEditing: nil];
+        [self _finishEditingWithTextMovement: NSIllegalTextMovement];
 
     if (numberOfRows > 0) {
         size.width = [self rectOfRow: 0].size.width;
@@ -1531,17 +1535,54 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     }
 }
 
+// The selection is emphasized (drawn with the alternate selected colours) while the table's
+// window is the key window and the table is its first responder; otherwise it is drawn in
+// the secondary, grey colours.
+- (BOOL) _selectionIsEmphasized {
+    NSWindow *window = [self window];
+    id responder = [window firstResponder];
+
+    if (![window isKeyWindow] || responder == nil)
+        return NO;
+    if (responder == self)
+        return YES;
+    // A field editor of this table (editing a cell) keeps the selection emphasized
+    return [responder isKindOfClass: [NSText class]] && [(NSText *) responder delegate] == self;
+}
+
+- (NSColor *) _selectionHighlightColor {
+    return [self _selectionIsEmphasized] ? [NSColor alternateSelectedControlColor]
+                                         : [NSColor secondarySelectedControlColor];
+}
+
+- (void) _keyStateChanged: (NSNotification *) note {
+    [self setNeedsDisplay: YES];
+}
+
+- (BOOL) becomeFirstResponder {
+    [self setNeedsDisplay: YES];
+    return [super becomeFirstResponder];
+}
+
+- (BOOL) resignFirstResponder {
+    [self setNeedsDisplay: YES];
+    return [super resignFirstResponder];
+}
+
 - (void) drawHighlightedSelectionForColumn: (NSInteger) column
                                        row: (NSInteger) row
                                     inRect: (NSRect) rect
 {
-    [[NSColor selectedControlColor] setFill];
+    [[self _selectionHighlightColor] setFill];
     NSRectFill(rect);
 }
 
 - (void) highlightSelectionInClipRect: (NSRect) rect {
     NSInteger row, column;
     NSInteger numberOfRows = [self numberOfRows];
+
+    if ([self selectionHighlightStyle] == NSTableViewSelectionHighlightStyleNone)
+        return;
 
     for (column = 0; column < [_tableColumns count]; ++column)
         for (row = 0; row < numberOfRows; ++row)
@@ -1576,7 +1617,11 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
                                              // dont just set the color so
                                              // custom background works
             [(NSTextFieldCell *) dataCell
-                    setTextColor: [NSColor selectedTextColor]];
+                    setTextColor: ([self selectionHighlightStyle] !=
+                                           NSTableViewSelectionHighlightStyleNone &&
+                                   [self _selectionIsEmphasized])
+                                          ? [NSColor alternateSelectedControlTextColor]
+                                          : [NSColor selectedTextColor]];
         } else
             [(NSTextFieldCell *) dataCell setTextColor: [NSColor textColor]];
     }
@@ -1598,8 +1643,9 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
         NSRange visibleColumns = [self columnsInRect: clipRect];
         NSInteger drawThisColumn = visibleColumns.location;
 
-        if ([self isRowSelected: row]) {
-            [[NSColor selectedControlColor] setFill];
+        if ([self isRowSelected: row] &&
+            [self selectionHighlightStyle] != NSTableViewSelectionHighlightStyleNone) {
+            [[self _selectionHighlightColor] setFill];
             NSRectFill([self rectOfRow: row]);
         }
 
@@ -1643,8 +1689,10 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
             [_editingCell setControlView: self];
             [_editingCell drawWithFrame: NS_EXTRA(NSTableView, self)->_editingFrame inView: self];
             if ([_editingCell focusRingType] != NSFocusRingTypeNone) {
-                [[NSColor keyboardFocusIndicatorColor] setStroke];
-                NSFrameRectWithWidth(NS_EXTRA(NSTableView, self)->_editingBorder, 2.0);
+                [NSGraphicsContext saveGraphicsState];
+                NSSetFocusRingStyle(NSFocusRingOnly);
+                NSRectFill(NS_EXTRA(NSTableView, self)->_editingBorder);
+                [NSGraphicsContext restoreGraphicsState];
             }
         } else {
             NSCell *dataCell = [self preparedCellAtColumn: drawThisColumn
@@ -1670,30 +1718,37 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
         [(NSColor *) [rowColors objectAtIndex: 0] setFill];
         NSRectFill(clipRect);
     } else {
+        NSInteger numberOfRows = [self numberOfRows];
         NSRange rangeOfRows = [self rowsInRect: clipRect];
         NSInteger i;
-        NSRect rectToFill = clipRect;
-        CGFloat heightFilled = 0.;
 
-        for (i = rangeOfRows.location;
-             i < rangeOfRows.location + rangeOfRows.length; i++) {
-            rectToFill = [self rectOfRow: i];
+        for (i = rangeOfRows.location; i < NSMaxRange(rangeOfRows); i++) {
+            NSRect rectToFill = [self rectOfRow: i];
 
+            rectToFill.origin.x = clipRect.origin.x;
+            rectToFill.size.width = clipRect.size.width;
             [(NSColor *) [rowColors objectAtIndex: i % colorCount] setFill];
-            NSRectFill(rectToFill);
-            rectToFill.origin.y +=
-                    rectToFill.size.height; // This is for beyond the loop.
-            heightFilled = rectToFill.origin.y;
+            NSRectFill(NSIntersectionRect(rectToFill, clipRect));
         }
-        if ([self _effectiveRowHeight] > 0.) {
-            rectToFill.size.height =
-                    [self _effectiveRowHeight] + _intercellSpacing.height;
-            while (heightFilled < clipRect.size.height) {
-                [(NSColor *) [rowColors objectAtIndex: i % colorCount] setFill];
-                NSRectFill(rectToFill);
-                heightFilled += rectToFill.size.height;
-                rectToFill.origin.y += rectToFill.size.height;
-                i++;
+
+        // The stripes carry on below the last row at the height of a row, the colors
+        // continuing in sequence with the rows
+        CGFloat pitch = numberOfRows > 0 ? [self rectOfRow: 0].size.height
+                                         : [self _effectiveRowHeight] + _intercellSpacing.height;
+        if (pitch > 0.) {
+            CGFloat y = numberOfRows > 0 ? NSMaxY([self rectOfRow: numberOfRows - 1]) : 0.;
+            NSInteger index = numberOfRows;
+
+            if (NSMinY(clipRect) > y) {
+                NSInteger skipped = (NSInteger) floor((NSMinY(clipRect) - y) / pitch);
+                y += skipped * pitch;
+                index += skipped;
+            }
+            for (; y < NSMaxY(clipRect); y += pitch, index++) {
+                NSRect rectToFill = NSMakeRect(clipRect.origin.x, y, clipRect.size.width, pitch);
+
+                [(NSColor *) [rowColors objectAtIndex: index % colorCount] setFill];
+                NSRectFill(NSIntersectionRect(rectToFill, clipRect));
             }
         }
     }
@@ -1827,6 +1882,31 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     [self tile];
 }
 
+// The table extends at least over the visible height of its clip view, so that
+// the alternating row backgrounds continue below the last row. The scroll view has
+// laid out its clip view by the time the table reaches a window.
+- (void) viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    [[NSNotificationCenter defaultCenter] removeObserver: self
+                                                    name: NSWindowDidBecomeKeyNotification
+                                                  object: nil];
+    [[NSNotificationCenter defaultCenter] removeObserver: self
+                                                    name: NSWindowDidResignKeyNotification
+                                                  object: nil];
+    if ([self window] != nil) {
+        [[NSNotificationCenter defaultCenter] addObserver: self
+                                                 selector: @selector(_keyStateChanged:)
+                                                     name: NSWindowDidBecomeKeyNotification
+                                                   object: [self window]];
+        [[NSNotificationCenter defaultCenter] addObserver: self
+                                                 selector: @selector(_keyStateChanged:)
+                                                     name: NSWindowDidResignKeyNotification
+                                                   object: [self window]];
+    }
+    if ([self window] != nil && [[self superview] isKindOfClass: [NSClipView class]])
+        [self noteNumberOfRowsChanged];
+}
+
 - (BOOL) isFlipped {
     return YES;
 }
@@ -1870,9 +1950,15 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 }
 
 - (void) textDidEndEditing: (NSNotification *) note {
+    [self _finishEditingWithTextMovement:
+                  [[[note userInfo] objectForKey: @"NSTextMovement"] intValue]];
+}
+
+// Commits and ends the current cell edit. Internal callers that stop an edit
+// (row changes, reloads, clicks outside the rows) use this directly instead of
+// synthesizing a notification.
+- (void) _finishEditingWithTextMovement: (NSInteger) textMovement {
     NSTableColumn *editedColumn = [_tableColumns objectAtIndex: _editedColumn];
-    NSInteger textMovement =
-            [[[note userInfo] objectForKey: @"NSTextMovement"] intValue];
     NSInteger numberOfRows = [self numberOfRows];
 
     [_editingCell endEditing: NS_EXTRA(NSControl, self)->_currentEditor];
@@ -2135,7 +2221,7 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 
     if (NS_EXTRA(NSTableView, self)->_clickedRow < 0) { // click beyond the end of the table
         if (_editingCell != nil)
-            [self textDidEndEditing: nil];
+            [self _finishEditingWithTextMovement: NSIllegalTextMovement];
         [self selectRowIndexes: [NSIndexSet indexSet] byExtendingSelection: NO];
         [NS_EXTRA(NSTableView, self)->_selectedColumns removeAllObjects];
         return;

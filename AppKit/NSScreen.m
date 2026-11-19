@@ -24,9 +24,36 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSGraphics.h>
 #import <AppKit/NSScreen.h>
 #import <AppKit/NSWindow.h>
+#import <AppKit/NSWindow-Private.h>
 #include <math.h>
 
 NSNotificationName const NSScreenColorSpaceDidChangeNotification = @"NSScreenColorSpaceDidChangeNotification";
+
+// The monitor name of an EDID base block: the display product name descriptor (tag 0xFC) among the four 18-byte
+// descriptors that start at offset 54. Its text is at most 13 characters, ended by a line feed and padded with
+// spaces (VESA E-EDID). Answers nil when there is none.
+static NSString *monitorNameFromEDID(NSData *edid) {
+    const uint8_t *bytes = [edid bytes];
+    NSUInteger length = [edid length];
+
+    for (NSUInteger offset = 54; offset <= 108 && offset + 18 <= length; offset += 18) {
+        const uint8_t *descriptor = bytes + offset;
+
+        if (descriptor[0] != 0 || descriptor[1] != 0 || descriptor[3] != 0xFC)
+            continue;
+
+        NSUInteger count = 0;
+        while (count < 13 && descriptor[5 + count] != 0x0A)
+            count++;
+        while (count > 0 && descriptor[5 + count - 1] == ' ')
+            count--;
+        if (count > 0)
+            return [[[NSString alloc] initWithBytes: descriptor + 5
+                                             length: count
+                                           encoding: NSASCIIStringEncoding] autorelease];
+    }
+    return nil;
+}
 
 @implementation NSScreen
 
@@ -78,12 +105,48 @@ NSNotificationName const NSScreenColorSpaceDidChangeNotification = @"NSScreenCol
     return 1.0;
 }
 
+// Whether the screen can show the gamut. Screens are described as sRGB (see -colorSpace), so only
+// the sRGB gamut is representable; wider ones are not.
+- (BOOL) canRepresentDisplayGamut: (NSDisplayGamut) displayGamut {
+    return displayGamut == NSDisplayGamutSRGB;
+}
+
+// The backing store of a screen has -backingScaleFactor pixels per point; the conversions scale the
+// rect and nothing else.
+- (NSRect) convertRectToBacking: (NSRect) rect {
+    CGFloat scale = [self backingScaleFactor];
+
+    return NSMakeRect(rect.origin.x * scale, rect.origin.y * scale,
+                      rect.size.width * scale, rect.size.height * scale);
+}
+
+- (NSRect) convertRectFromBacking: (NSRect) rect {
+    CGFloat scale = [self backingScaleFactor];
+
+    if (!(scale > 0))
+        scale = 1.0;
+    return NSMakeRect(rect.origin.x / scale, rect.origin.y / scale,
+                      rect.size.width / scale, rect.size.height / scale);
+}
+
+// The rect with its edges moved onto whole backing pixels as the options ask.
+- (NSRect) backingAlignedRect: (NSRect) rect options: (NSAlignmentOptions) options {
+    return [self convertRectFromBacking:
+                         _NSAlignRectToPixelGrid([self convertRectToBacking: rect], options)];
+}
+
 // No ICC profile is read from the display, so the screen is described as sRGB.
 - (NSColorSpace *) colorSpace {
     return [NSColorSpace sRGBColorSpace];
 }
 
+// The name the monitor reports in its EDID when the backend has read one, else a generic name with the display ID.
 - (NSString *) localizedName {
+    NSData *edid = NS_EXTRA(NSScreen, self)->_edid;
+    NSString *name = edid != nil ? monitorNameFromEDID(edid) : nil;
+
+    if (name != nil)
+        return name;
     return [NSString stringWithFormat: @"Display %u",
                                        (unsigned) [self cgDirectDisplayID]];
 }

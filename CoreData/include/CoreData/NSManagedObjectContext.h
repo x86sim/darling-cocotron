@@ -21,13 +21,18 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <Foundation/NSLock.h>
 #import <Foundation/NSObject.h>
 #import <Foundation/NSString.h>
+#import <dispatch/dispatch.h>
 
 @class NSSet, NSMutableSet, NSNotification, NSUndoManager, NSMapTable;
 @class NSManagedObject, NSManagedObjectID, NSFetchRequest, NSPersistentStore,
-        NSPersistentStoreCoordinator;
+        NSPersistentStoreCoordinator, NSPersistentStoreRequest;
 
+COREDATA_EXPORT NSString *const NSManagedObjectContextObjectsDidChangeNotification;
 COREDATA_EXPORT NSString *const NSManagedObjectContextWillSaveNotification;
 COREDATA_EXPORT NSString *const NSManagedObjectContextDidSaveNotification;
+COREDATA_EXPORT NSString *const NSManagedObjectContextObjectsDidChangeNotification;
+COREDATA_EXPORT NSString *const NSManagedObjectContextDidSaveObjectIDsNotification;
+COREDATA_EXPORT NSString *const NSManagedObjectContextDidMergeChangesObjectIDsNotification;
 
 COREDATA_EXPORT NSString *const NSInsertedObjectsKey;
 COREDATA_EXPORT NSString *const NSUpdatedObjectsKey;
@@ -35,10 +40,25 @@ COREDATA_EXPORT NSString *const NSDeletedObjectsKey;
 COREDATA_EXPORT NSString *const NSRefreshedObjectsKey;
 COREDATA_EXPORT NSString *const NSInvalidatedObjectsKey;
 COREDATA_EXPORT NSString *const NSInvalidatedAllObjectsKey;
+
+COREDATA_EXPORT NSString *const NSInsertedObjectIDsKey;
+COREDATA_EXPORT NSString *const NSUpdatedObjectIDsKey;
+COREDATA_EXPORT NSString *const NSDeletedObjectIDsKey;
+COREDATA_EXPORT NSString *const NSRefreshedObjectIDsKey;
+COREDATA_EXPORT NSString *const NSInvalidatedObjectIDsKey;
+
 COREDATA_EXPORT NSString *const NSPersistentStoreSaveConflictsErrorKey;
+
+typedef NS_ENUM(NSUInteger, NSManagedObjectContextConcurrencyType) {
+    NSConfinementConcurrencyType = 0,
+    NSPrivateQueueConcurrencyType = 1,
+    NSMainQueueConcurrencyType = 2
+};
 
 @interface NSManagedObjectContext : NSObject <NSLocking> {
     NSLock *_lock;
+    NSManagedObjectContextConcurrencyType _concurrencyType;
+    dispatch_queue_t _contextQueue;
     NSPersistentStoreCoordinator *_storeCoordinator;
     NSUndoManager *_undoManager;
     BOOL _retainsRegisteredObjects;
@@ -51,14 +71,23 @@ COREDATA_EXPORT NSString *const NSPersistentStoreSaveConflictsErrorKey;
     NSMutableSet *_insertedObjects;
     NSMutableSet *_updatedObjects;
     NSMutableSet *_deletedObjects;
+    NSMutableSet *_pendingInserted, *_pendingUpdated, *_pendingDeleted, *_pendingRefreshed;
+    NSManagedObjectContext *_parentContext;
+    NSString *_name;
 
     NSMapTable *_objectIdToObject;
 
     BOOL _hasChanges;
+    BOOL _automaticallyMergesChangesFromParent, _mergingChanges;
 
     //
     BOOL _requestedProcessPendingChanges;
 }
+
+- (instancetype)initWithConcurrencyType:(NSManagedObjectContextConcurrencyType)type;
+@property(readonly) NSManagedObjectContextConcurrencyType concurrencyType;
+- (void)performBlock:(void (^)(void))block;
+- (void)performBlockAndWait:(void (^)(void))block;
 
 - (NSPersistentStoreCoordinator *) persistentStoreCoordinator;
 - (NSUndoManager *) undoManager;
@@ -66,6 +95,10 @@ COREDATA_EXPORT NSString *const NSPersistentStoreSaveConflictsErrorKey;
 - (BOOL) propagatesDeletesAtEndOfEvent;
 - (NSTimeInterval) stalenessInterval;
 - (id) mergePolicy;
+@property(nonatomic) BOOL automaticallyMergesChangesFromParent;
+// The context that saves of this context are pushed to; nil for a context that works on a coordinator.
+@property(nullable, nonatomic, retain) NSManagedObjectContext *parentContext;
+@property(nullable, nonatomic, copy) NSString *name;
 
 - (void) setPersistentStoreCoordinator: (NSPersistentStoreCoordinator *) value;
 - (void) setUndoManager: (NSUndoManager *) value;
@@ -102,6 +135,11 @@ COREDATA_EXPORT NSString *const NSPersistentStoreSaveConflictsErrorKey;
 - (NSUInteger) countForFetchRequest: (NSFetchRequest *) request
                               error: (NSError **) error NS_SWIFT_NAME(count(for:))
         __attribute__((swift_error(nonnull_error)));
+
+// Runs an NSBatchUpdateRequest or NSBatchDeleteRequest and returns its result object. Other
+// request kinds are not supported: nil is returned with NSPersistentStoreOperationError.
+- (id) executeRequest: (NSPersistentStoreRequest *) request
+                error: (NSError **) error;
 
 - (void) insertObject: (NSManagedObject *) object;
 - (void) deleteObject: (NSManagedObject *) object;

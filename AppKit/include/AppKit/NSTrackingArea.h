@@ -25,6 +25,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
 @class NSView;
 
+NS_ASSUME_NONNULL_BEGIN
+
 typedef NS_OPTIONS(NSUInteger, NSTrackingAreaOptions) {
     NSTrackingMouseEnteredAndExited = (1 << 0),
     NSTrackingMouseMoved = (1 << 1),
@@ -63,25 +65,33 @@ typedef NS_OPTIONS(NSUInteger, NSTrackingAreaOptions) {
     // be discarded by -[NSView discardCursorRects] (and -[NSWindow
     // discardCursorRects]).
     BOOL _legacy;
+    // Identifies the area to the tag based API (-addTrackingRect:...,
+    // -addToolTipRect:...) and in events (-[NSEvent trackingNumber]). Unique
+    // for the life of the process, so a tag that outlives its area never
+    // names another area.
+    NSInteger _tag;
+    // YES for an area created through the tag based API; events of such areas
+    // have no -trackingArea.
+    BOOL _fromTagAPI;
     NS_EXTRA_IVARS_END(NSTrackingArea)
 }
 
 // Apple documented
-- (id) initWithRect: (NSRect) rect
+- (instancetype) initWithRect: (NSRect) rect
             options: (NSTrackingAreaOptions) options
-              owner: (id) owner
-           userInfo: (NSDictionary *) userInfo;
+              owner: (nullable id) owner
+           userInfo: (nullable NSDictionary<id, id> *) userInfo;
 
 - (NSRect) rect;
 - (NSTrackingAreaOptions) options;
-- (id) owner;
-- (NSDictionary *) userInfo;
+- (nullable id) owner;
+- (nullable NSDictionary<id, id> *) userInfo;
 
 // undocumented
-- (id) _initWithRect: (NSRect) rect
+- (null_unspecified id) _initWithRect: (NSRect) rect
                options: (NSTrackingAreaOptions) options
-                 owner: (id) owner
-              userData: (void *) userData
+                 owner: (null_unspecified id) owner
+              userData: (null_unspecified void *) userData
         retainUserData: (BOOL) retainUserData
              isToolTip: (BOOL) isToolTip
               isLegacy: (BOOL) legacy;
@@ -89,11 +99,16 @@ typedef NS_OPTIONS(NSUInteger, NSTrackingAreaOptions) {
 //-(void)_setRect:(NSRect)rect;
 - (NSRect) _rectInWindow;
 - (void) _setRectInWindow: (NSRect) rectInWindow;
-- (NSView *) _view;
-- (void) _setView: (NSView *) newView;
+- (null_unspecified NSView *) _view;
+- (void) _setView: (null_unspecified NSView *) newView;
 - (BOOL) _isToolTip;
 - (BOOL) _isLegacy;
+- (NSInteger) _tag;
+- (BOOL) _isFromTagAPI;
+- (void) _setFromTagAPI: (BOOL) fromTagAPI;
 - (BOOL) _mouseInside;
 - (void) _setMouseInside: (BOOL) mouseInside;
 
 @end
+
+NS_ASSUME_NONNULL_END

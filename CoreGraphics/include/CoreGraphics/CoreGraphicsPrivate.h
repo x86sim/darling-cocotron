@@ -129,6 +129,10 @@ extern int CGSServerOperationState(int state);
 extern CGError CGSAddSurface(CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID *sid);
 extern CGError CGSRemoveSurface(CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID sid);
 extern CGError CGSSetSurfaceBounds(CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID sid, CGRect rect);
+extern CGError CGSGetSurfaceBounds(CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID sid, CGRect *outBounds);
+extern CGError CGSGetWindowBounds(CGSConnectionID cid, CGSWindowID wid, CGRect *outBounds);
+// Shows the cursor and forgets all pending counted hides. Returns nothing.
+extern void CGSForceShowCursor(CGSConnectionID cid);
 extern CGError CGSOrderSurface(CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID sid, int a, int b);
 //extern CGLError CGLSetSurface(CGLContextObj gl, CGSConnectionID cid, CGSWindowID wid, CGSSurfaceID sid); // in CGL
 
@@ -202,9 +206,16 @@ extern void CGContextSetFontSmoothingStyle(CGContextRef context, uint32_t style)
 // through a per-process Darwin notification that the process' own windowing backend
 // answers; so success only means the request was made. Returns kCGErrorIllegalArgument
 // for a pid that is not positive, kCGErrorSuccess otherwise, and
-// kCGErrorCannotComplete when no request could be made.
+// kCGErrorCannotComplete when no request could be made, which includes a process (other than the
+// caller) that never connected to the window system, see _CGSProcessHasConnection().
 #define kCGSActivateProcessFrontWindowOnly 1
 CGError _CGSActivateProcess(pid_t pid, uint32_t options);
+// Whether the process with this pid is a live process that has connected to the window system,
+// as every process does that creates a connection (CGSNewConnection, CGSMainConnectionID; AppKit
+// does so when NSApplication is created). Processes that never did, such as command line tools
+// and system daemons, are not applications of the window system.
+Boolean _CGSProcessHasConnection(pid_t pid);
+#define kCGSProcessConnectionNotificationPrefix "org.darlinghq.process-connection."
 // The Darling process that has the input focus. The display server answers where it can (X11:
 // the owner of _NET_ACTIVE_WINDOW). A Wayland compositor does not tell clients, so the answer
 // is the process that most recently reported (through _CGSSetFrontProcess) that it was
@@ -213,11 +224,40 @@ CGError _CGSActivateProcess(pid_t pid, uint32_t options);
 CGError _CGSGetFrontProcess(pid_t* pid);
 // Reports that the process with this pid got the input focus. A windowing backend calls it
 // with its own pid when its windows get the focus on a display server that cannot be asked.
+// Every call posts the libnotify name kCGSFrontProcessNotificationName (below), so that processes
+// that follow the front process can ask _CGSGetFrontProcess() again.
 CGError _CGSSetFrontProcess(pid_t pid);
+// Reports that the process with this pid lost the input focus. When it is still the recorded front
+// process, no process is known to have the focus until one reports (a window system that cannot be
+// asked, such as a Wayland compositor, has focus on a process that is not a Darling process, or on
+// none). Posts the same name as _CGSSetFrontProcess().
+CGError _CGSResignFrontProcess(pid_t pid);
 // The name of the Darwin notification that asks the process with this pid to activate its
 // windows (see above); a windowing backend observes the name of its own process.
 #define kCGSProcessActivationNotificationPrefix "org.darlinghq.process-activation."
-// The libnotify name whose state holds the pid _CGSSetFrontProcess() stored.
+
+// Commands for the application of another process: a libnotify notification named after the target
+// process, which AppKit's application object answers (hide, unhide, and the quit request, which takes
+// the application's normal quit path).
+#define kCGSProcessHideNotificationPrefix "org.darlinghq.process-hide."
+#define kCGSProcessUnhideNotificationPrefix "org.darlinghq.process-unhide."
+#define kCGSProcessQuitNotificationPrefix "org.darlinghq.process-quit."
+#define kCGSProcessCommandHide 1
+#define kCGSProcessCommandUnhide 2
+#define kCGSProcessCommandQuit 3
+// Posts the command to the process. Returns kCGErrorIllegalArgument for a pid that is not positive or
+// an unknown command, kCGErrorCannotComplete for a process (other than the caller) that is not a
+// live application of the window system (see _CGSProcessHasConnection()), kCGErrorSuccess otherwise;
+// success means the request was made, not carried out.
+CGError _CGSSendProcessCommand(pid_t pid, uint32_t command);
+// Publishes the hidden state of the calling process' application for other processes.
+void _CGSSetProcessHidden(Boolean hidden);
+// Whether the application of the process with this pid is hidden. False for a process that is gone
+// or is not an application.
+Boolean _CGSProcessIsHidden(pid_t pid);
+
+// The libnotify name whose state holds the pid _CGSSetFrontProcess() stored, and which is posted
+// whenever the front process may have changed.
 #define kCGSFrontProcessNotificationName "org.darlinghq.front-process"
 
 void* _CGSNativeDisplay(CGSConnectionID connId);

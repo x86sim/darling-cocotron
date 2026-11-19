@@ -22,6 +22,7 @@
 // and the registrar is com.canonical.AppMenu.Registrar, as published at
 // https://github.com/KDE/plasma-workspace/blob/master/appmenu/com.canonical.AppMenu.Registrar.xml
 
+#import <AppKit/NSDisplay.h>
 #import <AppKit/NSDBusMenu.h>
 #import <AppKit/NSEvent.h>
 #import <AppKit/NSMenu.h>
@@ -150,8 +151,9 @@ static BOOL addressAllowed(const char *address) {
     return strstr(address, "unixexec") == NULL;
 }
 
-// The address to connect to, or nil.
-static NSString *sessionBusAddress(void) {
+// The address to connect to, or nil. Shared with the other users of the
+// session bus in AppKit (declared in NSDBusMenu.h).
+NSString *DarlingSessionBusAddress(void) {
     const char *env = getenv("DBUS_SESSION_BUS_ADDRESS");
 
     if (env != NULL && env[0] != '\0')
@@ -232,8 +234,9 @@ static NSString *shortcutKeyName(NSString *key) {
 }
 
 // The shortcut as the array of strings the protocol uses: the modifiers, then
-// the key. The Command key is the key that acts as it on this system, which
-// is Control by default (see NSModifierFlagMapping).
+// the key. The modifiers are the host keys that deliver them (Command is Super,
+// or Control where the display delivers Control as Command for the key), as the
+// menus show them.
 static NSArray *shortcutForItem(NSMenuItem *item) {
     NSString *key = [item keyEquivalent];
 
@@ -242,15 +245,22 @@ static NSArray *shortcutForItem(NSMenuItem *item) {
 
     NSUInteger mask = [item keyEquivalentModifierMask];
     NSMutableArray *parts = [NSMutableArray array];
+    BOOL commandIsControl = NO;
 
-    if (mask & NSCommandKeyMask)
+    if ((mask & NSCommandKeyMask) && !(mask & NSControlKeyMask) && [key length] == 1) {
+        commandIsControl = [[NSDisplay currentDisplay]
+                controlStandsInForCommand: (mask & ~NSCommandKeyMask) | NSControlKeyMask
+                            keyEquivalent: [[key lowercaseString] characterAtIndex: 0]];
+    }
+
+    if ((mask & NSControlKeyMask) || commandIsControl)
         [parts addObject: @"Control"];
     if (mask & NSAlternateKeyMask)
         [parts addObject: @"Alt"];
     if ((mask & NSShiftKeyMask) ||
         ![key isEqualToString: [key lowercaseString]])
         [parts addObject: @"Shift"];
-    if (mask & NSControlKeyMask)
+    if ((mask & NSCommandKeyMask) && !commandIsControl)
         [parts addObject: @"Super"];
     [parts addObject: shortcutKeyName(key)];
     return [NSArray arrayWithObject: parts];
@@ -295,7 +305,7 @@ static void socketCallback(CFSocketRef s, CFSocketCallBackType type,
     if ((self = [super init]) == nil)
         return nil;
 
-    NSString *address = sessionBusAddress();
+    NSString *address = DarlingSessionBusAddress();
     DBusError error;
     dbus_error_init(&error);
 

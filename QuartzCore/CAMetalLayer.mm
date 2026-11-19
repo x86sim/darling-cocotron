@@ -26,6 +26,14 @@
 #import <QuartzCore/CALayerContext.h>
 #import <Metal/stubs.h>
 
+#import <Metal/MTLDeviceInternal.h>
+#import <QuartzCore/CAMetalLayerSurface.h>
+#import "CALayerPlane.h"
+
+#if DARLING_METAL_ENABLED
+#include <indium-kit/layer.hpp>
+#endif
+
 #include <algorithm>
 
 #import "CALayerInternal.h"
@@ -70,11 +78,11 @@ static const char kCAMetalLayerInternalKey = 0;
 			internal = (CAMetalLayerInternal *)objc_getAssociatedObject(self, &kCAMetalLayerInternalKey);
 			if (!internal) {
 				internal = [[CAMetalLayerInternal alloc] init];
-				if (_context) {
-					[internal _setContext:_context];
+				if (NS_EXTRA(CALayer, self)->_context) {
+					[internal _setContext:NS_EXTRA(CALayer, self)->_context];
 				}
-				if (!CGSizeEqualToSize(_bounds.size, CGSizeZero)) {
-					[internal setBounds:_bounds];
+				if (!CGSizeEqualToSize(NS_EXTRA(CALayer, self)->_bounds.size, CGSizeZero)) {
+					[internal setBounds:NS_EXTRA(CALayer, self)->_bounds];
 				}
 				objc_setAssociatedObject(self, &kCAMetalLayerInternalKey, internal, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 				[internal release];
@@ -107,8 +115,8 @@ static const char kCAMetalLayerInternalKey = 0;
 	[super _setContext:context];
 	if ([self class] != [CAMetalLayerInternal class]) {
 		CAMetalLayerInternal *internal = [self _metalInternal];
-		if (CGSizeEqualToSize([internal drawableSize], CGSizeZero) && !CGSizeEqualToSize(_bounds.size, CGSizeZero)) {
-			[internal setDrawableSize:_bounds.size];
+		if (CGSizeEqualToSize([internal drawableSize], CGSizeZero) && !CGSizeEqualToSize(NS_EXTRA(CALayer, self)->_bounds.size, CGSizeZero)) {
+			[internal setDrawableSize:NS_EXTRA(CALayer, self)->_bounds.size];
 		}
 		[internal _setContext:context];
 	}
@@ -306,6 +314,46 @@ MTL_UNSUPPORTED_CLASS
 
 @end
 
+
+#if DARLING_METAL_ENABLED
+
+static Indium::PixelFormat indiumPixelFormat(MTLPixelFormat pixelFormat) {
+	switch (pixelFormat) {
+		case MTLPixelFormatBGRA8Unorm:      return Indium::PixelFormat::BGRA8Unorm;
+		case MTLPixelFormatBGRA8Unorm_sRGB: return Indium::PixelFormat::BGRA8Unorm_sRGB;
+		case MTLPixelFormatRGBA16Float:     return Indium::PixelFormat::RGBA16Float;
+		case MTLPixelFormatRGB10A2Unorm:    return Indium::PixelFormat::RGB10A2Unorm;
+		case MTLPixelFormatBGR10A2Unorm:    return Indium::PixelFormat::BGR10A2Unorm;
+		case MTLPixelFormatBGRA10_XR:       return Indium::PixelFormat::BGRA10_XR;
+		case MTLPixelFormatBGRA10_XR_sRGB:  return Indium::PixelFormat::BGRA10_XR_sRGB;
+		case MTLPixelFormatBGR10_XR:        return Indium::PixelFormat::BGR10_XR;
+		case MTLPixelFormatBGR10_XR_sRGB:   return Indium::PixelFormat::BGR10_XR_sRGB;
+		default:                            return Indium::PixelFormat::Invalid;
+	}
+};
+
+// CAMetalLayerForceOpenGL makes every Metal layer present through the layer context's OpenGL
+// rendering even where it could present through a swapchain on its own native window. The
+// application's own value wins; otherwise the user's org.darlinghq.QuartzCore domain decides, so
+// it can be set for all applications. NO when unset. Read once per process.
+static BOOL forcesOpenGLPresentation(void) {
+	static BOOL value;
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		CFStringRef key = CFSTR("CAMetalLayerForceOpenGL");
+		Boolean valid = false;
+		Boolean flag = CFPreferencesGetAppBooleanValue(key, kCFPreferencesCurrentApplication, &valid);
+
+		if (!valid)
+			flag = CFPreferencesGetAppBooleanValue(key, CFSTR("org.darlinghq.QuartzCore"), &valid);
+		value = valid && flag;
+	});
+	return value;
+}
+
+#endif
+
 @implementation CAMetalLayerInternal
 
 #if DARLING_METAL_ENABLED
@@ -327,8 +375,8 @@ MTL_UNSUPPORTED_CLASS
 		_pixelFormat = MTLPixelFormatBGRA8Unorm;
 		_framebufferOnly = YES;
 		// Unlike other layers, Metal layers are opaque by default.
-		_opaque = YES;
-		_drawableSize = _bounds.size; // TODO: multiply by contentsScale, once we add that to CALayer
+		NS_EXTRA(CALayer, self)->_opaque = YES;
+		_drawableSize = NS_EXTRA(CALayer, self)->_bounds.size; // TODO: multiply by contentsScale, once we add that to CALayer
 		_displaySyncEnabled = YES;
 		_maximumDrawableCount = 3;
 		_allowsNextDrawableTimeout = YES;
@@ -341,6 +389,7 @@ MTL_UNSUPPORTED_CLASS
 
 - (void)dealloc
 {
+	[self tearDownSwapchain];
 	[_device release];
 	if (_colorspace) {
 		CGColorSpaceRelease(_colorspace);
@@ -452,7 +501,7 @@ MTL_UNSUPPORTED_CLASS
 
 - (void)setBounds: (CGRect)value
 {
-	CGSize oldSize = _bounds.size;
+	CGSize oldSize = NS_EXTRA(CALayer, self)->_bounds.size;
 	[super setBounds: value];
 
 	if (!_drawableSizeExplicitlySet) {
@@ -471,6 +520,10 @@ MTL_UNSUPPORTED_CLASS
 
 - (id<CAMetalDrawable>)nextDrawable
 {
+	if ([self presentsThroughSwapchain]) {
+		return [self nextSwapchainDrawable];
+	}
+
 	std::shared_ptr<CAMetalDrawableActual> drawable = nullptr;
 
 	[_drawableCondition lock];
@@ -488,7 +541,7 @@ MTL_UNSUPPORTED_CLASS
 		// down, so on the main thread it stays valid, and the retain covers the unlocked
 		// window while a presented handler runs. Other threads never read it.
 		if ([NSThread isMainThread] && _queuedDrawableCount > 0) {
-			CALayerContext* context = [_context retain];
+			CALayerContext* context = [NS_EXTRA(CALayer, self)->_context retain];
 			if (context != nil) {
 				NSUInteger queuedBefore = _queuedDrawableCount;
 				[_drawableCondition unlock];
@@ -559,6 +612,262 @@ MTL_UNSUPPORTED_CLASS
 	[_drawableCondition unlock];
 
 	return [[[CAMetalDrawableInternal alloc] initWithLayer: self drawable: drawable] autorelease];
+}
+
+
+//
+// presenting through a swapchain on a native window
+//
+
+// Where the layer is in its context's native window: points, origin at the lower left. Only used while
+// the layer may be on its own plane, which it is only when nothing between it and the root is transformed.
+- (CGRect)frameInContext
+{
+	return CALayerPlaneFrameInRoot(self, [NS_EXTRA(CALayer, self)->_context layer]);
+}
+
+- (BOOL)presentsThroughSwapchain
+{
+	@synchronized(self) {
+		return _swapchainLayer != nullptr;
+	}
+}
+
+// Drops the swapchain and the native surface it presented to.
+- (void)tearDownSwapchain
+{
+	std::shared_ptr<IndiumKit::Layer> swapchain;
+	id<CAMetalLayerSurfaceProvider> provider = nil;
+
+	@synchronized(self) {
+		swapchain = std::move(_swapchainLayer);
+		_swapchainLayer = nullptr;
+		provider = _surfaceProvider;
+		_surfaceProvider = nil;
+		_nativeSurface = (CANativeSurface) {};
+	}
+
+	// the swapchain goes before the window it presents to
+	swapchain.reset();
+	if (provider) {
+		[provider destroyMetalSurfaceForLayer: self];
+		[provider release];
+	}
+
+	[_drawableCondition lock];
+	_swapchainOutstanding = 0;
+	[_drawableCondition broadcast];
+	[_drawableCondition unlock];
+}
+
+// Moves the native surface to where the layer is now, when that changed.
+- (void)syncSurfaceFrame
+{
+	id<CAMetalLayerSurfaceProvider> provider;
+	CGRect frame = [self frameInContext];
+
+	@synchronized(self) {
+		if (!_swapchainLayer || CGRectEqualToRect(frame, _surfaceFrame)) {
+			return;
+		}
+		provider = [_surfaceProvider retain];
+	}
+
+	CANativeSurface surface = {};
+	BOOL updated = [provider updateMetalSurface: &surface forLayer: self frame: frame];
+	[provider release];
+
+	if (updated) {
+		@synchronized(self) {
+			_surfaceFrame = frame;
+			_nativeSurface = surface;
+		}
+	}
+}
+
+// Sets up, keeps in step with the layer's properties, or drops the swapchain, and says whether the layer
+// presents through one. Called without the drawable lock held. It presents through a swapchain when the
+// layer may be on a plane of its own (nothing is drawn over it, see -prepareRender), the context's native
+// window can give it a surface of its own, the device can present to that, and the drawables are the size
+// of that surface (a swapchain cannot give any other size).
+- (BOOL)updateSwapchain
+{
+	CALayerContext* context = NS_EXTRA(CALayer, self)->_context;
+	id subwindow = [context subwindow];
+	BOOL possible = !forcesOpenGLPresentation() && _planeAllowed && _device != nil && context != nil &&
+	                _drawableSize.width >= 1 && _drawableSize.height >= 1 &&
+	                [subwindow conformsToProtocol: @protocol(CAMetalLayerSurfaceProvider)];
+	Indium::PixelFormat pixelFormat = indiumPixelFormat(_pixelFormat);
+
+	if (possible && (pixelFormat == Indium::PixelFormat::Invalid || (subwindow == _refusedSubwindow && _device == _refusedDevice))) {
+		possible = NO;
+	}
+
+	std::shared_ptr<IndiumKit::Layer> swapchain;
+	id<CAMetalLayerSurfaceProvider> provider = nil;
+	@synchronized(self) {
+		swapchain = _swapchainLayer;
+		provider = _surfaceProvider;
+	}
+
+	// a different window or device than the swapchain was made for starts over
+	if (swapchain && (!possible || subwindow != provider)) {
+		swapchain.reset();
+		[self tearDownSwapchain];
+	}
+
+	if (!possible) {
+		return NO;
+	}
+
+	CGRect frame = [self frameInContext];
+
+	// A swapchain cannot give drawables of any other size than its window's, so a layer that asks for
+	// another (a drawableSize that differs from the view's size in pixels) is left to the OpenGL path.
+	CGSize pixelSize = [subwindow pixelSizeForMetalSurfaceFrame: frame];
+	if (fabs(pixelSize.width - _drawableSize.width) >= 1 || fabs(pixelSize.height - _drawableSize.height) >= 1) {
+		if (swapchain) {
+			swapchain.reset();
+			[self tearDownSwapchain];
+		}
+		return NO;
+	}
+
+	CANativeSurface surface = {};
+
+	if (swapchain) {
+		if (![subwindow updateMetalSurface: &surface forLayer: self frame: frame]) {
+			swapchain.reset();
+			[self tearDownSwapchain];
+			return NO;
+		}
+	} else {
+		if (![subwindow createMetalSurface: &surface forLayer: self frame: frame]) {
+			_refusedSubwindow = subwindow;
+			_refusedDevice = _device;
+			return NO;
+		}
+
+		VkSurfaceKHR vulkanSurface = VK_NULL_HANDLE;
+		auto device = ((MTLDeviceInternal*)_device).device;
+
+		if (surface.kind == CANativeSurfaceKindXlib) {
+			vulkanSurface = IndiumKit::createXlibSurface(surface.display, surface.window);
+		} else if (surface.kind == CANativeSurfaceKindWayland) {
+			vulkanSurface = IndiumKit::createWaylandSurface(surface.display, surface.surface);
+		}
+
+		if (vulkanSurface != VK_NULL_HANDLE && !IndiumKit::canPresent(device, vulkanSurface)) {
+			IndiumKit::destroySurface(vulkanSurface);
+			vulkanSurface = VK_NULL_HANDLE;
+		}
+
+		if (vulkanSurface != VK_NULL_HANDLE) {
+			swapchain = IndiumKit::Layer::make(vulkanSurface, device, surface.pixelSize.width, surface.pixelSize.height);
+			if (!swapchain) {
+				// the layer takes the surface only when it succeeds
+				IndiumKit::destroySurface(vulkanSurface);
+			}
+		}
+
+		if (swapchain && !swapchain->setPixelFormat(pixelFormat)) {
+			swapchain.reset();
+		}
+
+		if (!swapchain) {
+			// this device cannot present to this window system, or not in this format: do not try again
+			// until the window or the device changes
+			_refusedSubwindow = subwindow;
+			_refusedDevice = _device;
+			[subwindow destroyMetalSurfaceForLayer: self];
+			return NO;
+		}
+
+		@synchronized(self) {
+			_swapchainLayer = swapchain;
+			_surfaceProvider = [subwindow retain];
+		}
+	}
+
+	swapchain->setFramebufferSize(surface.pixelSize.width, surface.pixelSize.height);
+	swapchain->setImageCount(_maximumDrawableCount);
+	swapchain->setFramebufferOnly(_framebufferOnly);
+	swapchain->setDisplaySyncEnabled(_displaySyncEnabled);
+
+	@synchronized(self) {
+		_surfaceFrame = frame;
+		_nativeSurface = surface;
+	}
+
+	return YES;
+}
+
+- (id<CAMetalDrawable>)nextSwapchainDrawable
+{
+	std::shared_ptr<IndiumKit::Layer> swapchain;
+	@synchronized(self) {
+		swapchain = _swapchainLayer;
+	}
+	if (!swapchain) {
+		return nil;
+	}
+
+	NSDate* endTime = [NSDate dateWithTimeIntervalSinceNow: 1];
+
+	// at most maximumDrawableCount drawables are out at once; the one that would be the next waits
+	// for a present of another
+	[_drawableCondition lock];
+	while (_swapchainOutstanding >= _maximumDrawableCount) {
+		if (_allowsNextDrawableTimeout) {
+			if (![_drawableCondition waitUntilDate: endTime]) {
+				[_drawableCondition unlock];
+				return nil;
+			}
+		} else {
+			[_drawableCondition wait];
+		}
+	}
+	++_swapchainOutstanding;
+	NSUInteger drawableID = _nextSwapchainDrawableID++;
+	[_drawableCondition unlock];
+
+	std::shared_ptr<IndiumKit::Drawable> drawable;
+
+	for (;;) {
+		NSTimeInterval remaining = [endTime timeIntervalSinceNow];
+		uint64_t timeout = remaining > 0 ? (uint64_t)(remaining * 1e9) : 0;
+		drawable = swapchain->nextDrawable(timeout);
+
+		if (drawable || _allowsNextDrawableTimeout) {
+			break;
+		}
+
+		// without a timeout the call waits for as long as the layer is on its swapchain
+		endTime = [NSDate dateWithTimeIntervalSinceNow: 1];
+		@synchronized(self) {
+			if (swapchain != _swapchainLayer) {
+				break;
+			}
+		}
+	}
+
+	if (!drawable) {
+		[self releaseSwapchainDrawable];
+		return nil;
+	}
+
+	auto wrapped = std::make_shared<CAMetalSwapchainDrawable>(self, drawable, drawableID);
+	return [[[CAMetalDrawableInternal alloc] initWithLayer: self drawable: wrapped] autorelease];
+}
+
+- (void)releaseSwapchainDrawable
+{
+	[_drawableCondition lock];
+	if (_swapchainOutstanding > 0) {
+		--_swapchainOutstanding;
+	}
+	[_drawableCondition broadcast];
+	[_drawableCondition unlock];
 }
 
 - (void)queuePresent: (NSUInteger)drawableID
@@ -639,6 +948,9 @@ MTL_UNSUPPORTED_CLASS
 
 - (void)recreateDrawables
 {
+	// decided before the drawable lock is taken, as dropping a swapchain takes it
+	BOOL swapchain = [self updateSwapchain];
+
 	[_drawableCondition lock];
 
 	// drop all queued presentations
@@ -662,39 +974,32 @@ MTL_UNSUPPORTED_CLASS
 	}
 	_usableDrawablesBitmap = 0;
 
-	if (!_device || !_context.glContext || _drawableSize.width == 0 || _drawableSize.height == 0) {
+	// A layer that can present to a native window through a swapchain has no use for the pool below.
+	if (swapchain) {
+		[_drawableCondition unlock];
+		return;
+	}
+
+	if (!_device || !NS_EXTRA(CALayer, self)->_context.glContext || _drawableSize.width == 0 || _drawableSize.height == 0) {
 		// can't create new drawables
 		[_drawableCondition unlock];
 		return;
 	}
 
-	Indium::PixelFormat pixelFormat;
-
-	switch (_pixelFormat) {
-		case MTLPixelFormatBGRA8Unorm:      pixelFormat = Indium::PixelFormat::BGRA8Unorm;      break;
-		case MTLPixelFormatBGRA8Unorm_sRGB: pixelFormat = Indium::PixelFormat::BGRA8Unorm_sRGB; break;
-		case MTLPixelFormatRGBA16Float:     pixelFormat = Indium::PixelFormat::RGBA16Float;     break;
-		case MTLPixelFormatRGB10A2Unorm:    pixelFormat = Indium::PixelFormat::RGB10A2Unorm;    break;
-		case MTLPixelFormatBGR10A2Unorm:    pixelFormat = Indium::PixelFormat::BGR10A2Unorm;    break;
-		case MTLPixelFormatBGRA10_XR:       pixelFormat = Indium::PixelFormat::BGRA10_XR;       break;
-		case MTLPixelFormatBGRA10_XR_sRGB:  pixelFormat = Indium::PixelFormat::BGRA10_XR_sRGB;  break;
-		case MTLPixelFormatBGR10_XR:        pixelFormat = Indium::PixelFormat::BGR10_XR;        break;
-		case MTLPixelFormatBGR10_XR_sRGB:   pixelFormat = Indium::PixelFormat::BGR10_XR_sRGB;   break;
-		default:                            pixelFormat = Indium::PixelFormat::Invalid;         break;
-	}
+	Indium::PixelFormat pixelFormat = indiumPixelFormat(_pixelFormat);
 
 	CGLContextObj prev = CGLGetCurrentContext();
-	CGLSetCurrentContext(_context.glContext);
+	CGLSetCurrentContext(NS_EXTRA(CALayer, self)->_context.glContext);
 
 	// ask the context once whether it can wait on the drawables' semaphores
-	if (_semaphoreProbeContext != _context.glContext) {
+	if (_semaphoreProbeContext != NS_EXTRA(CALayer, self)->_context.glContext) {
 		_glImportsSemaphores = CAMetalDrawableGLImportsSemaphores();
-		_semaphoreProbeContext = _context.glContext;
+		_semaphoreProbeContext = NS_EXTRA(CALayer, self)->_context.glContext;
 	}
 
 	// now let's start creating the new drawables
 	for (size_t i = 0; i < _maximumDrawableCount; ++i) {
-		_drawables[i] = std::make_shared<CAMetalDrawableActual>(self, _drawableSize, i, pixelFormat, ((MTLDeviceInternal*)self.device).device, _context.glContext, _glImportsSemaphores);
+		_drawables[i] = std::make_shared<CAMetalDrawableActual>(self, _drawableSize, i, pixelFormat, ((MTLDeviceInternal*)self.device).device, NS_EXTRA(CALayer, self)->_context.glContext, _glImportsSemaphores);
 		_usableDrawablesBitmap |= 1u << i;
 	}
 
@@ -729,6 +1034,41 @@ MTL_UNSUPPORTED_CLASS
 
 - (void)prepareRender
 {
+	// The native surface sits above everything the layer context composites, so the layer goes on it only
+	// while that looks the same as compositing it: nothing drawn over it, no transform, opacity or clip
+	// that a plane cannot show. Decided again every pass, as views move, hide and stack differently.
+	CALayerContext* context = NS_EXTRA(CALayer, self)->_context;
+	_planeAllowed = CALayerCanPresentOnOwnPlane(self, [context layer]);
+
+	if ([self presentsThroughSwapchain]) {
+		if (_planeAllowed) {
+			// A layer on a native window has no frame to composite, but it may have moved with its view.
+			[self syncSurfaceFrame];
+			return;
+		}
+		// Covered or changed in a way a plane cannot show: back to compositing, with the drawables
+		// it presents from now on.
+		_attemptedPlane = NO;
+		[self recreateDrawables];
+	} else {
+		// The layer's context gets its native window after the layer was configured, so the first render
+		// pass in a window is where a swapchain can be set up; it is tried again when the window or the
+		// device changes, or when the layer becomes uncovered.
+		id subwindow = [context subwindow];
+		if (subwindow != nil && _planeAllowed &&
+		    (subwindow != _attemptedSubwindow || _device != _attemptedDevice || !_attemptedPlane)) {
+			_attemptedSubwindow = subwindow;
+			_attemptedDevice = _device;
+			_attemptedPlane = YES;
+			[self recreateDrawables];
+			if ([self presentsThroughSwapchain]) {
+				return;
+			}
+		} else if (!_planeAllowed) {
+			_attemptedPlane = NO;
+		}
+	}
+
 	std::shared_ptr<CAMetalDrawableActual> drawable = nullptr;
 
 	[_drawableCondition lock];
@@ -740,6 +1080,8 @@ MTL_UNSUPPORTED_CLASS
 	[_drawableCondition unlock];
 
 	if (drawable) {
+		CAMetalDrawableWarnIfDisplayedOnAnotherDevice(std::dynamic_pointer_cast<Indium::PrivateDevice>(((MTLDeviceInternal*)_device).device));
+
 		// wait for the drawable to be fully rendered before copying it to the render texture
 		// (this is a GPU-side wait)
 		drawable->synchronizeRender();
@@ -771,6 +1113,10 @@ MTL_UNSUPPORTED_CLASS
 // same texture (via -_textureId) and reallocates it with -glTexImage2D.
 - (BOOL)_drawLayerContents: (CGRect)bounds opacity: (CGFloat)opacity
 {
+	// The layer's native window shows the frames, over what the tree draws beneath it.
+	if ([self presentsThroughSwapchain])
+		return YES;
+
 	if (_tex == 0)
 		return NO;
 
@@ -813,7 +1159,7 @@ MTL_UNSUPPORTED_CLASS
 // a blank bitmap, which the contents path would then upload over _tex.
 - (void)display
 {
-	[_context startTimerIfNeeded];
+	[NS_EXTRA(CALayer, self)->_context startTimerIfNeeded];
 }
 
 //
@@ -838,7 +1184,7 @@ MTL_UNSUPPORTED_CLASS
 
 - (void)_setContext: (CALayerContext*)context
 {
-	CALayerContext* previous = _context;
+	CALayerContext* previous = NS_EXTRA(CALayer, self)->_context;
 
 	[super _setContext: context];
 

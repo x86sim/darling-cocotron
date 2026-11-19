@@ -28,6 +28,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 // observed): the raw values follow the order of the documentation's table of cursors (top, bottom, left, right, topLeft,
 // topRight, bottomLeft, bottomRight; an earlier draft used top, left, bottom, right) and the bits are inward 1,
 // outward 2. The Swift name is the documented NSCursor.FrameResizePosition (Journal imports Swift symbols that name it).
+NS_ASSUME_NONNULL_BEGIN
+
 typedef NS_ENUM(NSUInteger, NSCursorFrameResizePosition) {
     NSCursorFrameResizePositionTop,
     NSCursorFrameResizePositionBottom,
@@ -57,7 +59,7 @@ typedef NS_OPTIONS(NSUInteger, NSCursorFrameResizeDirections) {
 }
 
 @property(class, readonly, retain, nonnull) NSCursor *currentCursor;
-@property(class, readonly, retain) NSCursor *currentSystemCursor;
+@property(nullable, class, readonly, retain) NSCursor *currentSystemCursor;
 
 @property(class, readonly, retain, nonnull) NSCursor *arrowCursor;
 @property(class, readonly, retain, nonnull) NSCursor *closedHandCursor;
@@ -65,6 +67,9 @@ typedef NS_OPTIONS(NSUInteger, NSCursorFrameResizeDirections) {
 @property(class, readonly, retain, nonnull) NSCursor *crosshairCursor;
 @property(class, readonly, retain, nonnull) NSCursor *disappearingItemCursor;
 @property(class, readonly, retain, nonnull) NSCursor *IBeamCursor;
+@property(class, readonly, retain, nonnull) NSCursor *IBeamCursorForVerticalLayout;
+@property(class, readonly, retain, nonnull) NSCursor *zoomInCursor;
+@property(class, readonly, retain, nonnull) NSCursor *zoomOutCursor;
 @property(class, readonly, retain, nonnull) NSCursor *openHandCursor;
 @property(class, readonly, retain, nonnull) NSCursor *pointingHandCursor;
 @property(class, readonly, retain, nonnull) NSCursor *resizeDownCursor;
@@ -87,13 +92,13 @@ typedef NS_OPTIONS(NSUInteger, NSCursorFrameResizeDirections) {
 
 + (void) setHiddenUntilMouseMoves: (BOOL) flag;
 
-- initWithImage: (NSImage *) image
-        foregroundColorHint: (NSColor *) foregroundHint
-        backgroundColorHint: (NSColor *) backgroundHint
+- (instancetype) initWithImage: (NSImage *) image
+        foregroundColorHint: (nullable NSColor *) foregroundHint
+        backgroundColorHint: (nullable NSColor *) backgroundHint
                     hotSpot: (NSPoint) hotSpot;
-- initWithImage: (NSImage *) image hotSpot: (NSPoint) hotSpot;
+- (instancetype) initWithImage: (null_unspecified NSImage *) image hotSpot: (NSPoint) hotSpot;
 
-- (NSImage *) image;
+- (null_unspecified NSImage *) image;
 - (NSPoint) hotSpot;
 
 - (BOOL) isSetOnMouseEntered;
@@ -113,3 +118,5 @@ typedef NS_OPTIONS(NSUInteger, NSCursorFrameResizeDirections) {
 + (void) pop;
 
 @end
+
+NS_ASSUME_NONNULL_END

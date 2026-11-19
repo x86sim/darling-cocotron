@@ -36,6 +36,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSPrintOperation.h>
 #import <AppKit/NSRaise.h>
 #import <AppKit/NSScrollView.h>
+#import <AppKit/NSText.h>
 #import <AppKit/NSTrackingArea.h>
 #import <AppKit/NSView.h>
 #import <AppKit/NSScreen.h>
@@ -60,9 +61,12 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSTextInput.h>
 #import <AppKit/NSTextInputClient.h>
 #import <objc/runtime.h>
+#import <AppKit/NSTouch.h>
 #include <math.h>
+#include <mach-o/dyld_priv.h>
 #import "NSGestureRecognizer-Private.h"
 #import "DarlingLayout.h"
+#import "NSGraphics-Private.h"
 
 @class IBMetricsTable;
 
@@ -85,7 +89,9 @@ const NSViewFullScreenModeOptionKey NSFullScreenModeAllScreens =
 - (CGAffineTransform) transformToWindow;
 - (CGAffineTransform) transformToLayer;
 - (void) _trackingAreasChanged;
+- (void) _removeAreaWithTag: (NSInteger) tag;
 - (void) _addLayerToSuperlayer;
+- (void) _synchronizeSublayerOrder;
 - (void) _updateLayerVisibility;
 - (void) _removeLayerFromSuperlayer;
 @end
@@ -152,7 +158,20 @@ const NSViewFullScreenModeOptionKey NSFullScreenModeAllScreens =
 NS_EXTRA_SYNTHESIZE_COPY(NSView, identifier, _identifier, NSUserInterfaceItemIdentifier, identifier, setIdentifier:)
 NS_EXTRA_SYNTHESIZE_ASSIGN(NSView, translatesAutoresizingMaskIntoConstraints, _translatesAutoresizingMaskIntoConstraints, BOOL, translatesAutoresizingMaskIntoConstraints, setTranslatesAutoresizingMaskIntoConstraints:)
 NS_EXTRA_SYNTHESIZE_RETAIN(NSView, appearance, _appearance, NSAppearance *, appearance, setAppearance:)
-NS_EXTRA_SYNTHESIZE_ASSIGN(NSView, wantsBestResolutionOpenGLSurface, _wantsBestResolutionOpenGLSurface, BOOL, wantsBestResolutionOpenGLSurface, setWantsBestResolutionOpenGLSurface:)
+// Until the application sets it, the property is YES for programs linked
+// against SDK 10.15 or later and NO for older ones (the NSView.h documentation
+// of the NSOpenGLSurfaceResolution category). A program's SDK version is what
+// dyld reports for its executable.
+- (BOOL) wantsBestResolutionOpenGLSurface {
+    if (NS_EXTRA(NSView, self)->_wantsBestResolutionOpenGLSurfaceSet)
+        return NS_EXTRA(NSView, self)->_wantsBestResolutionOpenGLSurface;
+    return dyld_get_program_sdk_version() >= DYLD_MACOSX_VERSION_10_15;
+}
+
+- (void) setWantsBestResolutionOpenGLSurface: (BOOL) value {
+    NS_EXTRA(NSView, self)->_wantsBestResolutionOpenGLSurface = value;
+    NS_EXTRA(NSView, self)->_wantsBestResolutionOpenGLSurfaceSet = YES;
+}
 
 static BOOL NSViewLayersEnabled = YES;
 static BOOL NSShowAllViews = NO;
@@ -369,8 +388,12 @@ typedef struct __VFlags {
         // alternative for enabling it when it should be.
         NS_EXTRA(NSView, self)->_autoresizesSubviews = YES;
         NS_EXTRA(NSView, self)->_isHidden = (vFlags & 0x80000000) ? YES : NO;
-        NS_EXTRA(NSView, self)->_wantsBestResolutionOpenGLSurface = [keyed
-                decodeBoolForKey: @"NSViewWantsBestResolutionOpenGLSurface"];
+        // An archive without the key leaves the SDK-dependent default.
+        if ([keyed containsValueForKey: @"NSViewWantsBestResolutionOpenGLSurface"]) {
+            NS_EXTRA(NSView, self)->_wantsBestResolutionOpenGLSurface = [keyed
+                    decodeBoolForKey: @"NSViewWantsBestResolutionOpenGLSurface"];
+            NS_EXTRA(NSView, self)->_wantsBestResolutionOpenGLSurfaceSet = YES;
+        }
         NS_EXTRA(NSView, self)->_tag = 0; // IB assigns a default tag id of 0 - which is different from
                   // the default in the docs.
         if ([keyed containsValueForKey: @"NSTag"])
@@ -554,7 +577,7 @@ typedef struct __VFlags {
 }
 
 - init {
-    return [self initWithFrame: NSMakeRect(0, 0, 1, 1)];
+    return [self initWithFrame: NSZeroRect];
 }
 
 - initWithFrame: (NSRect) frame {
@@ -988,6 +1011,80 @@ static inline void buildTransformsIfNeeded(NSView *self) {
                                                   bitsPerPixel: 0] autorelease];
 }
 
+// The view that a first responder stands for in focus ring drawing: the view itself, or the control that a field
+// editor is editing.
+static NSView *focusRingViewForResponder(NSResponder *responder) {
+    if ([responder isKindOfClass: [NSView class]]) {
+        if ([responder isKindOfClass: [NSText class]] && [(NSText *) responder isFieldEditor]) {
+            id delegate = [(NSText *) responder delegate];
+
+            if ([delegate isKindOfClass: [NSView class]])
+                return delegate;
+        }
+        return (NSView *) responder;
+    }
+    return nil;
+}
+
+// A view shows a focus ring while it has the keyboard focus (or its field editor does) in the key window, unless
+// its focus ring type is NSFocusRingTypeNone, and only if it reports a mask for the ring.
+static BOOL viewShowsFocusRing(NSView *view) {
+    NSWindow *window = [view window];
+
+    if (window == nil || [view isHidden] || ![window isKeyWindow])
+        return NO;
+    if (focusRingViewForResponder([window firstResponder]) != view)
+        return NO;
+
+    NSFocusRingType type = [view focusRingType];
+
+    if (type == NSFocusRingTypeDefault)
+        type = [[view class] defaultFocusRingType];
+    if (type == NSFocusRingTypeNone)
+        return NO;
+    return [view _focusRingShape] != nil || !NSIsEmptyRect([view focusRingMaskBounds]);
+}
+
+static BOOL anySubviewShowsFocusRing(NSView *view) {
+    for (NSView *child in [view subviews]) {
+        if (viewShowsFocusRing(child))
+            return YES;
+    }
+    return NO;
+}
+
+// Draws the focus rings of the subviews that have one, outside the shape of their mask. A ring reaches outside the
+// view that owns it, so it is drawn by the superview, over the subviews, in its coordinates and clip; the port's
+// clip is the rectangle being drawn, so a ring is painted again only together with the pixels under it.
+static void drawSubviewFocusRings(NSView *view, CGContextRef port) {
+    for (NSView *child in [view subviews]) {
+        if (!viewShowsFocusRing(child))
+            continue;
+
+        NSRect frame = [child frame];
+        NSGraphicsContext *context = [NSGraphicsContext graphicsContextWithGraphicsPort: port flipped: [child isFlipped]];
+
+        [NSGraphicsContext saveGraphicsState];
+        [NSGraphicsContext setCurrentContext: context];
+        CGContextSaveGState(port);
+        CGContextTranslateCTM(port, frame.origin.x, frame.origin.y);
+        if ([child isFlipped] != [view isFlipped]) {
+            CGContextTranslateCTM(port, 0, frame.size.height);
+            CGContextScaleCTM(port, 1, -1);
+        }
+        CGContextTranslateCTM(port, -[child bounds].origin.x, -[child bounds].origin.y);
+        [context _setFocusRingPlacement: (NSInteger) NSFocusRingOnly + 1 outerOnly: YES];
+        NSBezierPath *shape = [child _focusRingShape];
+
+        if (shape != nil)
+            [shape fill];
+        else
+            [child drawFocusRingMask];
+        CGContextRestoreGState(port);
+        [NSGraphicsContext restoreGraphicsState];
+    }
+}
+
 // Draws the view and its visible subviews, in their own coordinates, into the
 // current CGContext. The context's origin is the view's bounds origin.
 static void drawViewTreeInContext(NSView *view, CGContextRef port, NSRect rect) {
@@ -1019,6 +1116,13 @@ static void drawViewTreeInContext(NSView *view, CGContextRef port, NSRect rect) 
         }
         CGContextTranslateCTM(port, -[child bounds].origin.x, -[child bounds].origin.y);
         drawViewTreeInContext(child, port, childRect);
+        CGContextRestoreGState(port);
+    }
+
+    if (anySubviewShowsFocusRing(view)) {
+        CGContextSaveGState(port);
+        CGContextClipToRect(port, rect);
+        drawSubviewFocusRings(view, port);
         CGContextRestoreGState(port);
     }
 }
@@ -1080,7 +1184,8 @@ static void drawViewTreeInContext(NSView *view, CGContextRef port, NSRect rect) 
         }
 
         [self _updateLayerVisibility];
-        [[self superview] setNeedsDisplay: YES];
+        // Only where the view is shows or hides something.
+        [[self superview] setNeedsDisplayInRect: [self frame]];
 
         if (NS_EXTRA(NSView, self)->_isHidden)
             [self viewDidHide];
@@ -1390,6 +1495,26 @@ NSRect _NSAlignRectToPixelGrid(NSRect rect, NSAlignmentOptions options) {
     NS_EXTRA(NSView, self)->_accessibilityTitle = title;
 }
 
+// The frame of the native window that hosts a root layer, in window coordinates. A view's own frame is in
+// its superview's coordinates, which are the same only for the window's content view.
+static NSRect layerContextFrame(NSView *self) {
+    NSRect frame = self->_frame;
+
+    if (self->_superview != nil)
+        frame = [self->_superview convertRect: frame toView: nil];
+
+    return frame;
+}
+
+// Moves the native windows of the root layers in a view's subtree after the view moved or resized, since their
+// frames are in window coordinates.
+static void updateLayerContextFrames(NSView *self) {
+    [NS_EXTRA(NSView, self)->_layerContext setFrame: layerContextFrame(self)];
+
+    for (NSView *child in self->_subviews)
+        updateLayerContextFrames(child);
+}
+
 // Stores a new frame and lays out the subviews, without posting
 // NSViewFrameDidChangeNotification. Returns whether the frame changed.
 static BOOL applyFrame(NSView *self, NSRect frame) {
@@ -1397,6 +1522,15 @@ static BOOL applyFrame(NSView *self, NSRect frame) {
         return NO;
 
     NSSize oldSize = self->_bounds.size;
+
+    // QUIRK: a change of the frame size marks the view as needing layout, whether the new size came
+    // from the constraint solver, autoresizing or a direct call, and also outside of a window.
+    // Not documented. Evidence: black-box observation on macOS 10.14.4 (tier 2): needsLayout is
+    // YES after -setFrameSize: of a settled view with and without a window, and -layout of a view
+    // is called after constraints change its size.
+    // Test: tests/appkit-layout-repeat-passes.m (frame size change sets needsLayout)
+    if (!NSEqualSizes(self->_frame.size, frame.size))
+        NS_EXTRA(NSView, self)->_needsLayout = YES;
 
     if (self->_bounds.size.width == 0 || self->_bounds.size.height == 0) {
         // No valid current bounds value - just update it to use the frame size
@@ -1428,12 +1562,7 @@ static BOOL applyFrame(NSView *self, NSRect frame) {
         [self resizeSubviewsWithOldSize: oldSize];
     }
 
-    NSRect layerFrame = self->_frame;
-
-    if (self->_superview != nil)
-        layerFrame = [self->_superview convertRect: layerFrame toView: nil];
-
-    [NS_EXTRA(NSView, self)->_layerContext setFrame: layerFrame];
+    updateLayerContextFrames(self);
 
     invalidateTransform(self);
 
@@ -1558,7 +1687,7 @@ static void postFrameChange(NSView *self) {
         if (NS_EXTRA(NSView, self)->_layerContext && _window == nil) {
             [self _removeLayerFromSuperlayer];
         } else if (NS_EXTRA(NSView, self)->_layerContext) {
-            [NS_EXTRA(NSView, self)->_layerContext setSubwindow: [_window _createSubWindowWithFrame: [self frame]]];
+            [NS_EXTRA(NSView, self)->_layerContext setSubwindow: [_window _createSubWindowWithFrame: layerContextFrame(self)]];
             [self _updateLayerVisibility];
         } else if (_layer != nil && _window != nil) {
             [self _addLayerToSuperlayer];
@@ -1625,8 +1754,14 @@ static void postFrameChange(NSView *self) {
             [view _removeFromSuperviewSendingMoveHooks: NO];
         }
 
-        [view _setWindow: _window];
+        // QUIRK: the new superview (and with it the responder chain) is in
+        // place before -viewWillMoveToWindow: and -viewDidMoveToWindow: run.
+        // Not documented. Evidence: black-box observation (tier 2) on macOS
+        // 26.7.3 and 10.14.4. Removal clears the superview before the window
+        // callbacks in the same way.
+        // Test: tests/appkit-view-window-callbacks-superview.m
         [view _setSuperview: self];
+        [view _setWindow: _window];
     }
 
     if (index == NSNotFound)
@@ -1645,6 +1780,10 @@ static void postFrameChange(NSView *self) {
 
     if (NS_EXTRA(NSView, self)->_wantsLayer)
         [view setWantsLayer: YES];
+
+    // A layer added to the superlayer goes to the end, and the layer of a view
+    // that was only moved within its superview does not move at all.
+    [self _synchronizeSublayerOrder];
 }
 
 - (void) addSubview: (NSView *) view {
@@ -1708,8 +1847,10 @@ static void postFrameChange(NSView *self) {
 
     // Subviews that stay are only put in the order of the list, without
     // hooks (macOS runs none for a reorder done through this method).
-    if (![_subviews isEqualToArray: ordered])
+    if (![_subviews isEqualToArray: ordered]) {
         [_subviews setArray: ordered];
+        [self _synchronizeSublayerOrder];
+    }
 }
 
 - (void) sortSubviewsUsingFunction:
@@ -1720,6 +1861,7 @@ static void postFrameChange(NSView *self) {
         return;
 
     [_subviews sortUsingFunction: compareFunction context: context];
+    [self _synchronizeSublayerOrder];
     [self setNeedsDisplay: YES];
 }
 
@@ -1803,16 +1945,35 @@ static void postFrameChange(NSView *self) {
                                   retainUserData: NO
                                        isToolTip: YES
                                         isLegacy: NO];
+    [area _setFromTagAPI: YES];
+    NSToolTipTag tag = [area _tag];
     [NS_EXTRA(NSView, self)->_trackingAreas addObject: area];
     [area release];
 
     [self _trackingAreasChanged];
 
-    return area;
+    return tag;
+}
+
+// A tag that does not name an area of this view (it was removed, or was never
+// issued) is ignored.
+- (void) _removeAreaWithTag: (NSInteger) tag {
+    NSMutableArray *areas = NS_EXTRA(NSView, self)->_trackingAreas;
+    NSInteger count = [areas count];
+
+    while (--count >= 0) {
+        NSTrackingArea *area = [areas objectAtIndex: count];
+
+        if ([area _isFromTagAPI] && [area _tag] == tag) {
+            [areas removeObjectAtIndex: count];
+            [self _trackingAreasChanged];
+            break;
+        }
+    }
 }
 
 - (void) removeToolTip: (NSToolTipTag) tag {
-    [self removeTrackingArea: tag];
+    [self _removeAreaWithTag: tag];
 }
 
 - (void) removeAllToolTips {
@@ -1966,16 +2127,18 @@ static void postFrameChange(NSView *self) {
                                   retainUserData: NO
                                        isToolTip: NO
                                         isLegacy: NO];
+    [area _setFromTagAPI: YES];
+    NSTrackingRectTag tag = [area _tag];
     [NS_EXTRA(NSView, self)->_trackingAreas addObject: area];
     [area release];
 
     [self _trackingAreasChanged];
 
-    return area;
+    return tag;
 }
 
 - (void) removeTrackingRect: (NSTrackingRectTag) tag {
-    [self removeTrackingArea: tag];
+    [self _removeAreaWithTag: tag];
 }
 
 static char inputContextKey;
@@ -2406,6 +2569,12 @@ static char inputContextKey;
 }
 
 // Native root-layer windows must follow the view tree as well as CALayer.
+// The native windows of root layers are placed from the top of the platform window, so they must follow a
+// window resize even when no view frame changed.
+- (void) _updateLayerContextFrames {
+    updateLayerContextFrames(self);
+}
+
 - (void) _updateLayerVisibility {
     BOOL hidden = [self isHiddenOrHasHiddenAncestor];
     [_layer setHidden: hidden];
@@ -2416,10 +2585,10 @@ static char inputContextKey;
 
 - (void) _createLayerContextIfNeeded {
     if (NS_EXTRA(NSView, self)->_layerContext == nil && [_superview layer] == nil && _window != nil) {
-        NS_EXTRA(NSView, self)->_layerContext = [[CALayerContext alloc] initWithFrame: [self frame]];
+        NS_EXTRA(NSView, self)->_layerContext = [[CALayerContext alloc] initWithFrame: layerContextFrame(self)];
         [NS_EXTRA(NSView, self)->_layerContext setLayer: _layer];
         if (_window) {
-            [NS_EXTRA(NSView, self)->_layerContext setSubwindow: [_window _createSubWindowWithFrame: [self frame]]];
+            [NS_EXTRA(NSView, self)->_layerContext setSubwindow: [_window _createSubWindowWithFrame: layerContextFrame(self)]];
             [self _updateLayerVisibility];
         }
     }
@@ -2438,6 +2607,38 @@ static char inputContextKey;
     } else {
         [self _createLayerContextIfNeeded];
     }
+}
+
+// The sublayers that belong to the subviews are kept in the order of the
+// subviews, so that the view that is last in -subviews is drawn on top. Other
+// sublayers of the view's layer (added by the application) keep their places.
+- (void) _synchronizeSublayerOrder {
+    if (_layer == nil)
+        return;
+
+    NSMutableArray *wanted = [NSMutableArray arrayWithCapacity: [_subviews count]];
+    for (NSView *subview in _subviews) {
+        CALayer *sublayer = [subview layer];
+        if (sublayer != nil && [sublayer superlayer] == _layer)
+            [wanted addObject: sublayer];
+    }
+
+    NSArray *current = [_layer sublayers];
+    NSMutableArray *ordered = [[current mutableCopy] autorelease];
+    NSUInteger next = 0;
+    BOOL changed = NO;
+    for (NSUInteger i = 0; i < [current count] && next < [wanted count]; i++) {
+        if ([wanted indexOfObjectIdenticalTo: [current objectAtIndex: i]] == NSNotFound)
+            continue;
+        CALayer *sublayer = [wanted objectAtIndex: next++];
+        if ([current objectAtIndex: i] != sublayer) {
+            [ordered replaceObjectAtIndex: i withObject: sublayer];
+            changed = YES;
+        }
+    }
+
+    if (changed)
+        [_layer setSublayers: ordered];
 }
 
 /*
@@ -2735,8 +2936,30 @@ static void clearNeedsDisplay(NSView *self) {
     [[self window] setViewsNeedDisplay: YES];
 }
 
+// The ring is drawn by the superview, around the mask, so the area to redraw is the rectangle in the superview
+// widened by the reach of the ring.
 - (void) setKeyboardFocusRingNeedsDisplayInRect: (NSRect) rect {
-    NSUnimplementedMethod();
+    NSView *superview = [self superview];
+
+    if (superview == nil)
+        return;
+    [superview setNeedsDisplayInRect: NSInsetRect([self convertRect: rect toView: superview], -4, -4)];
+}
+
+- (NSBezierPath *) _focusRingShape {
+    return nil;
+}
+
+// A change of the keyboard focus to or from this view (or its field editor): redraw its ring, which is gone from
+// the mask bounds once the view has lost the focus.
+- (void) _focusRingStateChanged {
+    NSRect mask = [self focusRingMaskBounds];
+
+    [self setKeyboardFocusRingNeedsDisplayInRect: NSIsEmptyRect(mask) ? [self bounds] : mask];
+}
+
++ (NSView *) _focusRingViewForResponder: (NSResponder *) responder {
+    return focusRingViewForResponder(responder);
 }
 
 // No mask by default; subclasses that draw one also report its bounds.
@@ -3132,6 +3355,15 @@ static NSView *viewBeingPrinted = nil;
 
             if (!NSIsEmptyRect(check))
                 [child displayRectIgnoringOpacity: check];
+        }
+
+        if (anySubviewShowsFocusRing(self)) {
+            [self lockFocus];
+            CGContextRef port = [[NSGraphicsContext currentContext] graphicsPort];
+
+            CGContextClipToRect(port, rect);
+            drawSubviewFocusRings(self, port);
+            [self unlockFocus];
         }
     }
 
@@ -3630,6 +3862,12 @@ static CGFloat backingScaleFactor(NSView *view) {
     return NSMakeSize(NSViewNoIntrinsicMetric, NSViewNoIntrinsicMetric);
 }
 
+// What the constraint solver reads as the view's intrinsic size. It is the public size unless a view
+// class has a size that is known to the layout only (NSTextField: wrapped text height).
+- (NSSize) _intrinsicContentSizeForLayout {
+    return [self intrinsicContentSize];
+}
+
 - (NSUserInterfaceLayoutDirection) userInterfaceLayoutDirection {
     return NS_EXTRA(NSView, self)->_hasExplicitUserInterfaceLayoutDirection
                    ? NS_EXTRA(NSView, self)->_userInterfaceLayoutDirection
@@ -3803,15 +4041,11 @@ static NSMutableArray *installedViewLayoutGuides(NSView *view, BOOL create) {
 }
 
 - (void) noteFocusRingMaskChanged {
-    // Only a view that is drawing a ring has anything to redraw. The ring is
-    // drawn outside the mask bounds, so invalidate a margin around them.
-    if ([[self window] firstResponder] != self)
+    // Only a view that is drawing a ring has anything to redraw.
+    if (focusRingViewForResponder([[self window] firstResponder]) != self)
         return;
 
-    NSRect rect = NSInsetRect([self focusRingMaskBounds], -8, -8);
-    if (NSIsEmptyRect(rect))
-        rect = [self bounds];
-    [self setNeedsDisplayInRect: NSInsetRect(rect, -8, -8)];
+    [self _focusRingStateChanged];
 }
 
 - (void) willOpenMenu: (NSMenu *) menu withEvent: (NSEvent *) event {
@@ -4001,11 +4235,29 @@ static NSMutableArray *installedViewLayoutGuides(NSView *view, BOOL create) {
     }
 }
 
+- (BOOL) _subtreeNeedsUpdateConstraints {
+    if (NS_EXTRA(NSView, self)->_needsUpdateConstraints)
+        return YES;
+    for (NSView *child in _subviews) {
+        if ([child _subtreeNeedsUpdateConstraints])
+            return YES;
+    }
+    return NO;
+}
+
+// A pass can invalidate constraints: a view's -layout may change what its intrinsic size depends on
+// (a wrapping label setting its preferredMaxLayoutWidth from its new width is the usual case). The
+// passes then repeat until nothing is invalidated, so the sizes that result from the last layout
+// are applied. The count is bounded so that views that keep invalidating each other cannot hang.
 - (void) layoutSubtreeIfNeeded {
-    // Finish the update phase for the whole subtree before laying out any view.
-    [self updateConstraintsForSubtreeIfNeeded];
-    DarlingLayoutSubtree(self);
-    [self _layoutSubtreeAfterUpdatingConstraints];
+    for (int pass = 0; pass < 10; ++pass) {
+        // Finish the update phase for the whole subtree before laying out any view.
+        [self updateConstraintsForSubtreeIfNeeded];
+        DarlingLayoutSubtree(self);
+        [self _layoutSubtreeAfterUpdatingConstraints];
+        if (![self _subtreeNeedsUpdateConstraints])
+            break;
+    }
 }
 
 @end

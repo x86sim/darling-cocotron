@@ -21,12 +21,16 @@
 #import <CoreGraphics/CGWindowPrivate.h>
 #import <GL/glx.h>
 #import <Onyx2D/O2Geometry.h>
+#import <Onyx2D/O2Image.h>
 #import <OpenGL/CGLInternal.h>
 #import <X11/Xlib.h>
 #import <X11/Xresource.h>
 #import <X11/Xlocale.h>
 
 @class X11Display, CAWindowOpenGLContext, NSWindow, O2Context;
+
+// Posted, with the window as the object, after its backing pixels were flushed.
+extern NSString *const X11WindowBackingDidFlushNotification;
 
 @interface X11Window : CGWindow {
     int _level; // TODO: care about this value
@@ -57,6 +61,7 @@
     BOOL _wasMapped;  // the visual is settled when the window is first mapped
     BOOL _hasShadow;
     BOOL _wantsInputFocus;
+    BOOL _keyRequested; // the application asked for this window to become key and the focus has not answered yet
     BOOL _ignoresMouseEvents; // the input region currently set
     CGFloat _appliedAlpha; // the window's alpha value as last applied to the X window
     BOOL _alphaIsZero; // _appliedAlpha is 0
@@ -74,6 +79,12 @@
 
 @public
     XIC _xic;
+    // Set once the context delivers the composition through callbacks (on-the-spot
+    // preedit), with the callbacks and the composition's code points and caret.
+    BOOL _onTheSpotPreedit;
+    XIMCallback _preeditCallbacks[4];
+    NSMutableData *_preedit;
+    int _preeditCaret;
     // YES while X11Display delivers FocusIn for this window (see -makeKey).
     BOOL _receivingFocus;
     // -isMiniaturized as last read from _NET_WM_STATE; PropertyNotify on that
@@ -84,6 +95,16 @@
 
 + (void) removeDecorationForWindow: (Window) w onDisplay: (Display *) dpy;
 - (instancetype) initWithDelegate: (NSWindow *) delegate;
+- (void) createXInputContext;
+// The input method's composition, as its preedit callbacks report it, passed on to the
+// text input client of the window's first responder (see NSTextInputContext).
+- (void) preeditReplaceCharactersFrom: (int) first
+                               length: (int) length
+                             withText: (NSString *) text
+                                caret: (int) caret;
+- (void) preeditMoveCaretTo: (int) position direction: (XIMCaretDirection) direction;
+- (void) preeditDone;
+- (void) updateInputMethodSpot;
 - (O2Rect) frame;
 - (Visual *) visual;
 - (Drawable) drawable;
@@ -108,6 +129,9 @@
 // and the backing surface, which the GL viewport follows.
 - (NSSize) deviceSize: (NSSize) size;
 - (O2Rect) deviceRect: (O2Rect) rect;
+// A copy of the window's drawn pixels in a rectangle of device pixels from the top-left
+// corner, or NULL if the window has no backing yet. Release it.
+- (O2ImageRef) createBackingImageInDeviceRect: (O2Rect) rect;
 
 - (Window) windowHandle;
 // What the stacking of unmanaged and managed windows by level looks at (see
@@ -137,6 +161,9 @@
 - (void) setStyleMaskInternal: (NSUInteger) styleMask force: (BOOL) force;
 
 - (void) requestInputFocus;
+- (BOOL) isFullyTransparent;
+- (BOOL) takeKeyRequest;
+- (BOOL) isMenuOrPopup;
 - (void) mapNotified;
 
 @end

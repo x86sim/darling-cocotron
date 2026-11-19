@@ -16,6 +16,9 @@
  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  SOFTWARE. */
 
+#import <AppKit/NSTextInputBackend.h>
+#import <AppKit/NSTouch.h>
+#import "../private-include/AppKit/NSTouchBackend.h"
 #import "WaylandDisplay.h"
 #import "../private-include/AppKit/CarbonKeys.h"
 #import "NSEvent_gesture.h"
@@ -56,10 +59,20 @@
 @interface WaylandScreen : NSScreen {
 @public
     CGFloat _waylandScale;
+    NSString *_outputName;
 }
 @end
 @implementation WaylandScreen
 - (CGFloat) backingScaleFactor { return _waylandScale; }
+// The output's description or name as the compositor reports it, else the name from an EDID set on the screen, else the
+// generic name.
+- (NSString *) localizedName {
+    return _outputName != nil && [self edid] == nil ? _outputName : [super localizedName];
+}
+- (void) dealloc {
+    [_outputName release];
+    [super dealloc];
+}
 @end
 
 // Mode pixels are untransformed. Publish v2 properties together at wl_output.done.
@@ -81,12 +94,18 @@ typedef struct {
     WaylandLogicalOutputState _logicalCurrent, _logicalPending;
     NSArray *_modes;
     NSMutableArray *_pendingModes;
+    // wl_output version 4: the connector name and the human readable description, published at done.
+    NSString *_name, *_pendingName, *_description, *_pendingDescription;
 }
 @end
 
 @implementation WaylandOutput
 
 - (void) dealloc {
+    [_name release];
+    [_pendingName release];
+    [_description release];
+    [_pendingDescription release];
     [_modes release];
     [_pendingModes release];
     [super dealloc];
@@ -331,11 +350,6 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
                                         &wl_surface_interface, args, 0, nil);
 
     _cursorFractionalScale = [self newFractionalScaleForSurface: _cursorSurface owner: (id)self];
-    if (_cursorFractionalScale) {
-        union wl_argument viewport[] = {{.o = NULL}, {.o = (struct wl_object *)_cursorSurface}};
-        _cursorViewport = WaylandCreateObject(_viewporter, WP_VIEWPORTER_GET_VIEWPORT,
-            &wp_viewport_interface, viewport, 0, nil);
-    }
 
     CFSocketContext context = {.version = 0, .info = self};
     _wlSocket = CFSocketCreateWithNative(NULL, WL.wl_display_get_fd(_wlDisplay),
@@ -412,9 +426,9 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
     _outputManager = nil;
     if (_wlDisplay != NULL) {
         // wl_display_disconnect() doesn't free proxies.
-        struct wl_proxy *proxies[] = {_imageCursorBuffer, _cursorFractionalScale, _cursorViewport, _cursorSurface,
+        struct wl_proxy *proxies[] = {_imageCursorBuffer, _cursorFractionalScale, _cursorSurface,
                                       _lockedPointer, _relativePointer, _pointerConstraints, _relativePointerManager,
-                                      _pinchGesture, _pointerGestures, _pointer, _keyboard,
+                                      _textInput, _textInputManager, _pinchGesture, _pointerGestures, _pointer, _keyboard,
                                       _seat, _decorationManager, _dataDeviceManager, _wmBase,
                                       _shm, _viewporter, _fractionalScaleManager, _activationToken, _activation, _subcompositor, _logicalOutputManager,
                                       _legacyLogicalOutputManager, _compositor, _registry};
@@ -588,6 +602,11 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
         _pointerGestures = [self bindGlobal: name interface: &zwp_pointer_gestures_v1_interface
                                     version: MIN(version, 2) kind: 0 object: nil];
         [self attachPinchGesture];
+    } else if (strcmp(interface, "zwp_text_input_manager_v3") == 0 && _textInputManager == NULL) {
+        _textInputManagerName = name;
+        _textInputManager = [self bindGlobal: name interface: &zwp_text_input_manager_v3_interface
+                                     version: 1 kind: 0 object: nil];
+        [self attachTextInput];
     } else if (strcmp(interface, "zwp_pointer_constraints_v1") == 0 && _pointerConstraints == NULL) {
         _pointerConstraintsName = name;
         _pointerConstraints = [self bindGlobal: name interface: &zwp_pointer_constraints_v1_interface
@@ -605,6 +624,7 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
                          version: MIN(version, 5)
                             kind: WaylandObjectSeat
                           object: self];
+        [self attachTextInput];
     } else if (strcmp(interface, "zxdg_output_manager_v1") == 0 && _logicalOutputManager == NULL) {
         _logicalOutputManagerName = name;
         _logicalOutputManager = [self bindGlobal: name interface: &zxdg_output_manager_v1_interface
@@ -622,7 +642,8 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
         output->_globalName = name;
         output->_display = self;
         output->_current.scale = output->_pending.scale = 1;
-        output->_version = MIN(version, 2);
+        // Version 2 has scale and done, version 4 the name and the description.
+        output->_version = MIN(version, MIN(4u, wl_output_interface.version));
         output->_pendingModes = [NSMutableArray new];
         output->_modes = [NSArray new];
         // Version 2 has scale and done.
@@ -688,6 +709,12 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
 }
 
 - (void) registryGlobalRemoved: (uint32_t) name {
+    if (_textInputManager && name == _textInputManagerName) {
+        [self detachTextInput];
+        WaylandMarshal(_textInputManager, WP_TEXT_INPUT_MANAGER_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
+        _textInputManager = NULL; _textInputManagerName = 0;
+        return;
+    }
     if (_pointerGestures && name == _pointerGesturesName) {
         [self detachPinchGesture];
         if (WL.wl_proxy_get_version(_pointerGestures) >= 2)
@@ -790,6 +817,10 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
     BOOL changed = output->_current.width > 0 && output->_current.height > 0 &&
                    memcmp(&output->_current, &output->_pending, sizeof output->_current) != 0;
     output->_current = output->_pending;
+    [output->_name release];
+    output->_name = [output->_pendingName copy];
+    [output->_description release];
+    output->_description = [output->_pendingDescription copy];
     if (output->_logicalVersion >= 3)
         output->_logicalCurrent = output->_logicalPending;
     [output->_modes release];
@@ -848,6 +879,18 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
     case WP_OUTPUT_EV_SCALE:
         output->_pending.scale = MAX(args[0].i, 1);
         break;
+    case WP_OUTPUT_EV_NAME:
+    case WP_OUTPUT_EV_DESCRIPTION: {
+        NSString *text = args[0].s != NULL ? [NSString stringWithUTF8String: args[0].s] : nil;
+        if (opcode == WP_OUTPUT_EV_NAME) {
+            [output->_pendingName release];
+            output->_pendingName = [text copy];
+        } else {
+            [output->_pendingDescription release];
+            output->_pendingDescription = [text copy];
+        }
+        return; // Published with the next done event.
+    }
     case WP_OUTPUT_EV_DONE:
         [self publishOutput: output];
         return;
@@ -901,6 +944,10 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
         [self pinchEvent: opcode arguments: args];
         break;
 
+    case WaylandObjectTextInput:
+        [self textInputEvent: opcode arguments: args];
+        break;
+
     case WaylandObjectActivationToken:
         if (proxy == _activationToken && opcode == WP_ACTIVATION_TOKEN_EV_DONE)
             [self activationTokenDone: args[0].s];
@@ -926,6 +973,10 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
 
     case WaylandObjectKeyboard:
         [self keyboardEvent: opcode arguments: args];
+        break;
+
+    case WaylandObjectTouch:
+        [self touchEvent: opcode arguments: args];
         break;
 
     default:
@@ -973,6 +1024,15 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
         [_buttonClickCounts removeAllObjects];
     }
 
+    if ((capabilities & WP_SEAT_CAPABILITY_TOUCH) && _touch == NULL) {
+        args[0].o = NULL;
+        _touch = WaylandCreateObject(_seat, WP_SEAT_GET_TOUCH, &wl_touch_interface, args,
+                                     WaylandObjectTouch, self);
+    } else if (!(capabilities & WP_SEAT_CAPABILITY_TOUCH) && _touch != NULL) {
+        [self releaseInputDevice: &_touch opcode: WP_TOUCH_RELEASE];
+        [self touchCancel];
+    }
+
     if ((capabilities & WP_SEAT_CAPABILITY_KEYBOARD) && _keyboard == NULL) {
         args[0].o = NULL;
         _keyboard = WaylandCreateObject(_seat, WP_SEAT_GET_KEYBOARD,
@@ -996,6 +1056,56 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
             return window;
     }
     return nil;
+}
+
+#pragma mark - Touch
+
+// Fingers go to AppKit's touch router, which moves the mouse for views that
+// take no touches: compositors emulate no pointer from a touch screen.
+- (void) touchEvent: (uint32_t) opcode arguments: (union wl_argument *) args {
+    if (_touchWindows == nil)
+        _touchWindows = [NSMutableDictionary new];
+    switch (opcode) {
+    case WP_TOUCH_EV_DOWN: {
+        WaylandWindow *window = [self windowForSurface: (struct wl_proxy *) args[2].o];
+        if (window == nil)
+            break;
+        _inputSerial = args[0].u;
+        [_touchWindows setObject: [NSValue valueWithNonretainedObject: window] forKey: @(args[3].i)];
+        CGPoint point = CGPointMake(wl_fixed_to_double(args[4].f), wl_fixed_to_double(args[5].f));
+        NSTouchPost([window delegate], args[3].i, NSTouchPhaseBegan, [window transformPoint: point], 0);
+        break;
+    }
+    case WP_TOUCH_EV_MOTION: {
+        WaylandWindow *window = [[_touchWindows objectForKey: @(args[1].i)] nonretainedObjectValue];
+        if (window == nil || ![self windowIsKnown: window])
+            break;
+        CGPoint point = CGPointMake(wl_fixed_to_double(args[2].f), wl_fixed_to_double(args[3].f));
+        NSTouchPost([window delegate], args[1].i, NSTouchPhaseMoved, [window transformPoint: point], 0);
+        break;
+    }
+    case WP_TOUCH_EV_UP: {
+        WaylandWindow *window = [[_touchWindows objectForKey: @(args[2].i)] nonretainedObjectValue];
+        [_touchWindows removeObjectForKey: @(args[2].i)];
+        if (window == nil || ![self windowIsKnown: window])
+            break;
+        // Up carries no position: the finger leaves where it last was.
+        NSTouchPost([window delegate], args[2].i, NSTouchPhaseEnded, NSMakePoint(NAN, NAN), 0);
+        break;
+    }
+    case WP_TOUCH_EV_CANCEL:
+        [self touchCancel];
+        break;
+    }
+}
+
+- (void) touchCancel {
+    [_touchWindows removeAllObjects];
+    NSTouchCancelAll(nil);
+}
+
+- (BOOL) windowIsKnown: (WaylandWindow *) window {
+    return CFArrayContainsValue(_windows, CFRangeMake(0, CFArrayGetCount(_windows)), window);
 }
 
 #pragma mark - Pointer
@@ -1256,6 +1366,204 @@ static NSString *stringWithCodepoint(uint32_t codepoint) {
                         deltaX: deltaX
                         deltaY: deltaY];
     [self postEvent: event atStart: NO];
+}
+
+#pragma mark - Text input (text-input-v3)
+
+// The compositor's input method sends the composition (preedit_string) and the final text
+// (commit_string) between enter and leave, as one state applied at done. They go to the
+// text input client of the window's first responder through its NSTextInputContext.
+
+- (void) attachTextInput {
+    if (_textInputManager == NULL || _seat == NULL || _textInput != NULL)
+        return;
+    union wl_argument args[2] = {{.o = NULL}, {.o = (struct wl_object *) _seat}};
+    _textInput = WaylandCreateObject(_textInputManager, WP_TEXT_INPUT_MANAGER_GET_TEXT_INPUT,
+                                     &zwp_text_input_v3_interface, args,
+                                     WaylandObjectTextInput, self);
+}
+
+- (void) detachTextInput {
+    if (_textInput == NULL)
+        return;
+    [self textInputLeft];
+    WaylandMarshal(_textInput, WP_TEXT_INPUT_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
+    _textInput = NULL;
+}
+
+- (NSTextInputContext *) textInputContext {
+    return _textInputWindow != nil
+            ? [NSTextInputContext inputContextForWindow: [_textInputWindow delegate]] : nil;
+}
+
+// Sends the text input state to the compositor: whether the first responder takes text and where
+// its caret is. Only a change is sent, because the compositor answers every commit.
+- (void) syncTextInput {
+    if (_textInput == NULL || _textInputWindow == nil)
+        return;
+
+    NSTextInputContext *context = [self textInputContext];
+    BOOL wanted = context != nil;
+    BOOL changed = NO;
+
+    if (wanted != _textInputEnabled) {
+        WaylandMarshal(_textInput, wanted ? WP_TEXT_INPUT_ENABLE : WP_TEXT_INPUT_DISABLE,
+                       NULL, 0, NULL);
+        _textInputEnabled = wanted;
+        changed = YES;
+        if (!wanted) {
+            [_textInputPreedit release];
+            _textInputPreedit = nil;
+        }
+    }
+    if (wanted) {
+        // The caret rectangle in the surface's logical coordinates, y down.
+        NSRect screenRect = [context candidateRectOnScreen];
+        NSRect rect = NSZeroRect;
+        if (!NSEqualRects(screenRect, NSZeroRect)) {
+            NSRect windowRect = [[_textInputWindow delegate] convertRectFromScreen: screenRect];
+            NSPoint offset = [_textInputWindow contentOffset];
+            rect = NSMakeRect(NSMinX(windowRect) + offset.x,
+                              [_textInputWindow frame].size.height - NSMaxY(windowRect) + offset.y,
+                              NSWidth(windowRect), NSHeight(windowRect));
+        }
+        if (!NSEqualRects(rect, _textInputRect) || changed) {
+            union wl_argument args[4] = {{.i = (int32_t) floor(rect.origin.x)},
+                                         {.i = (int32_t) floor(rect.origin.y)},
+                                         {.i = (int32_t) ceil(rect.size.width)},
+                                         {.i = (int32_t) ceil(rect.size.height)}};
+            WaylandMarshal(_textInput, WP_TEXT_INPUT_SET_CURSOR_RECTANGLE, NULL, 0, args);
+            _textInputRect = rect;
+            changed = YES;
+        }
+    }
+    if (changed) {
+        WaylandMarshal(_textInput, WP_TEXT_INPUT_COMMIT, NULL, 0, NULL);
+        [self flush];
+    }
+}
+
+- (void) textInputCandidateRectChangedInWindow: (NSWindow *) window {
+    if (_textInputWindow != nil && [_textInputWindow delegate] == window)
+        [self syncTextInput];
+}
+
+// The compositor took the text input away from the window: a composition that was showing is
+// removed, as no commit can follow it.
+- (void) textInputLeft {
+    NSTextInputContext *context = [self textInputContext];
+
+    if (_textInputPreedit != nil)
+        [context cancelComposition];
+    [_textInputPreedit release];
+    _textInputPreedit = nil;
+    [_textInputPendingPreedit release];
+    _textInputPendingPreedit = nil;
+    [_textInputPendingCommit release];
+    _textInputPendingCommit = nil;
+    _textInputWindow = nil;
+    _textInputEnabled = NO;
+    _textInputRect = NSZeroRect;
+}
+
+// Converts a byte offset in the UTF-8 string to a UTF-16 offset in `text`.
+static NSUInteger utf16OffsetOfUTF8Offset(NSString *text, int byteOffset) {
+    if (byteOffset < 0)
+        return [text length];
+
+    NSUInteger length = [text length];
+    NSUInteger offset = 0;
+    int bytes = 0;
+
+    while (offset < length && bytes < byteOffset) {
+        unichar c = [text characterAtIndex: offset];
+        if (c >= 0xD800 && c < 0xDC00 && offset + 1 < length) {
+            bytes += 4;
+            offset += 2;
+        } else {
+            bytes += c < 0x80 ? 1 : (c < 0x800 ? 2 : 3);
+            offset++;
+        }
+    }
+    return offset;
+}
+
+// Applies one done batch in the order the protocol gives: the old composition goes, the
+// committed text is inserted, the new composition is shown with its caret.
+- (void) textInputDone {
+    NSTextInputContext *context = [self textInputContext];
+    NSString *commit = [_textInputPendingCommit autorelease];
+    NSString *preedit = [_textInputPendingPreedit autorelease];
+    int cursorBegin = _textInputPendingCursorBegin;
+    int cursorEnd = _textInputPendingCursorEnd;
+
+    _textInputPendingCommit = nil;
+    _textInputPendingPreedit = nil;
+    _textInputPendingCursorBegin = _textInputPendingCursorEnd = -1;
+
+    if (context == nil)
+        return;
+    if ([preedit length] == 0)
+        preedit = nil;
+    // Nothing the client has not already got: the compositor answers each commit with a done.
+    BOOL samePreedit = preedit == nil ? _textInputPreedit == nil : [preedit isEqualToString: _textInputPreedit];
+    if ([commit length] == 0 && samePreedit)
+        return;
+
+    if ([commit length] > 0) {
+        [context cancelComposition];
+        [_textInputPreedit release];
+        _textInputPreedit = nil;
+        [context commitComposition: commit];
+    }
+    if (preedit == nil) {
+        if (_textInputPreedit != nil)
+            [context cancelComposition];
+        [_textInputPreedit release];
+        _textInputPreedit = nil;
+        return;
+    }
+    NSUInteger begin = utf16OffsetOfUTF8Offset(preedit, cursorBegin);
+    NSUInteger end = cursorEnd < 0 ? begin : utf16OffsetOfUTF8Offset(preedit, cursorEnd);
+    if (end < begin)
+        end = begin;
+    [_textInputPreedit release];
+    _textInputPreedit = [preedit copy];
+    [context updateComposition: preedit selection: NSMakeRange(begin, end - begin)];
+}
+
+- (void) textInputEvent: (uint32_t) opcode arguments: (union wl_argument *) args {
+    switch (opcode) {
+    case WP_TEXT_INPUT_EV_ENTER:
+        [self textInputLeft];
+        _textInputWindow = [self windowForSurface: (struct wl_proxy *) args[0].o];
+        [self syncTextInput];
+        break;
+
+    case WP_TEXT_INPUT_EV_LEAVE:
+        [self textInputLeft];
+        break;
+
+    case WP_TEXT_INPUT_EV_PREEDIT_STRING:
+        [_textInputPendingPreedit release];
+        _textInputPendingPreedit = args[0].s != NULL ? [[NSString alloc] initWithUTF8String: args[0].s] : nil;
+        _textInputPendingCursorBegin = args[1].i;
+        _textInputPendingCursorEnd = args[2].i;
+        break;
+
+    case WP_TEXT_INPUT_EV_COMMIT_STRING:
+        [_textInputPendingCommit release];
+        _textInputPendingCommit = args[0].s != NULL ? [[NSString alloc] initWithUTF8String: args[0].s] : nil;
+        break;
+
+    case WP_TEXT_INPUT_EV_DELETE_SURROUNDING_TEXT:
+        // No surrounding text is reported to the input method, so it has nothing to delete.
+        break;
+
+    case WP_TEXT_INPUT_EV_DONE:
+        [self textInputDone];
+        break;
+    }
 }
 
 #pragma mark - Pinch gestures
@@ -1549,10 +1857,6 @@ static NSUInteger modifierDeviceMask(int code) {
     case WP_KEYBOARD_EV_ENTER: {
         [self resetKeyboardModifiers];
         _keyboardWindow = [self windowForSurface: (struct wl_proxy *) args[1].o];
-        // The compositor does not say which client has the focus; GetFrontProcess() asks
-        // CoreGraphics, which keeps the last process that reported it.
-        if (_keyboardWindow != nil)
-            _CGSSetFrontProcess(getpid());
         if (_heldKeyIdentities == nil)
             _heldKeyIdentities = [NSMutableDictionary new];
         struct wl_array *keys = args[2].a;
@@ -1643,34 +1947,51 @@ static NSUInteger modifierDeviceMask(int code) {
     }
 }
 
-- (void) keymapWithFormat: (uint32_t) format fd: (int) fd size: (uint32_t) size {
-    char *map = MAP_FAILED;
+// A keymap the client cannot use (format no_keymap, an empty or unreadable xkb_v1 map) leaves the
+// keymap in force as it was. The wl_keyboard protocol sends no_keymap when the client has to
+// interpret raw key codes itself, and a compositor may replace the keymap at any time, so input
+// must survive both. With no keymap yet, the system default layout (the evdev rules, honouring
+// the XKB_DEFAULT_* variables) interprets the raw codes.
+- (struct xkb_keymap *) keymapFromFormat: (uint32_t) format fd: (int) fd size: (uint32_t) size {
+    struct xkb_keymap *keymap = NULL;
 
-    if (_xkbContext == NULL) {
-        // Already logged at startup.
-    } else if (format != WP_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size == 0) {
-        NSLog(@"Wayland backend: unsupported keymap (format %u, %u bytes), "
-              @"keyboard input is disabled",
-              format, size);
-    } else {
-        map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (map == MAP_FAILED)
+    if (format == WP_KEYBOARD_KEYMAP_FORMAT_XKB_V1 && size == 0) {
+        NSLog(@"Wayland backend: the compositor sent an empty keymap");
+    } else if (format == WP_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+        char *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (map == MAP_FAILED) {
             NSLog(@"Wayland backend: cannot map the keymap: %s", strerror(errno));
+        } else {
+            keymap = WL.xkb_keymap_new_from_buffer(
+                    _xkbContext, map, strnlen(map, size), XKB_KEYMAP_FORMAT_TEXT_V1,
+                    XKB_KEYMAP_COMPILE_NO_FLAGS);
+            munmap(map, size);
+            if (keymap == NULL)
+                NSLog(@"Wayland backend: cannot compile the compositor's keymap");
+        }
+    } else if (format != WP_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP) {
+        NSLog(@"Wayland backend: unsupported keymap format %u", format);
+    }
+    return keymap;
+}
+
+- (void) keymapWithFormat: (uint32_t) format fd: (int) fd size: (uint32_t) size {
+    struct xkb_keymap *keymap = NULL;
+
+    if (_xkbContext != NULL) {
+        keymap = [self keymapFromFormat: format fd: fd size: size];
+        if (keymap == NULL && _xkbKeymap == NULL)
+            keymap = WL.xkb_keymap_new_from_names(_xkbContext, NULL,
+                                                  XKB_KEYMAP_COMPILE_NO_FLAGS);
     }
     close(fd);
-    if (map == MAP_FAILED)
-        return;
-
-    struct xkb_keymap *keymap = WL.xkb_keymap_new_from_buffer(
-            _xkbContext, map, strnlen(map, size), XKB_KEYMAP_FORMAT_TEXT_V1,
-            XKB_KEYMAP_COMPILE_NO_FLAGS);
-    munmap(map, size);
 
     struct xkb_state *state = keymap != NULL ? WL.xkb_state_new(keymap) : NULL;
     if (state == NULL) {
-        NSLog(@"Wayland backend: cannot use the compositor's keymap");
         if (keymap != NULL)
             WL.xkb_keymap_unref(keymap);
+        if (_xkbContext != NULL && _xkbKeymap == NULL)
+            NSLog(@"Wayland backend: no usable keymap, keyboard input is disabled");
         return;
     }
 
@@ -1744,12 +2065,14 @@ static NSUInteger modifierDeviceMask(int code) {
                         pressed: (BOOL) pressed
                          repeat: (BOOL) repeat
 {
+    // Key events belong to the key window whichever surface of the application the compositor
+    // gave the focus to. That matters when the key window is a window with alpha 0, which is
+    // never shown and so never gets the focus. Menus and pop-ups that hold the focus keep it.
     WaylandWindow *window = _keyboardWindow;
-    if (window == nil) {
-        id platformWindow = [[NSApp keyWindow] platformWindow];
-        if ([platformWindow isKindOfClass: [WaylandWindow class]])
-            window = platformWindow;
-    }
+    id keyPlatformWindow = [[NSApp keyWindow] platformWindow];
+    if ([keyPlatformWindow isKindOfClass: [WaylandWindow class]] &&
+        (window == nil || ![window isPopup]))
+        window = keyPlatformWindow;
     NSWindow *delegate = [window delegate];
     if (delegate == nil)
         return;
@@ -1975,6 +2298,8 @@ static uint32_t WaylandKeyLayoutCodepoint(void *context, uint32_t keysym) {
             wholeScale = MAX(wholeScale, ceil(ratio - 0.01));
         }
         screen->_waylandScale = wholeScale;
+        NSString *outputName = [output->_description length] > 0 ? output->_description : output->_name;
+        screen->_outputName = [outputName length] > 0 ? [outputName copy] : nil;
         [screen setCgDirectDisplayID: [screens count] + 1];
         [screens addObject: screen];
         x += frame.size.width;
@@ -2094,11 +2419,16 @@ static uint32_t WaylandKeyLayoutCodepoint(void *context, uint32_t keysym) {
 - (struct wl_proxy *) seat { return _seat; }
 
 - (WaylandWindow *) popupParentForWindow: (WaylandWindow *) window {
+    // A tool tip belongs to the window the pointer is over, whatever was clicked last. Its
+    // position comes from the pointer in that window: without one it is not shown.
+    if ([window isTooltip])
+        return _pointerWindow != window && [_pointerWindow isMapped] ? _pointerWindow : nil;
     // Menu tracking can open nested menus with keyboard or timer events. The
     // newest mapped popup is the parent even if pointer focus has not moved.
     for (CFIndex i = CFArrayGetCount(_windows); i > 0; i--) {
         WaylandWindow *candidate = (WaylandWindow *) CFArrayGetValueAtIndex(_windows, i - 1);
-        if (candidate != window && [candidate isMapped] && [candidate isPopup])
+        if (candidate != window && [candidate isMapped] && [candidate isPopup] &&
+            ![candidate isTooltip])
             return candidate;
     }
     if (_inputWindow != window && [_inputWindow isMapped])
@@ -2142,11 +2472,14 @@ static uint32_t WaylandKeyLayoutCodepoint(void *context, uint32_t keysym) {
 - (void) unmapPopupsForParent: (WaylandWindow *) parent {
     // Retain a snapshot: unmapping releases each child's parent reference.
     NSMutableArray *children = [NSMutableArray array];
+    NSMutableArray *tooltips = [NSMutableArray array];
     for (CFIndex i = CFArrayGetCount(_windows); i > 0; i--) {
         WaylandWindow *window = (WaylandWindow *) CFArrayGetValueAtIndex(_windows, i - 1);
         if ([window popupParent] == parent)
-            [children addObject: window];
+            [([window isTooltip] ? tooltips : children) addObject: window];
     }
+    for (WaylandWindow *window in tooltips)
+        [window unmap];
     if ([children count] != 0 && ![parent isPopup]) {
         [self cancelPopupMenus];
         return;
@@ -2161,7 +2494,7 @@ static uint32_t WaylandKeyLayoutCodepoint(void *context, uint32_t keysym) {
     NSMutableArray *popups = [NSMutableArray array];
     for (CFIndex i = CFArrayGetCount(_windows); i > 0; i--) {
         WaylandWindow *window = (WaylandWindow *) CFArrayGetValueAtIndex(_windows, i - 1);
-        if ([window isPopup])
+        if ([window isPopup] && ![window isTooltip])
             [popups addObject: window];
     }
     if ([popups count] == 0)
@@ -2212,6 +2545,8 @@ static uint32_t WaylandKeyLayoutCodepoint(void *context, uint32_t keysym) {
     }
     if (_wlLastClickWindow == window)
         _wlLastClickWindow = nil;
+    if (_textInputWindow == window)
+        [self textInputLeft];
     if (_pinchWindow == window)
         [self postPinchPhase: NSEventPhaseCancelled];
     [_draggingManager windowUnmapped: window];
@@ -2251,7 +2586,7 @@ static uint32_t WaylandKeyLayoutCodepoint(void *context, uint32_t keysym) {
     for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++) {
         WaylandWindow *window =
                 (WaylandWindow *) CFArrayGetValueAtIndex(_windows, i);
-        if ([window isMapped])
+        if ([window isOrderedIn])
             [result addObject: @([window windowNumber])];
     }
     return result;
@@ -2259,15 +2594,19 @@ static uint32_t WaylandKeyLayoutCodepoint(void *context, uint32_t keysym) {
 
 #pragma mark - Cursors
 
-// The output scale must be applied exactly once. A cursor surface without a
-// wp_viewport cannot express a logical size, so pre-scaling the raster and then
-// setting wl_surface.set_buffer_scale to the same factor asks the compositor to
-// scale it twice: a 24pt cursor then covers 96 physical px on a 2x output.
-// With a viewporter the client owns the scaling and pins buffer_scale to 1;
-// without one the compositor owns it, so hand over a 1x raster at buffer_scale 1.
+// The output scale must be applied exactly once. wl_surface.set_buffer_scale is the
+// one mechanism every compositor applies to a cursor surface; a wp_viewport
+// destination is not (Hyprland derives the logical size from buffer size / buffer
+// scale and ignores it, wlroots honours it). A raster pinned to buffer_scale 1 and
+// cropped by a viewport therefore shows 2x too large on a 2x Hyprland. So the raster is
+// made at the next whole scale and tagged with it; the compositor scales it down
+// to a fractional output. Without a fractional-scale manager, or without
+// set_buffer_scale, the compositor owns the scaling: hand over a 1x raster.
 - (uint32_t) cursorRenderScale120 {
-    if (_cursorFractionalScale) return _cursorPreferredScale120 ?: (_pointerWindow ? [_pointerWindow renderScale120] : 120);
-    return 120;
+    // set_buffer_scale needs wl_surface v3.
+    if (!_cursorFractionalScale || _compositorVersion < 3) return 120;
+    return WaylandCursorBufferScale120(
+            _cursorPreferredScale120 ?: (_pointerWindow ? [_pointerWindow renderScale120] : 120));
 }
 - (void) preferredScaleChanged: (uint32_t) scale120 {
     if (!_cursorFractionalScale || !scale120 || scale120 == _cursorPreferredScale120) return;
@@ -2355,8 +2694,7 @@ static uint32_t WaylandKeyLayoutCodepoint(void *context, uint32_t keysym) {
         return;
 
     uint32_t scale120 = [self cursorRenderScale120];
-    BOOL fractional = _cursorFractionalScale != NULL;
-    int32_t wireScale = fractional ? 1 : (int32_t)(scale120 / 120);
+    int32_t wireScale = (int32_t)(scale120 / 120);
     struct wl_proxy *buffer = decoration ? NULL : [self imageCursorBufferForScale120: scale120 cursor: cursor];
     if (_cursorApplyPending || cursor != _cursor || pointer != _pointer ||
         surface != _cursorSurface || serial != _pointerEnterSerial ||
@@ -2398,33 +2736,19 @@ static uint32_t WaylandKeyLayoutCodepoint(void *context, uint32_t keysym) {
         if (buffer == NULL)
             return;
         if (!image->width || !image->height || image->width > INT32_MAX || image->height > INT32_MAX) return;
-        if (fractional) {
-            uint64_t width = ((uint64_t)image->width * 120 + _cursorThemeScale120 / 2) / _cursorThemeScale120;
-            uint64_t height = ((uint64_t)image->height * 120 + _cursorThemeScale120 / 2) / _cursorThemeScale120;
-            if (width > INT32_MAX || height > INT32_MAX) return;
-            logical = NSMakeSize(MAX(1, width), MAX(1, height));
-            hotSpot = NSMakePoint(MIN(logical.width - 1, floor(image->hotspot_x * logical.width / image->width)),
-                MIN(logical.height - 1, floor(image->hotspot_y * logical.height / image->height)));
-        } else {
-            // No wp_viewport: the theme is loaded at the compositor's nominal
-            // size (_cursorThemeScale120 is 120, since cursorRenderScale120
-            // hands scaling to the compositor) and the surface stays at
-            // buffer_scale 1, so the hotspot is used unscaled.
-            wireScale = (int32_t)(_cursorThemeScale120 / 120);
-            if (wireScale < 1 || image->width % wireScale || image->height % wireScale) wireScale = 1;
-            logical = NSMakeSize(image->width / wireScale, image->height / wireScale);
-            hotSpot = NSMakePoint(image->hotspot_x / wireScale, image->hotspot_y / wireScale);
-        }
+        // The theme was loaded at the nominal size times the whole scale: the
+        // surface is tagged with that scale, so the logical size and the hotspot
+        // are the image's divided by it. A theme without that exact size hands
+        // back its nearest one, which the scale may not divide.
+        wireScale = WaylandCursorWireScale((int32_t)image->width, (int32_t)image->height,
+                                           (int32_t)(_cursorThemeScale120 / 120));
+        logical = NSMakeSize(image->width / wireScale, image->height / wireScale);
+        hotSpot = NSMakePoint(image->hotspot_x / wireScale, image->hotspot_y / wireScale);
     }
 
     if (_compositorVersion >= 3) {
         union wl_argument scaleArgs[1] = {{.i = wireScale}};
         WaylandMarshal(_cursorSurface, WP_SURFACE_SET_BUFFER_SCALE, NULL, 0, scaleArgs);
-    }
-
-    if (_cursorViewport) {
-        union wl_argument destination[] = {{.i = (int32_t)logical.width}, {.i = (int32_t)logical.height}};
-        WaylandMarshal(_cursorViewport, WP_VIEWPORT_SET_DESTINATION, NULL, 0, destination);
     }
 
     union wl_argument attach[3] = {{.o = (struct wl_object *) buffer}, {.i = 0}, {.i = 0}};
@@ -2477,6 +2801,9 @@ static uint32_t WaylandKeyLayoutCodepoint(void *context, uint32_t keysym) {
             {@"closedHandCursor", "grabbing", "hand3"},
             {@"crosshairCursor", "crosshair", "cross"},
             {@"IBeamCursor", "text", "xterm"},
+            {@"IBeamCursorForVerticalLayout", "vertical-text", "xterm"},
+            {@"zoomInCursor", "zoom-in", "left_ptr"},
+            {@"zoomOutCursor", "zoom-out", "left_ptr"},
             {@"openHandCursor", "grab", "fleur"},
             {@"pointingHandCursor", "pointer", "hand2"},
             {@"resizeDownCursor", "s-resize", "bottom_side"},

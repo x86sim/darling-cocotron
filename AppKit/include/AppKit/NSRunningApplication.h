@@ -21,7 +21,9 @@
 #import <AppKit/AppKitIvarLayout.h>
 #include <sys/types.h>
 
-@class NSString;
+@class NSString, NSURL, NSImage;
+
+NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(NSInteger, NSApplicationActivationPolicy) {
     NSApplicationActivationPolicyRegular,
@@ -40,16 +42,28 @@ typedef NS_OPTIONS(NSUInteger, NSApplicationActivationOptions) {
 }
 
 + (NSArray<NSRunningApplication *> *) runningApplicationsWithBundleIdentifier: (NSString *) bundleIdentifier;
-+ (instancetype) runningApplicationWithProcessIdentifier: (pid_t) pid;
-+ (NSRunningApplication *) currentApplication;
++ (nullable instancetype) runningApplicationWithProcessIdentifier: (pid_t) pid;
++ (__kindof NSRunningApplication *) currentApplication;
 
 @property(readonly) pid_t processIdentifier;
-@property(readonly, copy) NSString *bundleIdentifier;
-@property(readonly, copy) NSString *localizedName;
+@property(nullable, readonly, copy) NSString *bundleIdentifier;
+@property(nullable, readonly, copy) NSString *localizedName;
 @property(readonly, getter=isTerminated) BOOL terminated;
+// Whether this is the application that has the input focus, and the one that owns the menu bar.
+@property(readonly, getter=isActive) BOOL active;
+@property(readonly) BOOL ownsMenuBar;
+@property(readonly, getter=isHidden) BOOL hidden;
+@property(readonly) NSApplicationActivationPolicy activationPolicy;
+@property(nullable, readonly, copy) NSURL *bundleURL;
+@property(nullable, readonly, strong) NSImage *icon;
 
 - (BOOL) activateWithOptions: (NSApplicationActivationOptions) options;
+- (BOOL) hide;
+- (BOOL) unhide;
+- (BOOL) terminate;
 - (BOOL) activateFromApplication: (NSRunningApplication *) application
                          options: (NSApplicationActivationOptions) options;
 
 @end
+
+NS_ASSUME_NONNULL_END

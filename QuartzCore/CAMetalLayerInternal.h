@@ -22,10 +22,16 @@
 #import <OpenGL/gl.h>
 #import <OpenGL/CGLTypes.h>
 
+#import <QuartzCore/CAMetalLayerSurface.h>
+
 #include <memory>
 #include <array>
 
 class CAMetalDrawableActual;
+
+namespace IndiumKit {
+	class Layer;
+};
 
 @interface CAMetalLayerInternal : CAMetalLayer {
 	id<MTLDevice> _device;
@@ -56,11 +62,37 @@ class CAMetalDrawableActual;
 	// the GL context _glImportsSemaphores was found for
 	CGLContextObj _semaphoreProbeContext;
 	BOOL _glImportsSemaphores;
+
+	// Presenting through a Vulkan swapchain on a native window instead of through the layer context's
+	// OpenGL rendering: the swapchain's layer (null in the OpenGL mode), the provider of the native
+	// surface it presents to, that surface, and where it was last placed. Guarded by @synchronized(self).
+	std::shared_ptr<IndiumKit::Layer> _swapchainLayer;
+	id<CAMetalLayerSurfaceProvider> _surfaceProvider;
+	CANativeSurface _nativeSurface;
+	CGRect _surfaceFrame;
+	// Drawables handed out and not presented yet, and the next drawable ID; guarded by _drawableCondition.
+	NSUInteger _swapchainOutstanding;
+	NSUInteger _nextSwapchainDrawableID;
+	// The window and device a swapchain could not be made for; not tried again until either changes.
+	id _refusedSubwindow;
+	id _refusedDevice;
+	// The window and device the last render pass looked for a swapchain with, and whether the layer
+	// could be shown on its own plane then.
+	id _attemptedSubwindow;
+	id _attemptedDevice;
+	BOOL _attemptedPlane;
+	// Whether the layer, where it is in its tree, may be shown on a native surface of its own above the
+	// composited tree (CALayerCanPresentOnOwnPlane). Decided by every render pass, on the main thread.
+	BOOL _planeAllowed;
 }
 
 - (void)queuePresent: (NSUInteger)drawableID;
 - (void)releaseDrawable: (NSUInteger)drawableID;
 - (void)releaseDisplayedDrawable;
+// A drawable from the swapchain is no longer in use.
+- (void)releaseSwapchainDrawable;
+// Whether the layer presents through a swapchain on a native window.
+- (BOOL)presentsThroughSwapchain;
 
 - (BOOL)hasQueuedDrawables;
 

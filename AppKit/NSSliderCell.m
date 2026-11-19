@@ -311,6 +311,16 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 }
 
 - (void) drawBarInside: (NSRect) frame flipped: (BOOL) isFlipped {
+    if (_numberOfTickMarks == 0 && [self sliderType] == NSSliderTypeLinear) {
+        // without tick marks the slider is drawn as on macOS: a blue track up to the knob
+        [[_controlView graphicsStyle] drawAquaSliderTrackInRect: _lastRect
+                                                       vertical: [self isVertical]
+                                                       knobRect: [self knobRectFlipped: isFlipped]
+                                                        enabled: [self isEnabled]
+                                                         active: [[_controlView window] isKeyWindow]
+                                                        flipped: isFlipped];
+        return;
+    }
     [[_controlView graphicsStyle]
             drawSliderTrackInRect: frame
                          vertical: [self isVertical]
@@ -386,6 +396,12 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 }
 
 - (void) drawKnob: (NSRect) rect {
+    if (_numberOfTickMarks == 0) {
+        [[_controlView graphicsStyle] drawAquaSliderKnobInRect: rect
+                                                   controlSize: [self controlSize]
+                                                       enabled: [self isEnabled]];
+        return;
+    }
     [[_controlView graphicsStyle]
             drawSliderKnobInRect: rect
                         vertical: [self isVertical]
@@ -529,23 +545,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
         break;
     }
 
-    BOOL drawDottedRect = NO;
+}
 
-    // would be nice to put this code in some superclass
-    if ([[controlView window] firstResponder] == controlView) {
-        if ([controlView isKindOfClass: [NSMatrix class]]) {
-            NSMatrix *matrix = (NSMatrix *) controlView;
-
-            drawDottedRect = ([matrix keyCell] == self) ? YES : NO;
-        } else if ([controlView isKindOfClass: [NSControl class]]) {
-            NSControl *control = (NSControl *) controlView;
-
-            drawDottedRect = ([control selectedCell] == self) ? YES : NO;
-        }
-    }
-
-    if (drawDottedRect)
-        NSDottedFrameRect(NSInsetRect(frame, 1, 1)); // fugly
+// the ring is drawn around the knob
+- (NSBezierPath *) _focusRingPathWithFrame: (NSRect) frame inView: (NSView *) controlView {
+    return [NSBezierPath bezierPathWithOvalInRect: [self knobRectFlipped: [controlView isFlipped]]];
 }
 
 - (void) setClosestDoubleValue: (double) value {

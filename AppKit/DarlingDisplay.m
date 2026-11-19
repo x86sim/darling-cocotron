@@ -46,18 +46,24 @@ void NSColorSetCatalogColor(NSColorListName catalogName, NSColorName colorName, 
 - (NSColor *) colorWithName: (NSString *) colorName {
     if ([colorName isEqual: @"controlColor"])
         return [NSColor colorWithCalibratedWhite: 0.93 alpha: 1.0];
+    // The disabled text colour and the menu highlight are the values macOS 10.14 returns in the light
+    // appearance, converted to sRGB. There is no public menu background or menu text colour to read back; the
+    // menu text takes the label colour's value and the background is an estimate of the light menu material.
     if ([colorName isEqual: @"disabledControlTextColor"])
-        return [NSColor grayColor];
+        return [NSColor colorWithSRGBRed: 0.0f green: 0.0f blue: 0.0f alpha: 0.247f];
     if ([colorName isEqual: @"controlTextColor"])
         return [NSColor blackColor];
     if ([colorName isEqual: @"menuBackgroundColor"])
-        return [NSColor colorWithCalibratedWhite: 0.9 alpha: 1.0];
+        return [NSColor colorWithSRGBRed: 0.945f green: 0.945f blue: 0.945f alpha: 1.0f];
     if ([colorName isEqual: @"mainMenuBarColor"])
         return [NSColor colorWithCalibratedWhite: 0.9 alpha: 1.0];
     if ([colorName isEqual: @"controlShadowColor"])
         return [NSColor darkGrayColor];
     if ([colorName isEqual: @"selectedControlColor"])
-        return [NSColor blueColor];
+        return [NSColor colorWithSRGBRed: 0.701961f /* 179 */
+                                   green: 0.843137f /* 215 */
+                                    blue: 1.0f
+                                   alpha: 1.0f];
     if ([colorName isEqual: @"controlBackgroundColor"])
         return [NSColor whiteColor];
     if ([colorName isEqual: @"controlLightHighlightColor"])
@@ -73,11 +79,11 @@ void NSColorSetCatalogColor(NSColorListName catalogName, NSColorName colorName, 
     if ([colorName isEqual: @"headerTextColor"])
         return [NSColor blackColor];
     if ([colorName isEqual: @"menuItemTextColor"])
-        return [NSColor blackColor];
+        return [NSColor colorWithSRGBRed: 0.0f green: 0.0f blue: 0.0f alpha: 0.847f];
     if ([colorName isEqual: @"selectedMenuItemTextColor"])
         return [NSColor whiteColor];
     if ([colorName isEqual: @"selectedMenuItemColor"])
-        return [NSColor blueColor];
+        return [NSColor colorWithSRGBRed: 0.259f green: 0.467f blue: 0.957f alpha: 1.0f];
     if ([colorName isEqual: @"selectedControlTextColor"])
         return [NSColor blackColor];
     if ([colorName isEqual: @"windowFrameColor"])
@@ -122,8 +128,8 @@ void NSColorSetCatalogColor(NSColorListName catalogName, NSColorName colorName, 
                                          alpha: 1.00f];
     if ([colorName isEqual: @"alternateSelectedControlColor"])
         return [NSColor colorWithSRGBRed: 0.0f
-                                   green: 0.411765f
-                                    blue: 0.850980f
+                                   green: 0.388235f
+                                    blue: 0.882353f
                                     alpha: 1.0f];
     if ([colorName isEqual: @"controlDarkShadowColor"])
         return [NSColor colorWithCalibratedRed: 0.0f
@@ -140,10 +146,13 @@ void NSColorSetCatalogColor(NSColorListName catalogName, NSColorName colorName, 
     if ([colorName isEqual: @"highlightColor"])
         return [NSColor colorWithGenericGamma22White: 1.0f alpha: 1.0f];
     if ([colorName isEqual: @"keyboardFocusIndicatorColor"])
-        return [NSColor colorWithSRGBRed: 0.231373f
-                                   green: 0.60f
-                                    blue: 0.988235f
-                                    alpha: 1.0f];
+        // QUIRK: the indicator colour is a translucent blue, not an opaque one. Evidence: black-box read of
+        // +[NSColor keyboardFocusIndicatorColor] converted to sRGB on macOS 10.14.4, Blue control tint (tier 2).
+        // Test: appkit-focus-ring.m (test_quirk_keyboard_focus_indicator_color)
+        return [NSColor colorWithSRGBRed: 0.0f
+                                   green: 0.403922f
+                                    blue: 0.956863f
+                                    alpha: 0.247059f];
     if ([colorName isEqual: @"knobColor"])
         return [NSColor colorWithSRGBRed: 0.60f
                                    green: 0.60f

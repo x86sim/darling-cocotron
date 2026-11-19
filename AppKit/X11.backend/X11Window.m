@@ -20,8 +20,11 @@
 
 #import <AppKit/NSColor.h>
 #import <AppKit/NSGraphics.h>
+#import "X11Touch.h"
 #import <AppKit/NSMenuWindow.h>
 #import <AppKit/NSPanel.h>
+#import <AppKit/NSTextInput.h>
+#import <AppKit/NSTextInputBackend.h>
 #import <AppKit/NSPopUpWindow.h>
 #import <AppKit/NSRaise.h>
 #import <AppKit/NSWindow.h>
@@ -47,6 +50,8 @@
 #import "X11AppMenu.h"
 #import <X11/Xatom.h>
 #import <X11/Xutil.h>
+#include <math.h>
+#include <wchar.h>
 
 // The visual of opaque windows. Rendering goes through EGL, and a visual that
 // glXChooseVisual picks can be one that only GLX can draw to (NVIDIA's EGL
@@ -117,21 +122,105 @@ static XVisualInfo *X11AlphaVisualInfo(Display *display) {
 // windows are then created opaque straight away.
 static BOOL alphaSurfaceFailed;
 
-// An input context for the window, without preedit or status display.
-static XIC createInputContext(XIM xim, Window window) {
+// Whether the input method offers the on-the-spot preedit style: it then reports the
+// composition through callbacks and the application draws it itself.
+static BOOL inputMethodHasPreeditCallbacks(XIM xim) {
+    XIMStyles *styles = NULL;
+    BOOL found = NO;
+
+    if (xim == NULL)
+        return NO;
+#if defined(DARLING) && defined(__arm64__)
+    // Variadic, see createInputContext() below.
+    char *failed = ((char *(*)(XIM, const char *, void *, void *)) XGetIMValues)(
+            xim, XNQueryInputStyle, &styles, NULL);
+#else
+    char *failed = XGetIMValues(xim, XNQueryInputStyle, &styles, NULL);
+#endif
+    if (failed != NULL || styles == NULL)
+        return NO;
+    for (unsigned short i = 0; i < styles->count_styles; i++) {
+        if (styles->supported_styles[i] == (XIMPreeditCallbacks | XIMStatusNothing))
+            found = YES;
+    }
+    XFree(styles);
+    return found;
+}
+
+// Sets the preedit attribute list `list` on the context. Returns whether Xlib accepted it.
+static BOOL setPreeditAttributes(XIC ic, XVaNestedList list) {
+#if defined(DARLING) && defined(__arm64__)
+    char *failed = ((char *(*)(XIC, const char *, void *, void *)) XSetICValues)(
+            ic, XNPreeditAttributes, list, NULL);
+#else
+    char *failed = XSetICValues(ic, XNPreeditAttributes, list, NULL);
+#endif
+    XFree(list);
+    return failed == NULL;
+}
+
+static XVaNestedList preeditCallbackList(const char *name1, XIMCallback *cb1,
+                                         const char *name2, XIMCallback *cb2) {
+#if defined(DARLING) && defined(__arm64__)
+    return ((XVaNestedList (*)(int, const char *, void *, const char *, void *, void *))
+            XVaCreateNestedList)(0, name1, cb1, name2, cb2, NULL);
+#else
+    return XVaCreateNestedList(0, name1, cb1, name2, cb2, NULL);
+#endif
+}
+
+// An input context for the window. With an input method that supports on-the-spot preedit the
+// composition is delivered through the callbacks in `callbacks` (client data: the window);
+// otherwise the input method shows its own preedit and status.
+static XIC createInputContext(XIM xim, Window window, XIMCallback callbacks[4], BOOL *onTheSpot) {
+    XIC ic;
+    BOOL wantsCallbacks = inputMethodHasPreeditCallbacks(xim);
+
+    *onTheSpot = NO;
+    long style = wantsCallbacks ? (XIMPreeditCallbacks | XIMStatusNothing)
+                                : (XIMPreeditNothing | XIMStatusNothing);
 #if defined(DARLING) && defined(__arm64__)
     // XCreateIC() is variadic and lives in the native (Linux) libX11. Darwin arm64 passes
     // variadic arguments on the stack, Linux arm64 in registers, so call it through a
     // non-variadic prototype: all 8 arguments then go in x0-x7, where libX11 reads them.
+    ic = ((XIC (*)(XIM, const char *, long, const char *, Window, const char *, Window, void *)) XCreateIC)(
+        xim,
+        XNInputStyle, style,
+        XNClientWindow, window,
+        XNFocusWindow, window,
+        NULL);
+#else
+    ic = XCreateIC(xim,
+        XNInputStyle, style,
+        XNClientWindow, window,
+        XNFocusWindow, window,
+        NULL);
+#endif
+    if (ic == NULL || !wantsCallbacks)
+        return ic;
+
+    // The callbacks are set after creation, two to a call, so that no call needs more
+    // arguments than a non-variadic arm64 call can pass in registers.
+    if (setPreeditAttributes(ic, preeditCallbackList(XNPreeditStartCallback, &callbacks[0],
+                                                     XNPreeditDoneCallback, &callbacks[1])) &&
+        setPreeditAttributes(ic, preeditCallbackList(XNPreeditDrawCallback, &callbacks[2],
+                                                     XNPreeditCaretCallback, &callbacks[3]))) {
+        *onTheSpot = YES;
+        return ic;
+    }
+
+    // Without the callbacks the composition would be invisible: use the input method's own.
+    XDestroyIC(ic);
+#if defined(DARLING) && defined(__arm64__)
     return ((XIC (*)(XIM, const char *, long, const char *, Window, const char *, Window, void *)) XCreateIC)(
         xim,
-        XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+        XNInputStyle, (long) (XIMPreeditNothing | XIMStatusNothing),
         XNClientWindow, window,
         XNFocusWindow, window,
         NULL);
 #else
     return XCreateIC(xim,
-        XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+        XNInputStyle, (long) (XIMPreeditNothing | XIMStatusNothing),
         XNClientWindow, window,
         XNFocusWindow, window,
         NULL);
@@ -161,6 +250,174 @@ static XIC createInputContext(XIM xim, Window window) {
 @end
 
 @implementation X11Window
+
+#pragma mark - Input method composition
+
+// The composition is held as the code points the input method sent: its draw callback
+// replaces a range of characters, counted in characters, not UTF-16 units.
+
+static int preeditStartCallback(XIC ic, XPointer clientData, XPointer callData) {
+    // The composition may be any length.
+    return -1;
+}
+
+static void preeditDoneCallback(XIC ic, XPointer clientData, XPointer callData) {
+    [(X11Window *) clientData preeditDone];
+}
+
+static void preeditDrawCallback(XIC ic, XPointer clientData, XPointer callData) {
+    XIMPreeditDrawCallbackStruct *draw = (XIMPreeditDrawCallbackStruct *) callData;
+    NSString *text = nil;
+
+    if (draw == NULL)
+        return;
+    if (draw->text != NULL) {
+        if (draw->text->encoding_is_wchar) {
+            // wchar_t is 32 bits wide on the host the library runs on.
+            const wchar_t *wide = draw->text->string.wide_char;
+            if (wide != NULL)
+                text = [[[NSString alloc] initWithBytes: wide
+                                                 length: wcslen(wide) * sizeof(wchar_t)
+                                               encoding: NSUTF32LittleEndianStringEncoding] autorelease];
+        } else if (draw->text->string.multi_byte != NULL) {
+            // The locale's multi-byte encoding is UTF-8, as for Xutf8LookupString().
+            text = [NSString stringWithUTF8String: draw->text->string.multi_byte];
+        }
+    }
+    [(X11Window *) clientData preeditReplaceCharactersFrom: draw->chg_first
+                                                    length: draw->chg_length
+                                                  withText: text ?: @""
+                                                     caret: draw->caret];
+}
+
+static void preeditCaretCallback(XIC ic, XPointer clientData, XPointer callData) {
+    XIMPreeditCaretCallbackStruct *caret = (XIMPreeditCaretCallbackStruct *) callData;
+
+    if (caret != NULL)
+        [(X11Window *) clientData preeditMoveCaretTo: caret->position
+                                           direction: caret->direction];
+}
+
+- (void) createXInputContext {
+    X11Display *display = (X11Display *) [NSDisplay currentDisplay];
+
+    _preeditCallbacks[0] = (XIMCallback) { (XPointer) self, (XIMProc) preeditStartCallback };
+    _preeditCallbacks[1] = (XIMCallback) { (XPointer) self, (XIMProc) preeditDoneCallback };
+    _preeditCallbacks[2] = (XIMCallback) { (XPointer) self, (XIMProc) preeditDrawCallback };
+    _preeditCallbacks[3] = (XIMCallback) { (XPointer) self, (XIMProc) preeditCaretCallback };
+    _xic = createInputContext(display->_xim, _window, _preeditCallbacks, &_onTheSpotPreedit);
+}
+
+- (NSTextInputContext *) textInputContext {
+    return [NSTextInputContext inputContextForWindow: [self delegate]];
+}
+
+- (NSString *) preeditString {
+    NSUInteger count = [_preedit length] / sizeof(uint32_t);
+
+    if (count == 0)
+        return @"";
+    return [[[NSString alloc] initWithBytes: [_preedit bytes]
+                                     length: count * sizeof(uint32_t)
+                                   encoding: NSUTF32LittleEndianStringEncoding] autorelease];
+}
+
+// The caret as a UTF-16 offset in the composition string.
+- (NSUInteger) preeditCaretUTF16Offset {
+    const uint32_t *chars = [_preedit bytes];
+    NSUInteger count = [_preedit length] / sizeof(uint32_t);
+    NSUInteger offset = 0;
+
+    for (NSUInteger i = 0; i < _preeditCaret && i < count; i++)
+        offset += chars[i] > 0xFFFF ? 2 : 1;
+    return offset;
+}
+
+- (void) sendPreeditToClient {
+    NSTextInputContext *context = [self textInputContext];
+    NSString *text = [self preeditString];
+
+    if ([text length] == 0) {
+        [context cancelComposition];
+        return;
+    }
+    [context updateComposition: text
+                     selection: NSMakeRange([self preeditCaretUTF16Offset], 0)];
+}
+
+- (void) preeditReplaceCharactersFrom: (int) first
+                               length: (int) length
+                             withText: (NSString *) text
+                                caret: (int) caret {
+    NSData *incoming = [text dataUsingEncoding: NSUTF32LittleEndianStringEncoding];
+    NSUInteger count = [_preedit length] / sizeof(uint32_t);
+
+    if (_preedit == nil)
+        _preedit = [[NSMutableData alloc] init];
+    // The server's range is trusted only as far as it lies in the string.
+    if (first < 0 || (NSUInteger) first > count)
+        first = (int) count;
+    if (length < 0 || (NSUInteger) (first + length) > count)
+        length = (int) (count - first);
+    [_preedit replaceBytesInRange: NSMakeRange(first * sizeof(uint32_t), length * sizeof(uint32_t))
+                        withBytes: [incoming bytes]
+                           length: [incoming length]];
+    count = [_preedit length] / sizeof(uint32_t);
+    _preeditCaret = caret < 0 ? 0 : ((NSUInteger) caret > count ? (int) count : caret);
+    [self sendPreeditToClient];
+}
+
+- (void) preeditMoveCaretTo: (int) position direction: (XIMCaretDirection) direction {
+    switch (direction) {
+    case XIMForwardChar:
+        position = _preeditCaret + 1;
+        break;
+    case XIMBackwardChar:
+        position = _preeditCaret - 1;
+        break;
+    case XIMAbsolutePosition:
+        break;
+    default:
+        return; // Word and line moves: the caret stays where the last draw put it.
+    }
+    NSUInteger count = [_preedit length] / sizeof(uint32_t);
+    _preeditCaret = position < 0 ? 0 : ((NSUInteger) position > count ? (int) count : position);
+    [self sendPreeditToClient];
+}
+
+// The composition ended, by commit or by cancel; the committed text, if any, arrives as a key
+// event or as a commit and replaces nothing that is still marked.
+- (void) preeditDone {
+    [_preedit setLength: 0];
+    _preeditCaret = 0;
+    [[self textInputContext] cancelComposition];
+}
+
+// Gives the input method the spot where the client's composition is, so that it places its
+// candidate window there.
+- (void) updateInputMethodSpot {
+    if (_xic == NULL || !_onTheSpotPreedit)
+        return;
+
+    NSWindow *window = [self delegate];
+    NSRect rect = [[self textInputContext] candidateRectOnScreen];
+    if (window == nil || NSEqualRects(rect, NSZeroRect))
+        return;
+
+    rect = [window convertRectFromScreen: rect];
+    CGFloat scale = [self backingScaleFactor];
+    // The bottom-left corner of the caret rectangle: the baseline side, in X's device pixels.
+    NSPoint spot = [self transformPoint: NSMakePoint(NSMinX(rect), NSMinY(rect))];
+    XPoint point = { (short) lround(spot.x * scale), (short) lround(spot.y * scale) };
+    // Only some styles take a spot; the error for one that does not is of no interest.
+#if defined(DARLING) && defined(__arm64__)
+    XVaNestedList list = ((XVaNestedList (*)(int, const char *, void *, void *))
+            XVaCreateNestedList)(0, XNSpotLocation, &point, NULL);
+#else
+    XVaNestedList list = XVaCreateNestedList(0, XNSpotLocation, &point, NULL);
+#endif
+    setPreeditAttributes(_xic, list);
+}
 
 + (Visual *) visual {
     static Visual *ret = NULL;
@@ -431,7 +688,7 @@ static NSData *makeWindowIcon() {
         XSetTransientForHint(_display, _window, [mainWindow windowHandle]);
     }
 
-    _xic = createInputContext(x11disp->_xim, _window);
+    [self createXInputContext];
 
     [(X11Display *) [NSDisplay currentDisplay] setWindow: self forID: _window];
 
@@ -449,6 +706,7 @@ static NSData *makeWindowIcon() {
 
 - (void) dealloc {
     [self invalidate];
+    [_preedit release];
     [_deviceDictionary release];
     [super dealloc];
 }
@@ -666,7 +924,12 @@ static const int X11ChromelessCornerRadius = 5;
 }
 
 // The outline of a window without a frame: one device pixel along the rounded edge, drawn over the content
-// every time the window is flushed (opaque, so that drawing it again changes nothing).
+// every time the window is flushed. The window's backing keeps what is drawn on it, so drawing it again must
+// change nothing: every pixel is either the opaque outline colour or untouched. The straight sides are
+// pixel-aligned rectangles, because a stroked outline is not exact along its whole length (its side drifts by a
+// fraction of a pixel, and from some row on it colours the pixel beside the edge too, which showed as a second
+// line along part of the left edge). The corners are quarter arcs drawn without antialiasing, so that their
+// partial coverage cannot accumulate over repeated flushes.
 - (void) drawChromelessOutline {
     if (!_chromeless || _context == nil || _invisibleWithoutCompositor)
         return;
@@ -678,15 +941,23 @@ static const int X11ChromelessCornerRadius = 5;
     O2ContextRef context = _context;
     O2ContextSaveGState(context);
     O2Float color[4] = {0.45, 0.45, 0.45, 1.0};
+    O2ContextSetFillColor(context, color);
     O2ContextSetStrokeColor(context, color);
+    O2ContextSetShouldAntialias(context, NO);
+    O2ContextFillRect(context, O2RectMake(radius, 0, width - 2 * radius, line));
+    O2ContextFillRect(context, O2RectMake(radius, height - line, width - 2 * radius, line));
+    O2ContextFillRect(context, O2RectMake(0, radius, line, height - 2 * radius));
+    O2ContextFillRect(context, O2RectMake(width - line, radius, line, height - 2 * radius));
     O2ContextSetLineWidth(context, line);
     O2ContextBeginPath(context);
-    O2ContextMoveToPoint(context, inset + radius, inset);
-    O2ContextAddArcToPoint(context, width - inset, inset, width - inset, inset + radius, radius);
-    O2ContextAddArcToPoint(context, width - inset, height - inset, width - inset - radius, height - inset, radius);
-    O2ContextAddArcToPoint(context, inset, height - inset, inset, height - inset - radius, radius);
+    O2ContextMoveToPoint(context, inset, inset + radius);
     O2ContextAddArcToPoint(context, inset, inset, inset + radius, inset, radius);
-    O2ContextClosePath(context);
+    O2ContextMoveToPoint(context, width - inset - radius, inset);
+    O2ContextAddArcToPoint(context, width - inset, inset, width - inset, inset + radius, radius);
+    O2ContextMoveToPoint(context, width - inset, height - inset - radius);
+    O2ContextAddArcToPoint(context, width - inset, height - inset, width - inset - radius, height - inset, radius);
+    O2ContextMoveToPoint(context, inset + radius, height - inset);
+    O2ContextAddArcToPoint(context, inset, height - inset, inset, height - inset - radius, radius);
     O2ContextStrokePath(context);
     O2ContextRestoreGState(context);
 }
@@ -779,6 +1050,9 @@ static const int X11ChromelessCornerRadius = 5;
         XDestroyIC(_xic);
         _xic = NULL;
     }
+    [_preedit setLength: 0];
+    _preeditCaret = 0;
+    _onTheSpotPreedit = NO;
     [(X11Display *) [NSDisplay currentDisplay] setWindow: nil
                                                    forID: oldWindow];
 
@@ -795,8 +1069,7 @@ static const int X11ChromelessCornerRadius = 5;
         _cglWindow = _hasAlpha ? CGLGetWindowWithAlpha((void *) _window,
                                                        _visualInfo->visualid)
                                : CGLGetWindow((void *) _window);
-        _xic = createInputContext(
-                ((X11Display *) [NSDisplay currentDisplay])->_xim, _window);
+        [self createXInputContext];
         [(X11Display *) [NSDisplay currentDisplay] setWindow: self
                                                        forID: _window];
         return;
@@ -919,6 +1192,7 @@ static const int X11ChromelessCornerRadius = 5;
         mask |= PointerMotionMask;
     }
     XSelectInput(_display, _window, mask);
+    X11TouchSelectWindow(_display, _window);
 
     // Click-through windows (overlays, tooltips) must not take the pointer from
     // the window below. Only a change needs a request.
@@ -1202,6 +1476,7 @@ static const int X11ChromelessCornerRadius = 5;
     // A focus request still waiting for MapNotify is void once the window is
     // ordered out; otherwise a later non-key orderFront would take focus.
     _wantsInputFocus = NO;
+    _keyRequested = NO;
 }
 
 - (void) placeAboveWindow: (NSInteger) otherNumber {
@@ -1314,13 +1589,27 @@ BOOL X11WindowManagerIsRunning(Display *display) {
         [self requestInputFocus];
 }
 
+// A window with alphaValue 0 is ordered in (mapped, and invisible by opacity or shape) and can be the
+// key window; the window manager's focus moving to another window of the application does not take
+// the key status from it (see -[NSWindow platformWindowActivated:displayIfNeeded:]).
+- (BOOL) isFullyTransparent {
+    return _alphaIsZero;
+}
+
+// Whether the application asked for this window to become the key window and the focus now arriving
+// is the answer to that; reading it clears the request. Without one, the focus the window manager
+// gives a window that was ordered in is not a request for the key status.
+- (BOOL) takeKeyRequest {
+    BOOL requested = _keyRequested;
+    _keyRequested = NO;
+    return requested;
+}
+
+- (BOOL) isMenuOrPopup {
+    return _menuWindow || _overrideRedirect;
+}
+
 - (void) makeKey {
-    // Making a window key does not put it on the screen: one that has not been
-    // ordered in has no mapped X window, and cannot take the input focus
-    // before it has. Ordering a window in (which maps it) comes first when
-    // an application asks for both.
-    if (!_mapped)
-        return;
     // FocusIn activates the NSWindow, which makes it key again and ends up here.
     // The focus change came from the window manager, which also stacks the
     // window, so leave both alone. Answering a FocusIn that is already stale
@@ -1329,9 +1618,23 @@ BOOL X11WindowManagerIsRunning(Display *display) {
     // them, then bounce focus between two windows forever.
     if (_receivingFocus)
         return;
+    _keyRequested = YES;
+    // Making a window key does not put it on the screen: one that has not been
+    // ordered in has no mapped X window, and cannot take the input focus
+    // before it has. Ordering a window in (which maps it) comes first when
+    // an application asks for both.
+    if (!_mapped)
+        return;
     XRaiseWindow(_display, _window);
     [self restackForLevels];
     [self requestInputFocus];
+    // The window already holds the focus (the window manager gave it when the window was ordered in
+    // and that did not make it key), so no FocusIn follows to report the request.
+    Window focused;
+    int revert;
+    XGetInputFocus(_display, &focused, &revert);
+    if (focused == _window && ![_delegate isKeyWindow])
+        [(X11Display *) [NSDisplay currentDisplay] windowHoldsFocus: self];
 }
 
 - (void) makeMain {
@@ -1476,6 +1779,23 @@ BOOL X11WindowManagerIsRunning(Display *display) {
     [self drawChromelessOutline];
     O2ContextFlush(_context);
     [self openGLFlushBuffer];
+    // Layer trees in child windows show the pixels drawn beneath them (see
+    // -[X11SubWindow createBackdropImage]).
+    [[NSNotificationCenter defaultCenter]
+            postNotificationName: X11WindowBackingDidFlushNotification
+                          object: self];
+}
+
+- (O2ImageRef) createBackingImageInDeviceRect: (O2Rect) rect {
+    if (_context == nil)
+        return NULL;
+    O2Surface *surface = [(O2Context_builtin *) _context surface];
+    O2ImageRef whole = O2SurfaceCreateImage(surface);
+    O2Rect bounds = O2RectMake(0, 0, O2SurfaceGetWidth(surface), O2SurfaceGetHeight(surface));
+    O2ImageRef result = whole != NULL ? O2ImageCreateWithImageInRect(whole, O2RectIntersection(rect, bounds)) : NULL;
+
+    O2ImageRelease(whole);
+    return result;
 }
 
 // The point is in window coordinates in points (y up), as an event reports it.
@@ -1501,6 +1821,8 @@ BOOL X11WindowManagerIsRunning(Display *display) {
 - (O2Rect) frame {
     return [self untransformFrame: _frame];
 }
+
+NSString *const X11WindowBackingDidFlushNotification = @"X11WindowBackingDidFlush";
 
 static int ignoreBadWindow(Display *display, XErrorEvent *errorEvent) {
     if (errorEvent->error_code == BadWindow)

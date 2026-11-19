@@ -189,6 +189,7 @@ set(AppKit_sources
 	NSImageHintSymbolScale.m
 	NSPasteboard.m
 	DarlingFileURIList.m
+	DarlingPortalFileChooser.m
 	NSSearchFieldCell.m
 	NSOutlineView.m
 	NSDocument.m
@@ -247,6 +248,7 @@ set(AppKit_sources
 	NSControlAuxiliary.m
 	NSViewController.m
 
+	NSKillRing.m
 	NSTextView.subproj/NSTextView.m
 	NSTextView.subproj/NSTextViewCommands.m
 	NSTextView.subproj/NSLayoutManager+AppKit.m
@@ -267,6 +269,7 @@ set(AppKit_sources
 	NSEvent.subproj/NSEvent_other.m
 	NSEvent.subproj/NSEvent_keyboard.m
 	NSEvent.subproj/NSEvent_gesture.m
+	NSTouch.m
 	NSEvent.subproj/NSEvent.m
 
 	NSButton.m
@@ -359,10 +362,12 @@ set(AppKit_sources
 	NSFileWrapperExtensions.m
 
 	NSToolbar.subproj/NSToolbarItemGroup.m
+	NSToolbar.subproj/NSTrackingSeparatorToolbarItem.m
 	NSToolbar.subproj/NSToolbarCustomizationView.m
 	NSToolbar.subproj/NSToolbarView.m
 	NSToolbar.subproj/NSToolbar.m
 	NSToolbar.subproj/NSToolbarItem.m
+	NSToolbar.subproj/NSMenuToolbarItem.m
 	NSToolbar.subproj/NSSearchToolbarItem.m
 	NSToolbar.subproj/NSToolbarCustomizationPalette.m
 	NSToolbar.subproj/NSToolbarItemView.m
@@ -388,6 +393,7 @@ set(AppKit_sources
 	NSSavePanel.subproj/_NSFileSystemDataSource.m
 	NSSavePanel.subproj/NSOpenPanel.m
 	NSSavePanel.subproj/NSSavePanel.m
+	NSSavePanel.subproj/_NSSavePanelNavigation.m
 
 	NSDockTile.m
 	NSGraphics.m
@@ -434,8 +440,10 @@ set(AppKit_sources
 	NSVisualEffectView.m
 	NSOpenGLLayer.m
 	NSCollectionViewGridLayout.m
+	NSCollectionViewCompositionalLayout.m
 
 	NSSharingService.m
+	NSUserInterfaceCompressionOptions.m
 	MacWorkspace.m
 	NSCoder+AppKit.m
 
@@ -455,6 +463,7 @@ set(AppKit_sources
 	NSTouchDevice.m
 	NSSplitViewController.m
 	NSSplitViewItem.m
+	NSSplitViewItemAccessoryViewController.m
 	NSTabViewController.m
 	NSTableViewRowAction.m
 	NSLayoutGuide.m
@@ -512,6 +521,7 @@ set(AppKit_resources
 	application-x-generic.png SystemImages/application-x-generic.png
 	audio-x-generic.png SystemImages/audio-x-generic.png
 	image-x-generic.png SystemImages/image-x-generic.png
+	package-x-generic.png SystemImages/package-x-generic.png
 	text-x-generic.png SystemImages/text-x-generic.png
 	video-x-generic.png SystemImages/video-x-generic.png
 	COPYING.Adwaita SystemImages/COPYING.Adwaita
@@ -579,6 +589,7 @@ add_framework(AppKit
 		Onyx2D
 		CoreText
 		CoreData
+		CollectionViewCore
 		OpenGL
 		QuartzCore
 		CoreGraphics
@@ -593,6 +604,8 @@ add_framework(AppKit
 		dbus
 )
 
+# Applications bind the NSCollectionLayout* names to AppKit, so AppKit re-exports the framework that defines them.
+reexport(AppKit CollectionViewCore ${CMAKE_BINARY_DIR}/src/external/cocotron/CollectionViewCore/CollectionViewCore)
 reexport(AppKit Foundation ${CMAKE_BINARY_DIR}/src/external/foundation/Foundation)
 reexport(AppKit ApplicationServices ${CMAKE_BINARY_DIR}/src/frameworks/ApplicationServices/ApplicationServices)
 # AppKit re-exports the layout classes too, so that programs built for SDKs that declare them in AppKit bind them
@@ -647,6 +660,7 @@ add_backend(X11
 		X11.backend/X11Cursor.m
 		X11.backend/X11DropSession.m
 		X11.backend/X11DraggingManager.m
+		X11.backend/X11Touch.m
 	INFO_PLIST
 		X11.backend/Info.plist
 	DEPENDENCIES

@@ -1,9 +1,18 @@
 #import "DarlingLayout.h"
 #import <AppKit/NSLayoutConstraint.h>
+#import <AppKit/NSLayoutGuide.h>
+#import "NSViewLayoutInternal.h"
 #import <Foundation/NSException.h>
 #include "third_party/kiwi/kiwi.h"
 #include <map>
+#include <vector>
 #include <cmath>
+
+// Layout guides take part as rectangles without a view. The solved frame
+// is set on the guide, measured from its owning view's own origin.
+@interface NSLayoutGuide (DarlingLayout)
+- (void) setFrame: (NSRect) frame;
+@end
 
 namespace {
 struct Geometry { kiwi::Variable x, y, width, height; };
@@ -13,8 +22,10 @@ class Layout {
     // vertical axis running downwards whatever the root's flippedness is.
     bool fitting;
     kiwi::Solver solver;
-    std::map<NSView *, Geometry> geometry;
+    // The views and layout guides of the subtree, each a rectangle in the root's coordinates.
+    std::map<id, Geometry> geometry;
     std::vector<NSView *> traversal;
+    std::vector<NSLayoutGuide *> guides;
     NSMutableArray *constraints;
     std::map<double, std::vector<kiwi::Constraint>, std::greater<double>> optional;
 
@@ -22,6 +33,10 @@ class Layout {
         geometry.emplace(view, Geometry());
         traversal.push_back(view);
         [constraints addObjectsFromArray:[view constraints]];
+        for (NSLayoutGuide *guide in [view layoutGuides]) {
+            geometry.emplace(guide, Geometry());
+            guides.push_back(guide);
+        }
         for (NSView *child in [view subviews]) collect(child);
     }
 
@@ -37,11 +52,13 @@ class Layout {
 
     // The edges and sizes layout constraints refer to are those of the view's
     // alignment rectangle: the frame less the alignment insets.
-    kiwi::Expression attribute(NSView *view, NSInteger attr) {
-        auto found = geometry.find(view);
+    kiwi::Expression attribute(id item, NSInteger attr) {
+        auto found = geometry.find(item);
         if (found == geometry.end())
-            [NSException raise:NSInvalidArgumentException format:@"Layout item is outside the view tree: %@", view];
+            [NSException raise:NSInvalidArgumentException format:@"Layout item is outside the view tree: %@", item];
         Geometry &g = found->second;
+        bool isGuide = [item isKindOfClass:[NSLayoutGuide class]];
+        NSView *view = isGuide ? [(NSLayoutGuide *)item owningView] : (NSView *)item;
         bool rtl = [view userInterfaceLayoutDirection] == NSUserInterfaceLayoutDirectionRightToLeft;
         switch (attr) {
         case NSLayoutAttributeLeading: attr = rtl ? NSLayoutAttributeRight : NSLayoutAttributeLeft; break;
@@ -51,7 +68,7 @@ class Layout {
         // root's y is measured from its top edge.
         bool flipped = rootFlipped();
         double top = NSMaxY([root bounds]);
-        NSEdgeInsets insets = [view alignmentRectInsets];
+        NSEdgeInsets insets = isGuide ? NSEdgeInsetsMake(0, 0, 0, 0) : [view alignmentRectInsets];
         // Insets name the visual sides, so top and bottom are the same in any
         // coordinate system.
         kiwi::Expression left = g.x + insets.left;
@@ -68,13 +85,16 @@ class Layout {
         case NSLayoutAttributeCenterX: return (left + right) * 0.5;
         case NSLayoutAttributeCenterY: return (above + below) * 0.5;
         case NSLayoutAttributeFirstBaseline:
+            if (isGuide) break;
             return above + [view firstBaselineOffsetFromTop];
         case NSLayoutAttributeLastBaseline:
+            if (isGuide) break;
             return below - [view lastBaselineOffsetFromBottom];
         default:
-            [NSException raise:NSInvalidArgumentException format:@"Unsupported layout attribute: %ld", (long)attr];
-            return kiwi::Expression();
+            break;
         }
+        [NSException raise:NSInvalidArgumentException format:@"Unsupported layout attribute: %ld", (long)attr];
+        return kiwi::Expression();
     }
 
     // A required constraint that conflicts with the ones added before it is broken: the layout
@@ -118,7 +138,7 @@ class Layout {
     }
 
     void intrinsic(NSView *view, Geometry &g) {
-        NSSize size = [view intrinsicContentSize];
+        NSSize size = [view _intrinsicContentSizeForLayout];
         NSEdgeInsets insets = [view alignmentRectInsets];
         // The intrinsic size is that of the alignment rectangle.
         kiwi::Expression dimensions[] = {g.width - (insets.left + insets.right),
@@ -237,8 +257,12 @@ public:
 private:
     void buildConstraints() {
         for (auto &entry : geometry) {
-            NSView *view = entry.first;
             Geometry &g = entry.second;
+            if ([entry.first isKindOfClass:[NSLayoutGuide class]]) {
+                add(g.width >= 0.0); add(g.height >= 0.0);
+                continue;
+            }
+            NSView *view = entry.first;
             if (view == root && fitting) {
                 add(g.width >= 0.0); add(g.height >= 0.0);
                 intrinsic(view, g);
@@ -297,6 +321,16 @@ private:
         }
         for (NSUInteger i = 0; i < [views count]; ++i)
             [[views objectAtIndex:i] setFrame:[[frames objectAtIndex:i] rectValue]];
+        for (NSLayoutGuide *guide : guides) {
+            NSView *owner = [guide owningView];
+            auto guideEntry = geometry.find(guide), ownerEntry = geometry.find(owner);
+            if (owner == nil || guideEntry == geometry.end() || ownerEntry == geometry.end()) continue;
+            Geometry &g = guideEntry->second, &p = ownerEntry->second;
+            NSRect relative = NSMakeRect(g.x.value() - p.x.value(), g.y.value() - p.y.value(), g.width.value(), g.height.value());
+            if ([owner isFlipped] != [root isFlipped])
+                relative.origin.y = p.height.value() - relative.origin.y - relative.size.height;
+            [guide setFrame:relative];
+        }
     }
 };
 }

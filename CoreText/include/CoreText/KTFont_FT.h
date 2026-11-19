@@ -44,8 +44,7 @@ typedef int ptrdiff_t;
 - (CGPoint) positionOfGlyph: (CGGlyph) current
             precededByGlyph: (CGGlyph) previous
                   isNominal: (BOOL *) isNominalp;
-- (void) getAdvancements: (CGSize *) advancements
-               forGlyphs: (const CGGlyph *) glyphs
-                   count: (NSUInteger) count;
+
+- (CGFloat) kerningBetweenGlyph: (CGGlyph) first andGlyph: (CGGlyph) second;
 
 @end

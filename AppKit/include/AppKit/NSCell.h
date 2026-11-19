@@ -26,7 +26,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSApplication.h>
 #import <Foundation/NSNotification.h>
 
-@class NSFont, NSImage, NSView;
+@class NSBezierPath, NSFont, NSImage, NSView;
+
+NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(NSUInteger, NSCellType) {
     NSNullCellType,
@@ -172,31 +174,31 @@ APPKIT_EXPORT NSNotificationName NSControlTintDidChangeNotification;
 @property NSUserInterfaceLayoutDirection userInterfaceLayoutDirection;
 
 // The cell's contextual menu.
-@property(nonatomic, retain) NSMenu *menu;
+@property(nullable, nonatomic, retain) NSMenu *menu;
 
 #pragma mark -
 #pragma mark Class Methods
 
 + (NSFocusRingType) defaultFocusRingType;
-+ (NSMenu *) defaultMenu;
++ (nullable NSMenu *) defaultMenu;
 + (BOOL) prefersTrackingUntilMouseUp;
 
 #pragma mark -
 
-- initTextCell: (NSString *) string;
-- initImageCell: (NSImage *) image;
+- (instancetype) initTextCell: (NSString *) string;
+- (instancetype) initImageCell: (nullable NSImage *) image;
 
-@property(nonatomic, retain) NSView *controlView;
+@property(nullable, nonatomic, retain) NSView *controlView;
 @property(nonatomic) NSCellType type;
 @property NSControlStateValue state;
 
-- target;
+- (nullable id) target;
 @property(nonatomic) SEL action;
 @property(nonatomic) NSInteger tag;
 @property(nonatomic) NSInteger entryType;
-@property(nonatomic, retain) id formatter;
-@property (retain) NSFont *font;
-@property(nonatomic, retain) NSImage *image;
+@property(null_unspecified, nonatomic, retain) id formatter;
+@property (nullable, retain) NSFont *font;
+@property(nullable, nonatomic, retain) NSImage *image;
 @property(nonatomic) NSTextAlignment alignment;
 @property NSLineBreakMode lineBreakMode;
 @property(nonatomic) BOOL usesSingleLineMode;
@@ -217,16 +219,25 @@ APPKIT_EXPORT NSNotificationName NSControlTintDidChangeNotification;
 @property(nonatomic, getter=isHighlighted) BOOL highlighted;
 
 - (BOOL) hasValidObjectValue;
-- objectValue;
+- (nullable id) objectValue;
 @property(nonatomic, copy) NSString *stringValue;
 @property(nonatomic) int intValue;
 @property(nonatomic) float floatValue;
 @property double doubleValue;
 @property(nonatomic) NSInteger integerValue;
 @property(nonatomic, copy) NSAttributedString *attributedStringValue;
-@property(nonatomic, assign) id representedObject;
+@property(nullable, nonatomic, assign) id representedObject;
 @property NSControlSize controlSize;
 @property(nonatomic) NSFocusRingType focusRingType;
+
+- (NSRect) focusRingMaskBoundsForFrame: (NSRect) cellFrame inView: (NSView *) controlView;
+- (void) drawFocusRingMaskWithFrame: (NSRect) cellFrame inView: (NSView *) controlView;
+
+// Private: whether the cell is the one of the control that has the keyboard focus in a key window.
+- (BOOL) _hasKeyboardFocusInView: (null_unspecified NSView *) controlView;
+// Private: the shape of the ring the control draws for the cell's keyboard focus when the cell has the focus, in
+// the coordinates of the control; nil for a cell that has no shape of its own.
+- (null_unspecified NSBezierPath *) _focusRingPathWithFrame: (NSRect) frame inView: (null_unspecified NSView *) controlView;
 @property(nonatomic) NSBackgroundStyle backgroundStyle;
 
 // The background style the cell draws its interior for (read-only).
@@ -238,21 +249,21 @@ APPKIT_EXPORT NSNotificationName NSControlTintDidChangeNotification;
 @property(nonatomic) BOOL allowsMixedState;
 @property(nonatomic) BOOL allowsEditingTextAttributes;
 
-- (void) setTarget: target;
+- (void) setTarget: (nullable id) target;
 
 
 - (void) setFloatingPointFormat: (BOOL) fpp
                            left: (NSUInteger) left
                           right: (NSUInteger) right;
 
-- (void) setObjectValue: (id<NSCopying>) value;
+- (void) setObjectValue: (null_unspecified id<NSCopying>) value;
 
-- (void) takeObjectValueFrom: (id) sender;
-- (void) takeStringValueFrom: (id) sender;
-- (void) takeIntValueFrom: (id) sender;
-- (void) takeFloatValueFrom: (id) sender;
-- (void) takeDoubleValueFrom: (id) sender;
-- (void) takeIntegerValueFrom: (id) sender;
+- (void) takeObjectValueFrom: (nullable id) sender;
+- (void) takeStringValueFrom: (nullable id) sender;
+- (void) takeIntValueFrom: (nullable id) sender;
+- (void) takeFloatValueFrom: (nullable id) sender;
+- (void) takeDoubleValueFrom: (nullable id) sender;
+- (void) takeIntegerValueFrom: (nullable id) sender;
 
 - (NSSize) cellSize;
 - (NSSize) cellSizeForBounds: (NSRect) rect;
@@ -286,12 +297,12 @@ APPKIT_EXPORT NSNotificationName NSControlTintDidChangeNotification;
 - (void) editWithFrame: (NSRect) frame
                 inView: (NSView *) view
                 editor: (NSText *) editor
-              delegate: (id) delegate
-                 event: (NSEvent *) event;
+              delegate: (nullable id) delegate
+                 event: (nullable NSEvent *) event;
 - (void) selectWithFrame: (NSRect) frame
                   inView: (NSView *) view
                   editor: (NSText *) editor
-                delegate: (id) delegate
+                delegate: (nullable id) delegate
                    start: (NSInteger) location
                   length: (NSInteger) length;
 - (void) endEditing: (NSText *) editor;
@@ -301,7 +312,7 @@ APPKIT_EXPORT NSNotificationName NSControlTintDidChangeNotification;
 @property(nonatomic) BOOL sendsActionOnEndEditing;
 
 // The cell's menu, whatever the event and position.
-- (NSMenu *) menuForEvent: (NSEvent *) event
+- (nullable NSMenu *) menuForEvent: (NSEvent *) event
                    inRect: (NSRect) rect
                    ofView: (NSView *) view;
 
@@ -311,3 +322,5 @@ void NSDrawThreePartImage(NSRect frame, NSImage *startCap, NSImage *centerFill,
                           NSImage *endCap, BOOL vertical,
                           NSCompositingOperation operation, CGFloat alpha,
                           BOOL flipped);
+
+NS_ASSUME_NONNULL_END

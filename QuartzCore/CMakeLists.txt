@@ -33,6 +33,7 @@ set(QuartzCore_sources
 	CAEmitterLayer.m
 	CAFrameRateRange.m
 	CALayerContext.m
+	CALayerPlane.m
 	CAKeyedCoding.m
 	CALayer.m
 	CALayerHost.m
@@ -86,7 +87,7 @@ generate_sdk_framework(QuartzCore
 )
 
 if (BUILD_METAL)
-	set(QUARTZCORE_LINK_INDIUM_PRIVATE indium_private)
+	set(QUARTZCORE_LINK_INDIUM_PRIVATE indium_private indium_kit_private)
 else()
 	set(QUARTZCORE_LINK_INDIUM_PRIVATE "")
 endif()

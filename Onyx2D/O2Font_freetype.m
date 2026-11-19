@@ -1,12 +1,21 @@
 #import <Onyx2D/O2Font_freetype.h>
 #ifdef FREETYPE_PRESENT
 #import <Onyx2D/O2Encoding.h>
+
+/* Font smoothing thickens the outlines: macOS renders smoothed text with about
+ * 15% more coverage than the plain outline at every size, which scales with the
+ * size like the stem width does. The factor is the added stem width per pixel of
+ * font size at the default (medium, level 2) setting, fitted to coverage totals
+ * measured on macOS 10.14.4; levels 1 and 3 scale it by 1/2 and 3/2. */
+#define O2FONT_SMOOTHING_WIDENING 0.0125
 #import <string.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <dispatch/dispatch.h>
 #import FT_TRUETYPE_TABLES_H
+#import FT_OUTLINE_H
+#include <math.h>
 
 @implementation O2Font_freetype
 
@@ -87,21 +96,26 @@ static NSString *guestPathFromHostPath(const char *path) {
 }
 #endif
 
-static void addAppFont(FcConfig *config, NSString *path) {
-    path = [[NSBundle mainBundle] pathForResource: path ofType: nil];
+// Adds a font file, or a directory of them, at a guest path to the application
+// fonts of config. Returns NO when the path does not exist or fontconfig takes nothing from it.
+static BOOL addFontFile(FcConfig *config, NSString *path) {
+    BOOL isDirectory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath: path
+                                              isDirectory: &isDirectory])
+        return NO;
+    path = hostPathFromGuestPath(path);
+    if (isDirectory)
+        return FcConfigAppFontAddDir(config, (const FcChar8 *) [path UTF8String]) != FcFalse;
+    return FcConfigAppFontAddFile(config, (const FcChar8 *) [path UTF8String]) != FcFalse;
+}
+
+static void addAppFont(FcConfig *config, NSString *name) {
+    NSString *path = [[NSBundle mainBundle] pathForResource: name ofType: nil];
     if (path == nil) {
-        NSLog(@"Cannot find font %@ in resources", path);
+        NSLog(@"Cannot find font %@ in resources", name);
         return;
     }
-    BOOL isDirectory;
-    [[NSFileManager defaultManager] fileExistsAtPath: path
-                                         isDirectory: &isDirectory];
-    path = hostPathFromGuestPath(path);
-    if (isDirectory) {
-        FcConfigAppFontAddDir(config, (const FcChar8 *) [path UTF8String]);
-    } else {
-        FcConfigAppFontAddFile(config, (const FcChar8 *) [path UTF8String]);
-    }
+    addFontFile(config, path);
 }
 
 #ifdef DARLING
@@ -170,6 +184,25 @@ FcConfig *O2FontSharedFontConfig() {
     return fontConfig;
 }
 
+O2FontRegistrationResult O2FontRegisterFontFile(NSString *path) {
+    static NSMutableSet *registered = nil;
+
+    if (path == nil || ![[NSFileManager defaultManager] fileExistsAtPath: path])
+        return O2FontRegistrationNotFound;
+    path = [path stringByStandardizingPath];
+    @synchronized([O2Font_freetype class]) {
+        if (registered == nil)
+            registered = [[NSMutableSet alloc] init];
+        if ([registered containsObject: path])
+            return O2FontRegistrationAlreadyRegistered;
+        FcConfig *config = O2FontSharedFontConfig();
+        if (config == NULL || !addFontFile(config, path))
+            return O2FontRegistrationUnrecognized;
+        [registered addObject: path];
+    }
+    return O2FontRegistrationSucceeded;
+}
+
 NSArray *O2FontCopyInstalledFaces(NSString *family, NSString *postScriptName,
                                   NSString *style, NSString *fullName)
 {
@@ -228,8 +261,9 @@ out:
 /* fontconfig ranks bitmap faces (the X11 .pcf fonts) above outline fonts for some generic
  * families, and a bitmap face has units_per_EM == 0, so every metric derived from it divides
  * by zero. Return the first scalable face of the sorted set, or the first face if none is. */
-static NSString *filenameOfFirstScalableFace(FcFontSet *set) {
+static NSString *filenameOfFirstScalableFace(FcFontSet *set, int *faceIndex) {
     NSString *fallback = nil;
+    int fallbackIndex = 0;
     for (int i = 0; i < set->nfont; i++) {
         FcChar8 *filename = NULL;
         if (FcPatternGetString(set->fonts[i], FC_FILE, 0, &filename) != FcResultMatch) {
@@ -239,15 +273,21 @@ static NSString *filenameOfFirstScalableFace(FcFontSet *set) {
         if (path == nil) {
             continue;
         }
+        /* The face within a font collection (.ttc) file; 0 when the pattern has none. */
+        int index = 0;
+        FcPatternGetInteger(set->fonts[i], FC_INDEX, 0, &index);
         FcBool scalable = FcTrue; /* left untouched when the pattern has no FC_SCALABLE */
         FcPatternGetBool(set->fonts[i], FC_SCALABLE, 0, &scalable);
         if (scalable) {
+            *faceIndex = index;
             return path;
         }
         if (fallback == nil) {
             fallback = path;
+            fallbackIndex = index;
         }
     }
+    *faceIndex = fallbackIndex;
     return fallback;
 }
 
@@ -347,7 +387,38 @@ O2FontRef O2FontCreateWithCodePointCoverage(const uint32_t *codePoints,
     return [[O2Font_freetype alloc] initWithFace: face];
 }
 
-+ (NSString *) filenameForPattern: (NSString *) pattern {
+/* The installed face whose PostScript name is exactly name: its file and the face index in it
+ * (which selects the face within a font collection file and the instance of a variable font). */
++ (NSString *) filenameForPostScriptName: (NSString *) name faceIndex: (int *) faceIndex {
+    FcConfig *config = O2FontSharedFontConfig();
+    FcPattern *pattern = FcPatternCreate();
+    FcObjectSet *objects = FcObjectSetCreate();
+    NSString *result = nil;
+
+    if (pattern != NULL && objects != NULL && [name length] > 0 &&
+        FcPatternAddString(pattern, FC_POSTSCRIPT_NAME, (const FcChar8 *) [name UTF8String]) &&
+        FcObjectSetAdd(objects, FC_FILE) && FcObjectSetAdd(objects, FC_INDEX)) {
+        FcFontSet *set = FcFontList(config, pattern, objects);
+        for (int i = 0; set != NULL && i < set->nfont && result == nil; i++) {
+            FcChar8 *filename = NULL;
+            if (FcPatternGetString(set->fonts[i], FC_FILE, 0, &filename) != FcResultMatch)
+                continue;
+            int index = 0;
+            FcPatternGetInteger(set->fonts[i], FC_INDEX, 0, &index);
+            result = [NSString stringWithUTF8String: (const char *) filename];
+            *faceIndex = index;
+        }
+        if (set != NULL)
+            FcFontSetDestroy(set);
+    }
+    if (objects != NULL)
+        FcObjectSetDestroy(objects);
+    if (pattern != NULL)
+        FcPatternDestroy(pattern);
+    return result;
+}
+
++ (NSString *) filenameForPattern: (NSString *) pattern faceIndex: (int *) faceIndex {
     FcConfig *config = O2FontSharedFontConfig();
 
     FcPattern *pat = FcNameParse((unsigned char *) [pattern UTF8String]);
@@ -361,7 +432,7 @@ O2FontRef O2FontCreateWithCodePointCoverage(const uint32_t *codePoints,
         return nil;
     }
 
-    NSString *res = filenameOfFirstScalableFace(set);
+    NSString *res = filenameOfFirstScalableFace(set, faceIndex);
     FcFontSetDestroy(set);
     return res;
 }
@@ -372,8 +443,21 @@ O2FontRef O2FontCreateWithCodePointCoverage(const uint32_t *codePoints,
         return nil;
     }
 
+    // FreeType reads the font from one block of memory that must outlive the
+    // face. Direct-access providers (CFData, bytes, URL) already expose such a
+    // block; a file provider is sequential and has none, so read its contents.
     const void *bytes = [provider bytes];
     size_t length = [provider length];
+    if (bytes == NULL) {
+        CFDataRef contents = O2DataProviderCopyData(provider);
+        if (contents == NULL) {
+            [self release];
+            return nil;
+        }
+        _faceData = (NSData *) contents;
+        bytes = [_faceData bytes];
+        length = [_faceData length];
+    }
 
     FT_Face face;
     int error = FT_New_Memory_Face(O2FontSharedFreeTypeLibrary(), bytes, length,
@@ -391,9 +475,15 @@ O2FontRef O2FontCreateWithCodePointCoverage(const uint32_t *codePoints,
 - (instancetype) initWithFontName: (NSString *) name {
     self = [super initWithFontName: name];
 
-    NSString *filename = [[self class] filenameForPattern: name];
+    // The face is found by its PostScript name, else by fontconfig's closest match for the name. A font
+    // collection file holds several faces: the face that was matched is opened, not the first.
+    int faceIndex = 0;
+    NSString *filename = [[self class] filenameForPostScriptName: name faceIndex: &faceIndex];
     if (filename == nil) {
-        filename = [[self class] filenameForPattern: @""];
+        filename = [[self class] filenameForPattern: name faceIndex: &faceIndex];
+    }
+    if (filename == nil) {
+        filename = [[self class] filenameForPattern: @"" faceIndex: &faceIndex];
     }
     if (filename == nil) {
         NSLog(@"No font found for name %@", name);
@@ -403,7 +493,7 @@ O2FontRef O2FontCreateWithCodePointCoverage(const uint32_t *codePoints,
 
     FT_Face face;
     FT_Error error = FT_New_Face(O2FontSharedFreeTypeLibrary(),
-                                 [filename fileSystemRepresentation], 0, &face);
+                                 [filename fileSystemRepresentation], faceIndex, &face);
 
     if (error != 0) {
         NSLog(@"FT_New_Face() = %d", error);
@@ -460,8 +550,25 @@ O2FontRef O2FontCreateWithCodePointCoverage(const uint32_t *codePoints,
     _ascent = face->ascender;
     _descent = face->descender;
     _leading = 0;
-    _capHeight = face->height;
-    _xHeight = face->height;
+    _capHeight = 0;
+    _xHeight = 0;
+    // sCapHeight and sxHeight exist from OS/2 version 2 on.
+    TT_OS2 *os2 = FT_Get_Sfnt_Table(face, FT_SFNT_OS2);
+    if (os2 != NULL && os2->version >= 2) {
+        _capHeight = os2->sCapHeight;
+        _xHeight = os2->sxHeight;
+    }
+    // Older tables: take the height of the flat-topped letters instead.
+    if (_capHeight <= 0 || _xHeight <= 0) {
+        NSInteger *targets[2] = { &_capHeight, &_xHeight };
+        FT_ULong letters[2] = { 'H', 'x' };
+        for (int i = 0; i < 2; i++) {
+            FT_UInt g = *targets[i] > 0 ? 0 : FT_Get_Char_Index(face, letters[i]);
+            if (g != 0 &&
+                FT_Load_Glyph(face, g, FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING) == 0)
+                *targets[i] = face->glyph->metrics.horiBearingY;
+        }
+    }
     _italicAngle = 0;
     _stemV = 0;
     _bbox.origin.x = face->bbox.xMin;
@@ -475,6 +582,7 @@ O2FontRef O2FontCreateWithCodePointCoverage(const uint32_t *codePoints,
 
 - (void) dealloc {
     FT_Done_Face(_face);
+    [_faceData release];
     [_glyphCache release];
     [_macRomanEncoding release];
     [_macExpertEncoding release];
@@ -610,15 +718,31 @@ FT_Face O2FontFreeTypeFace(O2Font_freetype *self) {
 
 - (void) fetchAdvances {
     @synchronized(self) {
-        FT_Set_Char_Size(_face, 0, _unitsPerEm * 64, 72, 72);
-
         _advances = NSZoneMalloc(NULL, sizeof(NSInteger) * _numberOfGlyphs);
 
+        // Design-unit advances: unscaled and unhinted, so that scaling them to
+        // any point size gives the exact fractional advance.
         for (O2Glyph glyph = 0; glyph < _numberOfGlyphs; glyph++) {
-            FT_Load_Glyph(_face, glyph, FT_LOAD_DEFAULT);
-
-            _advances[glyph] = _face->glyph->advance.x / (O2Float)(2 << 5);
+            if (FT_Load_Glyph(_face, glyph,
+                              FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING |
+                                      FT_LOAD_IGNORE_TRANSFORM) == 0)
+                _advances[glyph] = _face->glyph->advance.x;
+            else
+                _advances[glyph] = 0;
         }
+    }
+}
+
+- (int) verticalAdvanceForGlyph: (O2Glyph) glyph {
+    @synchronized(self) {
+        // With FT_LOAD_VERTICAL_LAYOUT the vertical advance is in advance.y; FreeType
+        // synthesizes one for a font without vhea/vmtx tables.
+        if (FT_Load_Glyph(_face, glyph,
+                          FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING |
+                                  FT_LOAD_IGNORE_TRANSFORM |
+                                  FT_LOAD_VERTICAL_LAYOUT) != 0)
+            return 0;
+        return (int) _face->glyph->advance.y;
     }
 }
 
@@ -743,38 +867,66 @@ FT_Face O2FontFreeTypeFace(O2Font_freetype *self) {
 }
 
 /* Cache entries are keyed by everything that determines the rendered bitmap:
- * the glyph, the 26.6 pixel size handed to FT_Set_Char_Size and the FreeType
- * load flags and render mode. The text rendering matrix only reaches this
- * point as its scale (folded into the pixel size by the caller; shear and
- * rotation are not applied to FreeType bitmaps), and the context's
- * antialiasing flag is not consulted by the FreeType backend (coverage is
- * always the 8-bit gray bitmap). If the backend starts honouring either, the
- * extra input has to become part of this key. */
-#define O2FONT_GLYPH_LOAD_FLAGS FT_LOAD_DEFAULT
-#define O2FONT_GLYPH_RENDER_MODE FT_RENDER_MODE_NORMAL
-#define O2FONT_GLYPH_SIZE_KEY_BITS 24
+ * the glyph, the 26.6 pixel size handed to FT_Set_Char_Size, the glyph matrix,
+ * the render options, the smoothing level and the subpixel offset. Glyphs are
+ * loaded unhinted: macOS positions and sizes text exactly, and does not snap
+ * outlines to the pixel grid. */
+#define O2FONT_GLYPH_LOAD_FLAGS (FT_LOAD_NO_HINTING)
+
+typedef struct {
+    uint32_t glyph;
+    uint32_t size64;
+    uint32_t options;
+    uint32_t smoothing;
+    uint32_t subpixelIndex;
+    uint32_t subpixelSteps;
+    FT_Fixed xx, xy, yx, yy;
+} O2FreeTypeGlyphKey;
+
+NSUInteger O2FreeTypeSubpixelSteps(BOOL quantized) {
+    // A quantized position is one of four offsets, as on macOS.
+    return quantized ? 4 : 16;
+}
 
 - (O2FreeTypeCachedGlyph *) rasterizeGlyph: (O2Glyph) glyph
                                   pointSize: (O2Float) pointSize
+                                     matrix: (const O2FreeTypeGlyphMatrix *) matrix
+                                    options: (unsigned) options
+                                  smoothing: (unsigned) smoothing
+                              subpixelIndex: (unsigned) subpixelIndex
+                              subpixelSteps: (unsigned) subpixelSteps
 {
-    if (_face == NULL || !(pointSize > 0)) {
+    if (_face == NULL || !(pointSize > 0) || subpixelSteps == 0) {
         return nil;
+    }
+
+    BOOL antialiased = (options & O2FreeTypeGlyphAntialiased) != 0;
+    if (!antialiased) {
+        smoothing = 0;
     }
 
     /* The size is set here, under the font lock, so a hit or a miss never
      * depends on what size the face was left at by metric queries. */
     O2Float size64 = pointSize * 64;
-    BOOL cacheable = size64 < (O2Float)(1 << O2FONT_GLYPH_SIZE_KEY_BITS);
+    BOOL cacheable = size64 < (O2Float)(1 << 24);
 
     @synchronized(self) {
-        NSNumber *key = nil;
+        NSData *key = nil;
 
         if (cacheable) {
-            uint64_t keyValue =
-                    ((uint64_t)(uint32_t)(long) size64
-                     << (64 - O2FONT_GLYPH_SIZE_KEY_BITS)) |
-                    ((uint64_t)O2FONT_GLYPH_RENDER_MODE << 32) | glyph;
-            key = [NSNumber numberWithUnsignedLongLong: keyValue];
+            O2FreeTypeGlyphKey keyValue = {
+                .glyph = glyph,
+                .size64 = (uint32_t)(long) size64,
+                .options = options,
+                .smoothing = smoothing,
+                .subpixelIndex = subpixelIndex,
+                .subpixelSteps = subpixelSteps,
+                .xx = matrix != NULL ? matrix->xx : 0x10000,
+                .xy = matrix != NULL ? matrix->xy : 0,
+                .yx = matrix != NULL ? matrix->yx : 0,
+                .yy = matrix != NULL ? matrix->yy : 0x10000,
+            };
+            key = [NSData dataWithBytes: &keyValue length: sizeof(keyValue)];
 
             O2FreeTypeCachedGlyph *hit = [_glyphCache objectForKey: key];
             if (hit != nil) {
@@ -786,11 +938,30 @@ FT_Face O2FontFreeTypeFace(O2Font_freetype *self) {
             return nil;
         }
 
-        if (FT_Load_Glyph(_face, glyph, O2FONT_GLYPH_LOAD_FLAGS) != 0) {
-            return nil;
-        }
+        FT_Matrix ftMatrix = {
+            matrix != NULL ? matrix->xx : 0x10000, matrix != NULL ? matrix->xy : 0,
+            matrix != NULL ? matrix->yx : 0, matrix != NULL ? matrix->yy : 0x10000
+        };
+        // The pen's fractional x as a 26.6 offset applied to the outline.
+        FT_Vector delta = { (FT_Pos)(subpixelIndex * 64 / subpixelSteps), 0 };
+        FT_Set_Transform(_face, &ftMatrix, &delta);
 
-        if (FT_Render_Glyph(_face->glyph, O2FONT_GLYPH_RENDER_MODE) != 0) {
+        FT_Error error = FT_Load_Glyph(_face, glyph, O2FONT_GLYPH_LOAD_FLAGS);
+        if (error == 0 && smoothing > 0 &&
+            _face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+            // Widen the outline, keeping it centred on the original.
+            FT_Pos strength = (FT_Pos) lround(
+                    O2FONT_SMOOTHING_WIDENING * (smoothing / 2.0) * pointSize * 64);
+            FT_Outline_Embolden(&_face->glyph->outline, strength);
+            FT_Outline_Translate(&_face->glyph->outline, -strength / 2, -strength / 2);
+        }
+        if (error == 0) {
+            error = FT_Render_Glyph(_face->glyph,
+                                    antialiased ? FT_RENDER_MODE_NORMAL
+                                                : FT_RENDER_MODE_MONO);
+        }
+        FT_Set_Transform(_face, NULL, NULL);
+        if (error != 0) {
             return nil;
         }
 
@@ -855,8 +1026,18 @@ FT_Face O2FontFreeTypeFace(O2Font_freetype *self) {
         unsigned char *data = NSZoneMalloc(NULL, bytes);
 
         for (FT_Int row = 0; row < bitmap.rows; row++) {
-            memcpy(data + row * bitmap.width,
-                   srcBitmap->buffer + row * srcBitmap->pitch, bitmap.width);
+            const unsigned char *srcRow = srcBitmap->buffer + row * srcBitmap->pitch;
+            unsigned char *dstRow = data + row * bitmap.width;
+
+            if (srcBitmap->pixel_mode == FT_PIXEL_MODE_MONO) {
+                // One bit per pixel, most significant bit first: aliased
+                // coverage is either 0 or 255.
+                for (FT_Int x = 0; x < bitmap.width; x++) {
+                    dstRow[x] = (srcRow[x >> 3] & (0x80 >> (x & 7))) ? 255 : 0;
+                }
+            } else {
+                memcpy(dstRow, srcRow, bitmap.width);
+            }
         }
 
         bitmap.buffer = data;

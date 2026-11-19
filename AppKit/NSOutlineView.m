@@ -309,6 +309,9 @@ static inline id childOfItemAtIndex(NSOutlineView *self, id item,
 - parentForItem: item {
     if (!NS_EXTRA(NSOutlineView, self)->_rowCacheValid)
         [self loadRootItem];
+    // The root item (nil) has no parent.
+    if (item == nil)
+        return nil;
     return NSMapGet(NS_EXTRA(NSOutlineView, self)->_itemToParent, item);
 }
 
@@ -321,6 +324,9 @@ static inline id childOfItemAtIndex(NSOutlineView *self, id item,
 - (NSInteger) levelForItem: (id) item {
     if (!NS_EXTRA(NSOutlineView, self)->_rowCacheValid)
         [self loadRootItem];
+    // The root item (nil) is above the first level.
+    if (item == nil)
+        return -1;
     NSInteger level = (NSInteger) NSMapGet(NS_EXTRA(NSOutlineView, self)->_itemToLevel, item);
     return level;
 }
@@ -937,8 +943,10 @@ static void loadItemIntoMapTables(NSOutlineView *self, id item,
             [_editingCell setControlView: self];
             [_editingCell drawWithFrame: NS_EXTRA(NSTableView, self)->_editingFrame inView: self];
             if ([_editingCell focusRingType] != NSFocusRingTypeNone) {
-                [[NSColor keyboardFocusIndicatorColor] setStroke];
-                NSFrameRectWithWidth(NS_EXTRA(NSTableView, self)->_editingBorder, 2.0);
+                [NSGraphicsContext saveGraphicsState];
+                NSSetFocusRingStyle(NSFocusRingOnly);
+                NSRectFill(NS_EXTRA(NSTableView, self)->_editingBorder);
+                [NSGraphicsContext restoreGraphicsState];
             }
         } else {
             NSCell *dataCell = [self preparedCellAtColumn: drawThisColumn
