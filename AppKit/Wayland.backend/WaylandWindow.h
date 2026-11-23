@@ -57,6 +57,13 @@ struct WaylandBuffer {
     struct wl_proxy *_surface;
     struct wl_proxy *_xdgSurface;
     struct wl_proxy *_toplevel;
+    // The menu bar, when the compositor has wlr-layer-shell: it has this role instead of the xdg ones.
+    struct wl_proxy *_layerSurface;
+    // org_kde_kwin_appmenu of the toplevel, while the main menu is exported.
+    struct wl_proxy *_appMenu;
+    // org_kde_plasma_surface of the toplevel while it is not an application window (see
+    // -updateTaskbarPresence).
+    struct wl_proxy *_plasmaSurface;
     struct wl_proxy *_popup;
     WaylandWindow *_popupParent;
     uint32_t _popupGrabSerial;
@@ -67,15 +74,27 @@ struct WaylandBuffer {
     struct WaylandBuffer _buffers[2];
     int32_t _pendingWidth, _pendingHeight;
     BOOL _pendingActivated;
+    // The compositor's xdg_toplevel suspended state (version 6): the surface is not being repainted,
+    // for instance because it is covered or its workspace is not shown.
+    BOOL _pendingSuspended, _suspended;
     BOOL _mapped;
     // The window has been ordered in, whether or not it is mapped (a window with alpha 0 is not).
     BOOL _shouldBeMapped;
     BOOL _fullyTransparent;
+    // Ordered in by an application that may not take the input focus, so not mapped yet (see
+    // -mapWouldTakeFocusFromOthers).
+    BOOL _mapDeferred;
+    // A menu is ordered in but waits for its parent window's first configure: a popup cannot be
+    // created for a surface that has no role and configuration yet, and as a toplevel the
+    // compositor would place and size it.
+    BOOL _popupWaitingForParent;
+    BOOL _genericPopup; // an xdg_popup for a pop-up window that is not a menu or tool tip (see DarlingWindowPresentation.h)
     // -makeKey was called and the activation it asks for has not arrived yet.
     BOOL _keyRequested;
     // The activation is being reported to the NSWindow; its -becomeKeyWindow asks -makeKey, which is no new request.
     BOOL _reportingActivation;
     BOOL _configured;
+    BOOL _toplevelIconSet; // the compositor was given an icon for the toplevel
     BOOL _needsPresent;
     BOOL _activated;
     NSMutableSet *_surfaceOutputs;
@@ -89,6 +108,8 @@ struct WaylandBuffer {
     // configure said, and the size to go back to.
     BOOL _fullscreenRequested, _pendingFullscreen, _fullscreenRecheckPending;
     BOOL _fullscreenReported; // what the last configure said, told to the delegate
+    BOOL _fullscreenSettling; // a fullscreen change was requested and not yet answered
+    NSUInteger _fullscreenSettleToken;
     WaylandFullscreenTracker _fullscreenTracker;
     // The window this one is transient for because of its level, if any (not retained: the
     // display clears it when that window goes away).
@@ -113,6 +134,9 @@ struct WaylandBuffer {
 - (BOOL) isMapped;
 - (BOOL) isFullyTransparent;
 - (BOOL) isOrderedIn;
+- (void) keyboardFocusLeft;
+- (BOOL) isActivatedByCompositor;
+- (BOOL) isMapDeferred;
 - (BOOL) takeKeyRequest;
 - (void) reportActivationDisplayingIfNeeded: (BOOL) displayIfNeeded;
 - (int32_t) bufferScale;
@@ -125,8 +149,14 @@ struct WaylandBuffer {
 // events of the batch (including a configure for the new size) are in.
 - (void) outputsChanged;
 - (BOOL) isPopup;
+- (struct wl_proxy *) layerSurface;
+- (BOOL) isPopupWaitingForParent;
+- (void) ensureMapped;
 // A tool tip window: placed as an ungrabbed popup next to the pointer.
 - (BOOL) isTooltip;
+// A pop-up window of the application (a drop-down a toolkit draws, a custom tool tip), shown as an
+// ungrabbed popup of its parent window; it is not part of menu tracking.
+- (BOOL) isGenericPopup;
 - (WaylandWindow *) popupParent;
 - (WaylandWindow *) levelParent;
 - (void) updateLevelParent;
@@ -134,6 +164,9 @@ struct WaylandBuffer {
 - (uint32_t) popupGrabSerial;
 - (struct wl_proxy *) xdgSurface;
 - (void) unmap;
+// Tells the compositor where the application's main menu is (KDE's appmenu
+// protocol), or takes the address back when there is no menu or no toplevel.
+- (void) updateApplicationMenu;
 - (NSPoint) contentOffset;
 - (BOOL) isDecorationPoint: (CGPoint) point;
 - (BOOL) decorationButton: (uint32_t) button pressed: (BOOL) pressed
@@ -147,5 +180,8 @@ struct WaylandBuffer {
                 kind: (WaylandObjectKind) kind
                proxy: (struct wl_proxy *) proxy
            arguments: (union wl_argument *) args;
+
+// Gives the toplevel the application icon (xdg-toplevel-icon), when the compositor has the protocol.
+- (void) updateToplevelIcon;
 
 @end

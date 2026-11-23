@@ -4,6 +4,7 @@
 #import <QuartzCore/CAConstraintLayoutManager.h>
 #import <QuartzCore/CALayer.h>
 #import <QuartzCore/CALayerContext.h>
+#import <QuartzCore/CAScrollLayer.h>
 #import <QuartzCore/CATransaction.h>
 #import <Onyx2D/O2Image.h>
 #import "CAKeyedCoding.h"
@@ -78,12 +79,15 @@ NSString *const CAToneMapModeIfSupported = @"ifSupported";
     return NS_EXTRA(CALayer, self)->_superlayer;
 }
 
+// _sublayers is never nil, so the mutators can copy it; the public getter
+// reports a layer without sublayers as nil, as macOS does.
 - (NSArray *) sublayers {
-    return NS_EXTRA(CALayer, self)->_sublayers;
+    NSArray *sublayers = NS_EXTRA(CALayer, self)->_sublayers;
+    return [sublayers count] > 0 ? sublayers : nil;
 }
 
 - (void) setSublayers: (NSArray *) sublayers {
-    sublayers = [sublayers copy];
+    sublayers = sublayers != nil ? [sublayers copy] : [NSArray new];
 
     // A layer has a single superlayer, so the new sublayers leave the layers
     // they are in now.
@@ -176,45 +180,190 @@ NSString *const CAToneMapModeIfSupported = @"ifSupported";
         [action runActionForKey: @"bounds" object: self arguments: nil];
     }
 
-    BOOL sizeChanged = !CGSizeEqualToSize(NS_EXTRA(CALayer, self)->_bounds.size, value.size);
+    CGRect oldBounds = NS_EXTRA(CALayer, self)->_bounds;
+    BOOL sizeChanged = !CGSizeEqualToSize(oldBounds.size, value.size);
     NS_EXTRA(CALayer, self)->_bounds = value;
     if (sizeChanged)
         [self setNeedsLayout];
     if (sizeChanged && NS_EXTRA(CALayer, self)->_needsDisplayOnBoundsChange)
         [self setNeedsDisplay];
+    // Any change of the bounds rectangle, an origin-only one included, informs
+    // the sublayers; the sublayers apply their autoresizing masks synchronously.
+    if (!CGRectEqualToRect(oldBounds, value))
+        [self resizeSublayersWithOldSize: oldBounds.size];
+}
+
+// Splits the change of a superlayer's extent along one axis between the parts of
+// a sublayer that its mask makes flexible. Returns the new origin and length.
+static void CALayerAutoresizeAxis(CGFloat *origin, CGFloat *length, CGFloat delta, BOOL minMargin, BOOL sizable, BOOL maxMargin) {
+    int margins = (minMargin ? 1 : 0) + (maxMargin ? 1 : 0);
+    CGFloat sizeShare = 0, marginShare = 0;
+
+    if (sizable) {
+        // QUIRK: a flexible size takes a third of the change when a margin is
+        // flexible too, and the flexible margins share the rest equally,
+        // whatever the current sizes of the parts (unlike NSView's proportional
+        // split). Not documented. Evidence: black-box observation on macOS 26.7.3
+        // (tier 2). Test: tests/src/quartzcore_autoresizing.m (split cases).
+        sizeShare = margins > 0 ? delta / 3 : delta;
+        if (margins > 0)
+            marginShare = (delta - sizeShare) / margins;
+    } else if (margins > 0) {
+        marginShare = delta / margins;
+    }
+    if (minMargin)
+        *origin += marginShare;
+    *length += sizeShare;
+}
+
+- (void) resizeSublayersWithOldSize: (CGSize) size {
+    NSArray *children = [NS_EXTRA(CALayer, self)->_sublayers copy];
+
+    for (CALayer *child in [children reverseObjectEnumerator])
+        [child resizeWithOldSuperlayerSize: size];
+    [children release];
+}
+
+- (void) resizeWithOldSuperlayerSize: (CGSize) size {
+    CAAutoresizingMask mask = NS_EXTRA(CALayer, self)->_autoresizingMask;
+    CALayer *superlayer = NS_EXTRA(CALayer, self)->_superlayer;
+
+    if (mask == kCALayerNotSizable || superlayer == nil)
+        return;
+
+    CGSize newSize = [superlayer bounds].size;
+    CGRect frame = [self frame];
+
+    CALayerAutoresizeAxis(&frame.origin.x, &frame.size.width, newSize.width - size.width,
+                          (mask & kCALayerMinXMargin) != 0, (mask & kCALayerWidthSizable) != 0, (mask & kCALayerMaxXMargin) != 0);
+    CALayerAutoresizeAxis(&frame.origin.y, &frame.size.height, newSize.height - size.height,
+                          (mask & kCALayerMinYMargin) != 0, (mask & kCALayerHeightSizable) != 0, (mask & kCALayerMaxYMargin) != 0);
+
+    // QUIRK: the result is a whole-number rectangle: the origin rounds down and
+    // the far edges round up, and a negative extent is flipped to a positive one.
+    // Not documented. Evidence: black-box observation on macOS 26.7.3 (tier 2).
+    // Test: tests/src/quartzcore_autoresizing.m (rounding cases).
+    frame = CGRectStandardize(frame);
+    CGFloat minX = floor(CGRectGetMinX(frame)), minY = floor(CGRectGetMinY(frame));
+    CGFloat maxX = ceil(CGRectGetMaxX(frame)), maxY = ceil(CGRectGetMaxY(frame));
+    frame = CGRectMake(minX, minY, maxX - minX, maxY - minY);
+
+    if (!CGRectEqualToRect(frame, [self frame]))
+        [self setFrame: frame];
+}
+
+// Maps a corner of the layer, given relative to the anchor point, through the
+// layer's transform to the superlayer's coordinates; the 3D result is
+// projected to the plane.
+static CGPoint CALayerTransformedCorner(CATransform3D t, CGFloat x, CGFloat y, CGFloat z, CGPoint position) {
+    CGFloat w = x * t.m14 + y * t.m24 + z * t.m34 + t.m44;
+    CGFloat px = x * t.m11 + y * t.m21 + z * t.m31 + t.m41;
+    CGFloat py = x * t.m12 + y * t.m22 + z * t.m32 + t.m42;
+
+    if (w != 0 && w != 1) {
+        px /= w;
+        py /= w;
+    }
+    return CGPointMake(position.x + px, position.y + py);
+}
+
+// Whether a transform has no part in the third dimension or the perspective.
+// Rotations built by CATransform3DMakeRotation leave rounding residue (float on
+// 32-bit) in these entries, so they are compared with a tolerance.
+static BOOL CALayerTransformIsAffine(CATransform3D t) {
+    const CGFloat eps = 1e-6;
+
+    return fabs(t.m13) < eps && fabs(t.m14) < eps && fabs(t.m23) < eps && fabs(t.m24) < eps &&
+           fabs(t.m31) < eps && fabs(t.m32) < eps && fabs(t.m34) < eps && fabs(t.m43) < eps &&
+           fabs(t.m33 - 1) < eps && fabs(t.m44 - 1) < eps;
 }
 
 - (CGRect) frame {
+    CGRect bounds = NS_EXTRA(CALayer, self)->_bounds;
+    CGPoint anchor = NS_EXTRA(CALayer, self)->_anchorPoint;
+    CGPoint position = NS_EXTRA(CALayer, self)->_position;
+    CATransform3D t = NS_EXTRA(CALayer, self)->_transform;
     CGRect result;
 
-    result.size = NS_EXTRA(CALayer, self)->_bounds.size;
-    result.origin.x = NS_EXTRA(CALayer, self)->_position.x - result.size.width * NS_EXTRA(CALayer, self)->_anchorPoint.x;
-    result.origin.y = NS_EXTRA(CALayer, self)->_position.y - result.size.height * NS_EXTRA(CALayer, self)->_anchorPoint.y;
+    if (CATransform3DIsIdentity(t)) {
+        result.size = bounds.size;
+        result.origin.x = position.x - result.size.width * anchor.x;
+        result.origin.y = position.y - result.size.height * anchor.y;
+        return result;
+    }
 
-    return result;
+    // The frame of a transformed layer is the bounding box of its transformed
+    // bounds, in the superlayer's coordinates. The bounds origin does not take
+    // part: the corners are the bounds size, relative to the anchor point.
+    CGFloat z = -NS_EXTRA(CALayer, self)->_anchorPointZ;
+    CGFloat left = -bounds.size.width * anchor.x, top = -bounds.size.height * anchor.y;
+    CGPoint corners[4] = {
+        CALayerTransformedCorner(t, left, top, z, position),
+        CALayerTransformedCorner(t, left + bounds.size.width, top, z, position),
+        CALayerTransformedCorner(t, left, top + bounds.size.height, z, position),
+        CALayerTransformedCorner(t, left + bounds.size.width, top + bounds.size.height, z, position),
+    };
+    CGFloat minX = corners[0].x, maxX = corners[0].x, minY = corners[0].y, maxY = corners[0].y;
+
+    for (int i = 1; i < 4; i++) {
+        minX = MIN(minX, corners[i].x);
+        maxX = MAX(maxX, corners[i].x);
+        minY = MIN(minY, corners[i].y);
+        maxY = MAX(maxY, corners[i].y);
+    }
+    return CGRectMake(minX, minY, maxX - minX, maxY - minY);
 }
 
 - (void) setFrame: (CGRect) value {
+    CGPoint anchor = NS_EXTRA(CALayer, self)->_anchorPoint;
+    CATransform3D t = NS_EXTRA(CALayer, self)->_transform;
+    CGSize size = value.size;
+
+    // QUIRK: with a transform, setting the frame is documented as undefined.
+    // Observed: the bounds size becomes the frame size taken through the
+    // inverse of the transform's 2x2 part, with the sign dropped, when the
+    // transform is affine and invertible (a non-affine transform keeps the
+    // frame size as is); the position is the frame origin plus the anchor
+    // point's share of the frame size, less the transform's translation; the
+    // bounds origin stays. The resulting frame is therefore not always the one that
+    // was set (a rotation keeps its size but not its extent). Evidence:
+    // black-box observation on macOS 26.7.3 (tier 2), probes in
+    // vd-upstream/mac-probes/calayer-transformed-frame. A singular affine
+    // transform was seen once (bounds width 0) and is left to keep the
+    // bounds size here.
+    // Test: tests/src/quartzcore_transformed_frame.m (setFrame cases).
+    if (!CATransform3DIsIdentity(t)) {
+        if (CALayerTransformIsAffine(t)) {
+            CGFloat det = t.m11 * t.m22 - t.m12 * t.m21;
+
+            if (det != 0) {
+                size.width = fabs((value.size.width * t.m22 - value.size.height * t.m21) / det);
+                size.height = fabs((value.size.height * t.m11 - value.size.width * t.m12) / det);
+            } else {
+                size = NS_EXTRA(CALayer, self)->_bounds.size;
+            }
+        }
+    }
 
     CGPoint position;
 
-    position.x = value.origin.x + value.size.width * NS_EXTRA(CALayer, self)->_anchorPoint.x;
-    position.y = value.origin.y + value.size.height * NS_EXTRA(CALayer, self)->_anchorPoint.y;
+    position.x = value.origin.x + value.size.width * anchor.x - t.m41;
+    position.y = value.origin.y + value.size.height * anchor.y - t.m42;
 
     [self setPosition: position];
 
     CGRect bounds = NS_EXTRA(CALayer, self)->_bounds;
 
-    bounds.size = value.size;
+    bounds.size = size;
 
     [self setBounds: bounds];
 }
 
-- (CGFloat) opacity {
+- (float) opacity {
     return NS_EXTRA(CALayer, self)->_opacity;
 }
 
-- (void) setOpacity: (CGFloat) value {
+- (void) setOpacity: (float) value {
     CAAnimation *animation = [self animationForKey: @"opacity"];
 
     if (animation == nil && ![CATransaction disableActions]) {
@@ -251,6 +400,7 @@ NSString *const CAToneMapModeIfSupported = @"ifSupported";
 
 - (void) setContentsScale: (CGFloat) value {
     NS_EXTRA(CALayer, self)->_contentsScale = value;
+    [NS_EXTRA(CALayer, self)->_context startTimerIfNeeded];
 }
 
 - (CGRect) contentsCenter {
@@ -259,6 +409,7 @@ NSString *const CAToneMapModeIfSupported = @"ifSupported";
 
 - (void) setContentsCenter: (CGRect) value {
     NS_EXTRA(CALayer, self)->_contentsCenter = value;
+    [NS_EXTRA(CALayer, self)->_context startTimerIfNeeded];
 }
 
 - (CALayerContentsFormat) contentsFormat {
@@ -343,6 +494,7 @@ NSString *const CAToneMapModeIfSupported = @"ifSupported";
 
 - (void) setSublayerTransform: (CATransform3D) value {
     NS_EXTRA(CALayer, self)->_sublayerTransform = value;
+    [NS_EXTRA(CALayer, self)->_context startTimerIfNeeded];
 }
 
 - (NSString *) minificationFilter {
@@ -386,6 +538,8 @@ NSString *const CAToneMapModeIfSupported = @"ifSupported";
     NS_EXTRA(CALayer, self)->_contentsFormat = [kCAContentsFormatRGBA8Uint copy];
     NS_EXTRA(CALayer, self)->_contentsGravity = [kCAGravityResize copy];
     NS_EXTRA(CALayer, self)->_cornerCurve = [kCACornerCurveCircular copy];
+    NS_EXTRA(CALayer, self)->_maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner |
+                                              kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
     NS_EXTRA(CALayer, self)->_allowsGroupOpacity = YES;
     NS_EXTRA(CALayer, self)->_shadowColor = CGColorCreateGenericRGB(0, 0, 0, 1);
     NS_EXTRA(CALayer, self)->_shadowOpacity = 0;
@@ -743,6 +897,7 @@ static BOOL isOpaqueBlack(CGColorRef color) {
         CGColorRelease(NS_EXTRA(CALayer, self)->_backgroundColor);
     if (NS_EXTRA(CALayer, self)->_borderColor)
         CGColorRelease(NS_EXTRA(CALayer, self)->_borderColor);
+    [NS_EXTRA(CALayer, self)->_contents release];
     [NS_EXTRA(CALayer, self)->_textureContents release];
     NS_EXTRA_FREE(CALayer, self);
     [super dealloc];
@@ -804,6 +959,15 @@ static void replaceColor(CGColorRef *slot, CGColorRef value) {
     value = [value copy];
     [NS_EXTRA(CALayer, self)->_cornerCurve release];
     NS_EXTRA(CALayer, self)->_cornerCurve = value;
+    [NS_EXTRA(CALayer, self)->_context startTimerIfNeeded];
+}
+
+- (CACornerMask) maskedCorners {
+    return NS_EXTRA(CALayer, self)->_maskedCorners;
+}
+
+- (void) setMaskedCorners: (CACornerMask) value {
+    NS_EXTRA(CALayer, self)->_maskedCorners = value;
     [NS_EXTRA(CALayer, self)->_context startTimerIfNeeded];
 }
 
@@ -1227,6 +1391,126 @@ static void replaceColor(CGColorRef *slot, CGColorRef value) {
     return flipped;
 }
 
+// Maps the layer's coordinates to those of its superlayer, after the
+// superlayer's sublayerTransform, or, for a layer without one, to the space
+// the layer is placed in. This is the geometry CARenderer draws with:
+// - the bounds origin is removed and a geometryFlipped layer is flipped
+//   within its bounds;
+// - the anchor point goes to the position, through the layer's transform;
+// - the superlayer's sublayerTransform applies about its anchor point, in
+//   its own coordinates.
+static CATransform3D layerToSuperlayerTransform(CALayer *layer) {
+    CGRect bounds = NS_EXTRA(CALayer, layer)->_bounds;
+    CGPoint anchor = NS_EXTRA(CALayer, layer)->_anchorPoint;
+    CGPoint position = NS_EXTRA(CALayer, layer)->_position;
+    CATransform3D m = CATransform3DMakeTranslation(-bounds.origin.x, -bounds.origin.y, 0);
+
+    if (NS_EXTRA(CALayer, layer)->_geometryFlipped) {
+        m = CATransform3DConcat(m, CATransform3DMakeScale(1, -1, 1));
+        m = CATransform3DConcat(m, CATransform3DMakeTranslation(0, bounds.size.height, 0));
+    }
+    m = CATransform3DConcat(m, CATransform3DMakeTranslation(-bounds.size.width * anchor.x,
+                                                            -bounds.size.height * anchor.y, 0));
+    m = CATransform3DConcat(m, NS_EXTRA(CALayer, layer)->_transform);
+    m = CATransform3DConcat(m, CATransform3DMakeTranslation(position.x, position.y, 0));
+
+    CALayer *superlayer = NS_EXTRA(CALayer, layer)->_superlayer;
+    if (superlayer != nil) {
+        CATransform3D sublayerTransform = NS_EXTRA(CALayer, superlayer)->_sublayerTransform;
+        if (!CATransform3DIsIdentity(sublayerTransform)) {
+            CGRect superBounds = NS_EXTRA(CALayer, superlayer)->_bounds;
+            CGPoint superAnchor = NS_EXTRA(CALayer, superlayer)->_anchorPoint;
+            CGFloat ax = superBounds.origin.x + superBounds.size.width * superAnchor.x;
+            CGFloat ay = superBounds.origin.y + superBounds.size.height * superAnchor.y;
+            m = CATransform3DConcat(m, CATransform3DMakeTranslation(-ax, -ay, 0));
+            m = CATransform3DConcat(m, sublayerTransform);
+            m = CATransform3DConcat(m, CATransform3DMakeTranslation(ax, ay, 0));
+        }
+    }
+    return m;
+}
+
+// Maps the layer's coordinates to the space its tree's root layer is placed
+// in. A nil layer stands for that space.
+static CATransform3D layerToTreeSpaceTransform(CALayer *layer) {
+    CATransform3D m = CATransform3DIdentity;
+    for (; layer != nil; layer = NS_EXTRA(CALayer, layer)->_superlayer)
+        m = CATransform3DConcat(m, layerToSuperlayerTransform(layer));
+    return m;
+}
+
+// The transform from the coordinates of one layer to another's. Layers of
+// different trees are related through the space their roots are placed in.
+static CATransform3D transformBetweenLayers(CALayer *from, CALayer *to) {
+    return CATransform3DConcat(layerToTreeSpaceTransform(from),
+                               CATransform3DInvert(layerToTreeSpaceTransform(to)));
+}
+
+static CGPoint applyToPoint(CATransform3D m, CGPoint p) {
+    CGFloat w = p.x * m.m14 + p.y * m.m24 + m.m44;
+    CGFloat x = p.x * m.m11 + p.y * m.m21 + m.m41;
+    CGFloat y = p.x * m.m12 + p.y * m.m22 + m.m42;
+    if (w != 0 && w != 1) {
+        x /= w;
+        y /= w;
+    }
+    return CGPointMake(x, y);
+}
+
+// The bounding box of the rect's corners.
+static CGRect applyToRect(CATransform3D m, CGRect rect) {
+    if (CGRectIsNull(rect))
+        return rect;
+    CGPoint corners[4] = {
+        applyToPoint(m, CGPointMake(CGRectGetMinX(rect), CGRectGetMinY(rect))),
+        applyToPoint(m, CGPointMake(CGRectGetMaxX(rect), CGRectGetMinY(rect))),
+        applyToPoint(m, CGPointMake(CGRectGetMinX(rect), CGRectGetMaxY(rect))),
+        applyToPoint(m, CGPointMake(CGRectGetMaxX(rect), CGRectGetMaxY(rect))),
+    };
+    CGFloat minX = corners[0].x, maxX = corners[0].x;
+    CGFloat minY = corners[0].y, maxY = corners[0].y;
+    for (int i = 1; i < 4; i++) {
+        minX = MIN(minX, corners[i].x);
+        maxX = MAX(maxX, corners[i].x);
+        minY = MIN(minY, corners[i].y);
+        maxY = MAX(maxY, corners[i].y);
+    }
+    return CGRectMake(minX, minY, maxX - minX, maxY - minY);
+}
+
+- (CGPoint) convertPoint: (CGPoint) point fromLayer: (CALayer *) layer {
+    return applyToPoint(transformBetweenLayers(layer, self), point);
+}
+
+- (CGPoint) convertPoint: (CGPoint) point toLayer: (CALayer *) layer {
+    return applyToPoint(transformBetweenLayers(self, layer), point);
+}
+
+- (CGRect) convertRect: (CGRect) rect fromLayer: (CALayer *) layer {
+    return applyToRect(transformBetweenLayers(layer, self), rect);
+}
+
+- (CGRect) convertRect: (CGRect) rect toLayer: (CALayer *) layer {
+    return applyToRect(transformBetweenLayers(self, layer), rect);
+}
+
+// The part of the layer's bounds that shows through the scroll layers above it
+// (a layer outside any scroll layer shows all of its bounds; clipping by
+// masksToBounds does not count).
+- (CGRect) visibleRect {
+    CGRect visible = [self bounds];
+    for (CALayer *ancestor = [self superlayer]; ancestor != nil;
+         ancestor = [ancestor superlayer]) {
+        if (![ancestor isKindOfClass: [CAScrollLayer class]])
+            continue;
+        visible = CGRectIntersection(
+                visible, [self convertRect: [ancestor bounds] fromLayer: ancestor]);
+        if (CGRectIsNull(visible))
+            return CGRectZero;
+    }
+    return visible;
+}
+
 - (BOOL) needsDisplayOnBoundsChange {
     return NS_EXTRA(CALayer, self)->_needsDisplayOnBoundsChange;
 }
@@ -1285,14 +1569,211 @@ static void replaceColor(CGColorRef *slot, CGColorRef value) {
 }
 
 - valueForKey: (NSString *) key {
-    // FIXME: KVC appears broken for structs
-
     if ([key isEqualToString: @"bounds"])
         return [NSValue valueWithRect: NS_EXTRA(CALayer, self)->_bounds];
     if ([key isEqualToString: @"frame"])
         return [NSValue valueWithRect: [self frame]];
 
     return [super valueForKey: key];
+}
+
+// Key paths into the struct-valued properties of a layer. NSValue does not
+// support key-value coding of its members, so the members of these structs are
+// read and written through the layer's accessors, which keeps their side
+// effects (autoresizing, actions) in place. The result of splitting a path is
+// the property (head) and the rest of the path (tail) within its struct.
+typedef enum {
+    CALayerStructNone,
+    CALayerStructRect,
+    CALayerStructPoint,
+    CALayerStructSize,
+    CALayerStructTransform,
+} CALayerStructKind;
+
+static CALayerStructKind CALayerStructKindOfKey(NSString *key) {
+    if ([key isEqualToString: @"bounds"] || [key isEqualToString: @"frame"] ||
+        [key isEqualToString: @"contentsRect"])
+        return CALayerStructRect;
+    if ([key isEqualToString: @"position"] || [key isEqualToString: @"anchorPoint"])
+        return CALayerStructPoint;
+    if ([key isEqualToString: @"shadowOffset"])
+        return CALayerStructSize;
+    if ([key isEqualToString: @"transform"] || [key isEqualToString: @"sublayerTransform"])
+        return CALayerStructTransform;
+    return CALayerStructNone;
+}
+
+static BOOL CALayerSplitKeyPath(NSString *path, NSString **head, NSString **tail) {
+    NSRange dot = [path rangeOfString: @"."];
+
+    if (dot.location == NSNotFound)
+        return NO;
+    *head = [path substringToIndex: dot.location];
+    *tail = [path substringFromIndex: dot.location + 1];
+    return CALayerStructKindOfKey(*head) != CALayerStructNone;
+}
+
+// The member of a rect, point or size addressed by the tail, or NULL.
+static CGFloat *CALayerStructMember(CALayerStructKind kind, NSString *tail, CGRect *rect, CGPoint *point, CGSize *size) {
+    if (kind == CALayerStructRect) {
+        if ([tail isEqualToString: @"origin.x"]) return &rect->origin.x;
+        if ([tail isEqualToString: @"origin.y"]) return &rect->origin.y;
+        if ([tail isEqualToString: @"size.width"]) return &rect->size.width;
+        if ([tail isEqualToString: @"size.height"]) return &rect->size.height;
+    } else if (kind == CALayerStructPoint) {
+        if ([tail isEqualToString: @"x"]) return &point->x;
+        if ([tail isEqualToString: @"y"]) return &point->y;
+    } else if (kind == CALayerStructSize) {
+        if ([tail isEqualToString: @"width"]) return &size->width;
+        if ([tail isEqualToString: @"height"]) return &size->height;
+    }
+    return NULL;
+}
+
+// The rotation or scale entries of a transform that a key path like
+// transform.rotation.z or transform.scale.x addresses.
+static BOOL CALayerTransformComponent(NSString *tail, CATransform3D *t, CGFloat *value, BOOL set) {
+    CGFloat v = set ? *value : 0;
+
+    if ([tail isEqualToString: @"scale"] || [tail isEqualToString: @"scale.x"]) {
+        if (set) { t->m11 = v; if ([tail isEqualToString: @"scale"]) { t->m22 = v; t->m33 = v; } }
+        else *value = t->m11;
+    } else if ([tail isEqualToString: @"scale.y"]) {
+        if (set) t->m22 = v; else *value = t->m22;
+    } else if ([tail isEqualToString: @"scale.z"]) {
+        if (set) t->m33 = v; else *value = t->m33;
+    } else if ([tail isEqualToString: @"rotation"] || [tail isEqualToString: @"rotation.z"]) {
+        if (set) { t->m11 = cos(v); t->m12 = sin(v); t->m21 = -sin(v); t->m22 = cos(v); }
+        else *value = atan2(t->m12, t->m11);
+    } else if ([tail isEqualToString: @"rotation.x"]) {
+        if (set) { t->m22 = cos(v); t->m23 = sin(v); t->m32 = -sin(v); t->m33 = cos(v); }
+        else *value = atan2(t->m23, t->m22);
+    } else if ([tail isEqualToString: @"rotation.y"]) {
+        if (set) { t->m11 = cos(v); t->m13 = -sin(v); t->m31 = sin(v); t->m33 = cos(v); }
+        else *value = atan2(-t->m13, t->m11);
+    } else if ([tail isEqualToString: @"translation.x"]) {
+        if (set) t->m41 = v; else *value = t->m41;
+    } else if ([tail isEqualToString: @"translation.y"]) {
+        if (set) t->m42 = v; else *value = t->m42;
+    } else if ([tail isEqualToString: @"translation.z"]) {
+        if (set) t->m43 = v; else *value = t->m43;
+    } else {
+        return NO;
+    }
+    return YES;
+}
+
+- valueForKeyPath: (NSString *) path {
+    NSString *head, *tail;
+
+    if (!CALayerSplitKeyPath(path, &head, &tail))
+        return [super valueForKeyPath: path];
+
+    CALayerStructKind kind = CALayerStructKindOfKey(head);
+    CGFloat v;
+
+    if (kind == CALayerStructTransform) {
+        CATransform3D t = [head isEqualToString: @"transform"] ? [self transform] : [self sublayerTransform];
+
+        if ([tail isEqualToString: @"translation"])
+            return [NSValue valueWithSize: NSMakeSize(t.m41, t.m42)];
+        if (CALayerTransformComponent(tail, &t, &v, NO))
+            return [NSNumber numberWithDouble: v];
+        return [super valueForKeyPath: path];
+    }
+
+    CGRect rect = CGRectZero;
+    CGPoint point = CGPointZero;
+    CGSize size = CGSizeZero;
+
+    if (kind == CALayerStructRect)
+        rect = [head isEqualToString: @"bounds"] ? [self bounds] : [head isEqualToString: @"frame"] ? [self frame] : [self contentsRect];
+    else if (kind == CALayerStructPoint)
+        point = [head isEqualToString: @"position"] ? [self position] : [self anchorPoint];
+    else
+        size = [self shadowOffset];
+
+    if (kind == CALayerStructRect && [tail isEqualToString: @"origin"])
+        return [NSValue valueWithPoint: NSMakePoint(rect.origin.x, rect.origin.y)];
+    if (kind == CALayerStructRect && [tail isEqualToString: @"size"])
+        return [NSValue valueWithSize: NSMakeSize(rect.size.width, rect.size.height)];
+
+    CGFloat *member = CALayerStructMember(kind, tail, &rect, &point, &size);
+
+    if (member == NULL)
+        return [super valueForKeyPath: path];
+    return [NSNumber numberWithDouble: *member];
+}
+
+- (void) setValue: (id) value forKeyPath: (NSString *) path {
+    NSString *head, *tail;
+
+    if (!CALayerSplitKeyPath(path, &head, &tail)) {
+        [super setValue: value forKeyPath: path];
+        return;
+    }
+
+    CALayerStructKind kind = CALayerStructKindOfKey(head);
+
+    if (kind == CALayerStructTransform) {
+        BOOL sublayer = [head isEqualToString: @"sublayerTransform"];
+        CATransform3D t = sublayer ? [self sublayerTransform] : [self transform];
+        CGFloat v = [value doubleValue];
+
+        if ([tail isEqualToString: @"translation"]) {
+            NSSize s = [value sizeValue];
+
+            t.m41 = s.width;
+            t.m42 = s.height;
+        } else if (!CALayerTransformComponent(tail, &t, &v, YES)) {
+            [super setValue: value forKeyPath: path];
+            return;
+        }
+        if (sublayer)
+            [self setSublayerTransform: t];
+        else
+            [self setTransform: t];
+        return;
+    }
+
+    CGRect rect = CGRectZero;
+    CGPoint point = CGPointZero;
+    CGSize size = CGSizeZero;
+    BOOL isPosition = [head isEqualToString: @"position"];
+
+    if (kind == CALayerStructRect)
+        rect = [head isEqualToString: @"bounds"] ? [self bounds] : [head isEqualToString: @"frame"] ? [self frame] : [self contentsRect];
+    else if (kind == CALayerStructPoint)
+        point = isPosition ? [self position] : [self anchorPoint];
+    else
+        size = [self shadowOffset];
+
+    if (kind == CALayerStructRect && [tail isEqualToString: @"origin"])
+        { NSPoint o = [value pointValue]; rect.origin = CGPointMake(o.x, o.y); }
+    else if (kind == CALayerStructRect && [tail isEqualToString: @"size"])
+        { NSSize z = [value sizeValue]; rect.size = CGSizeMake(z.width, z.height); }
+    else {
+        CGFloat *member = CALayerStructMember(kind, tail, &rect, &point, &size);
+
+        if (member == NULL) {
+            [super setValue: value forKeyPath: path];
+            return;
+        }
+        *member = [value doubleValue];
+    }
+
+    if ([head isEqualToString: @"bounds"])
+        [self setBounds: rect];
+    else if ([head isEqualToString: @"frame"])
+        [self setFrame: rect];
+    else if ([head isEqualToString: @"contentsRect"])
+        [self setContentsRect: rect];
+    else if (isPosition)
+        [self setPosition: point];
+    else if ([head isEqualToString: @"anchorPoint"])
+        [self setAnchorPoint: point];
+    else
+        [self setShadowOffset: size];
 }
 
 static id<CAAction> actionInStyle(NSDictionary *style, NSString *key) {
@@ -1379,7 +1860,7 @@ static id<CAAction> actionInStyle(NSDictionary *style, NSString *key) {
     return NO;
 }
 
-- (BOOL) _drawLayerContents: (CGRect) bounds opacity: (CGFloat) opacity {
+- (BOOL) _drawLayerContents: (CGRect) bounds opacity: (float) opacity {
     return NO;
 }
 

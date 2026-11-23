@@ -85,6 +85,8 @@ typedef NS_ENUM(NSUInteger, NSImageLoadStatus) {
         NSImageCacheMode _cacheMode;
         NSString *_accessibilityDescription;
         NSImageSymbolConfiguration *_symbolConfiguration;
+        // The system symbol a symbol image draws, nil for other images.
+        NSString *_symbolName;
         NSMutableArray *_scaledRepCache;
         id _drawingHandlerRepCache;
         // the bitmap an image-level -lockFocus draws into, and its context
@@ -224,13 +226,21 @@ typedef NS_ENUM(NSUInteger, NSImageLoadStatus) {
 
 @property (copy, nullable) NSString *accessibilityDescription;
 
-// SF Symbols. Darling has no symbol artwork: these return a generic template
-// placeholder glyph for any non-empty name (nil for a nil or empty name).
+// SF Symbols. Darling has no symbol artwork: these return a template image of
+// its own drawing for a few symbols, and of a generic placeholder glyph for any
+// other non-empty name (nil for a nil or empty name).
 + (nullable instancetype) imageWithSystemSymbolName: (NSString *) name
                   accessibilityDescription: (nullable NSString *) description;
 + (nullable instancetype) imageWithSystemSymbolName: (NSString *) name
                              variableValue: (double) value
                   accessibilityDescription: (nullable NSString *) description;
+// Documented on the AppKit page of NSImage init(symbolName:variableValue:)
+// (macOS 13), whose Objective-C declaration is this class method. Darling loads
+// no symbols of an application's own, so it answers like
+// imageWithSystemSymbolName:variableValue:accessibilityDescription: with no
+// description.
++ (nullable instancetype) imageWithSymbolName: (NSString *) name
+                             variableValue: (double) value;
 - (nullable NSImage *) imageWithSymbolConfiguration:
         (NSImageSymbolConfiguration *) configuration;
 @property(nonatomic, readonly) NSImageSymbolConfiguration *symbolConfiguration;
@@ -245,13 +255,16 @@ typedef NS_ENUM(NSInteger, NSImageSymbolScale) {
     NSImageSymbolScaleLarge = 3,
 };
 
-@interface NSImageSymbolConfiguration : NSObject <NSCopying> {
+@interface NSImageSymbolConfiguration : NSObject <NSCopying, NSSecureCoding> {
     CGFloat _pointSize;
     NSFontWeight _weight;
     NSImageSymbolScale _scale;
     NSArray<NSColor *> *_paletteColors;
     NSColor *_hierarchicalColor;
     BOOL _prefersMulticolor;
+    BOOL _prefersMonochrome;
+    BOOL _prefersHierarchical;
+    NSFontTextStyle _textStyle;
 }
 
 + (instancetype) configurationWithPointSize: (CGFloat) pointSize
@@ -259,10 +272,15 @@ typedef NS_ENUM(NSInteger, NSImageSymbolScale) {
 + (instancetype) configurationWithPointSize: (CGFloat) pointSize
                                      weight: (NSFontWeight) weight
                                       scale: (NSImageSymbolScale) scale;
++ (instancetype) configurationWithTextStyle: (NSFontTextStyle) style;
++ (instancetype) configurationWithTextStyle: (NSFontTextStyle) style
+                                      scale: (NSImageSymbolScale) scale;
 + (instancetype) configurationWithScale: (NSImageSymbolScale) scale;
 + (instancetype) configurationWithPaletteColors: (NSArray<NSColor *> *) colors;
 + (instancetype) configurationWithHierarchicalColor: (NSColor *) color;
 + (instancetype) configurationPreferringMulticolor;
++ (instancetype) configurationPreferringMonochrome;
++ (instancetype) configurationPreferringHierarchical;
 - (null_unspecified NSImageSymbolConfiguration *) configurationByApplyingConfiguration:
         (NSImageSymbolConfiguration *) configuration;
 

@@ -302,11 +302,12 @@ static const char kCAMetalLayerInternalKey = 0;
 
 #else
 
-// Without Metal the properties are not implemented here: don't let the compiler synthesize them (their _device,
-// _pixelFormat, ... ivars would clash with CAMetalLayerInternal's in this file).
-@dynamic device, preferredDevice, pixelFormat, colorspace, framebufferOnly, drawableSize, presentsWithTransaction,
-	displaySyncEnabled, wantsExtendedDynamicRangeContent, EDRMetadata, maximumDrawableCount, allowsNextDrawableTimeout,
-	developerHUDProperties;
+// Without Metal the accessors are forwarded like every other method; leave
+// them to the runtime so that no instance variables are synthesized for them,
+// which would clash with those of CAMetalLayerInternal.
+@dynamic device, preferredDevice, pixelFormat, colorspace, framebufferOnly, drawableSize,
+	presentsWithTransaction, displaySyncEnabled, wantsExtendedDynamicRangeContent, EDRMetadata,
+	maximumDrawableCount, allowsNextDrawableTimeout, developerHUDProperties;
 
 MTL_UNSUPPORTED_CLASS
 
@@ -998,8 +999,16 @@ static BOOL forcesOpenGLPresentation(void) {
 	}
 
 	// now let's start creating the new drawables
+	// A drawable the device cannot make is left out rather than ending the process:
+	// -nextDrawable then has fewer drawables to hand out, or none, and returns nil
+	// when it runs out, as it does when the layer has no device.
 	for (size_t i = 0; i < _maximumDrawableCount; ++i) {
-		_drawables[i] = std::make_shared<CAMetalDrawableActual>(self, _drawableSize, i, pixelFormat, ((MTLDeviceInternal*)self.device).device, NS_EXTRA(CALayer, self)->_context.glContext, _glImportsSemaphores);
+		try {
+			_drawables[i] = std::make_shared<CAMetalDrawableActual>(self, _drawableSize, i, pixelFormat, ((MTLDeviceInternal*)self.device).device, NS_EXTRA(CALayer, self)->_context.glContext, _glImportsSemaphores);
+		} catch (const std::exception& e) {
+			NSLog(@"CAMetalLayer: cannot create a %gx%g drawable: %s", _drawableSize.width, _drawableSize.height, e.what());
+			break;
+		}
 		_usableDrawablesBitmap |= 1u << i;
 	}
 

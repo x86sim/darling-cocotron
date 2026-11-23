@@ -28,6 +28,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSMenuItem.h>
 #import <AppKit/NSNibLoading.h>
 #import <AppKit/NSRaise.h>
+#import <Onyx2D/O2Font_freetype.h>
 
 @implementation NSFontManager
 
@@ -173,8 +174,14 @@ static Class _fontPanelFactory;
         return result;
     // -fontFamilyWithName: pretends to have any family, which would list the
     // fallback font's faces for a name that is not installed.
-    if (![[NSFontFamily allFontFamilyNames] containsObject: familyName])
-        return result;
+    if (![[NSFontFamily allFontFamilyNames] containsObject: familyName]) {
+        // The families every macOS provides (Times, Helvetica, ...) have members
+        // when an installed family stands in for them.
+        NSString *installed = O2FontCopyInstalledFamilyForStandardFamily(familyName);
+        if (installed == nil)
+            return result;
+        familyName = [installed autorelease];
+    }
     NSFontFamily *family = [NSFontFamily fontFamilyWithName: familyName];
     NSArray *typefaces = [family typefaces];
     int i, count = [typefaces count];
@@ -304,6 +311,24 @@ static Class _fontPanelFactory;
 
     [_panel setPanelFont: _selectedFont isMultiple: _isMultiple];
     return _panel;
+}
+
+- (void) dealloc {
+    [NS_EXTRA(NSFontManager, self)->_fontMenu release];
+    NS_EXTRA_FREE(NSFontManager, self);
+    [super dealloc];
+}
+
+- (void) setFontMenu: (NSMenu *) newMenu {
+    newMenu = [newMenu retain];
+    [NS_EXTRA(NSFontManager, self)->_fontMenu release];
+    NS_EXTRA(NSFontManager, self)->_fontMenu = newMenu;
+}
+
+- (NSMenu *) fontMenu: (BOOL) create {
+    // GUESS: the documentation says create == YES builds the menu when there is none; Darling
+    // has no default Font menu, so this answers nil then, as it does for create == NO.
+    return NS_EXTRA(NSFontManager, self)->_fontMenu;
 }
 
 - (BOOL) sendAction {

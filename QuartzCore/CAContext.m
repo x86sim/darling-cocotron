@@ -67,17 +67,19 @@ NSString *const kCAContextPortNumber = @"port_number";
 - (void) _publishFrame;
 @end
 
-// Draws a remote context's tree into an offscreen framebuffer and copies each
-// frame into one of two IOSurfaces. It runs on CALayerContext's frame timer:
+// Draws a remote context's tree into a framebuffer whose texture is bound to
+// one of two IOSurfaces, which the hosts then show. It runs on CALayerContext's frame timer:
 // the layers of the tree request frames from it as they change.
 @interface CARemoteLayerContext : CALayerContext {
     CAContext *_owner;
     GLuint _framebuffer;
-    GLuint _renderbuffer;
-    GLint _framebufferWidth;
-    GLint _framebufferHeight;
+    // The texture bound to each surface, and the surface it is bound to.
+    GLuint _textures[2];
+    IOSurfaceRef _textureSurfaces[2];
     IOSurfaceRef _surfaces[2];
     mach_port_t _surfacePorts[2];
+    // Where the frame in each surface lies.
+    CARemoteFrameGeometry _geometries[2];
     // The surface holding the last frame, or -1 when there is nothing to show.
     int _current;
 }
@@ -85,6 +87,8 @@ NSString *const kCAContextPortNumber = @"port_number";
 - (void) detach;
 // A send right the caller does not own, or MACH_PORT_NULL.
 - (mach_port_t) currentSurfacePort;
+// Where the frame in the current surface lies.
+- (CARemoteFrameGeometry) currentGeometry;
 @end
 
 @implementation CARemoteLayerContext
@@ -104,6 +108,7 @@ NSString *const kCAContextPortNumber = @"port_number";
     if (_surfaces[index] != NULL)
         CFRelease(_surfaces[index]);
     _surfaces[index] = NULL;
+    _textureSurfaces[index] = NULL;
     if (_surfacePorts[index] != MACH_PORT_NULL)
         mach_port_deallocate(mach_task_self(), _surfacePorts[index]);
     _surfacePorts[index] = MACH_PORT_NULL;
@@ -115,7 +120,7 @@ NSString *const kCAContextPortNumber = @"port_number";
     CGLContextObj previous = CGLGetCurrentContext();
     if (_framebuffer != 0 && CGLSetCurrentContext(_glContext) == kCGLNoError) {
         glDeleteFramebuffers(1, &_framebuffer);
-        glDeleteRenderbuffers(1, &_renderbuffer);
+        glDeleteTextures(2, _textures);
         CGLSetCurrentContext(previous != _glContext ? previous : NULL);
     }
     [self releaseSurfaceAtIndex: 0];
@@ -133,25 +138,43 @@ NSString *const kCAContextPortNumber = @"port_number";
     return _current >= 0 ? _surfacePorts[_current] : MACH_PORT_NULL;
 }
 
+- (CARemoteFrameGeometry) currentGeometry {
+    CARemoteFrameGeometry none = {0};
+    return _current >= 0 ? _geometries[_current] : none;
+}
+
 // There is no window to show the tree in.
 - (void) setSubwindow: (CGSubWindow *) subwindow {
 }
 
-- (BOOL) prepareFramebufferWidth: (GLint) width height: (GLint) height {
-    if (_framebuffer == 0) {
+// Makes the framebuffer draw into the texture that uses the surface's memory
+// (the surface is the texture's storage, so nothing is read back or copied
+// afterwards; where the driver cannot import the surface, OpenGL.c copies the
+// texture into it when it is locked). Leaves the framebuffer bound.
+- (BOOL) prepareFramebufferForSurface: (IOSurfaceRef) surface index: (int) index {
+    if (_framebuffer == 0)
         glGenFramebuffers(1, &_framebuffer);
-        glGenRenderbuffers(1, &_renderbuffer);
+    if (_textures[index] == 0)
+        glGenTextures(1, &_textures[index]);
+
+    glBindTexture(GL_TEXTURE_2D, _textures[index]);
+    if (_textureSurfaces[index] != surface) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        if (CGLTexImageIOSurface2D(_glContext, GL_TEXTURE_2D, GL_RGBA8,
+                                   (GLsizei) IOSurfaceGetWidth(surface),
+                                   (GLsizei) IOSurfaceGetHeight(surface), GL_BGRA,
+                                   GL_UNSIGNED_INT_8_8_8_8_REV, surface, 0) != kCGLNoError) {
+            glBindTexture(GL_TEXTURE_2D, 0);
+            return NO;
+        }
+        _textureSurfaces[index] = surface;
     }
+    glBindTexture(GL_TEXTURE_2D, 0);
+
     glBindFramebuffer(GL_FRAMEBUFFER, _framebuffer);
-    if (width != _framebufferWidth || height != _framebufferHeight) {
-        glBindRenderbuffer(GL_RENDERBUFFER, _renderbuffer);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height);
-        glBindRenderbuffer(GL_RENDERBUFFER, 0);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                  GL_RENDERBUFFER, _renderbuffer);
-        _framebufferWidth = width;
-        _framebufferHeight = height;
-    }
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           _textures[index], 0);
     return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
 }
 
@@ -187,49 +210,81 @@ NSString *const kCAContextPortNumber = @"port_number";
     return surface;
 }
 
+// The pixels a frame covers: the tree's drawn extent, out to whole points,
+// cut down to the largest frame a host accepts. A cut keeps the top-left,
+// where the content starts in a tree laid out from the top.
+static BOOL frameRectForExtent(CGRect extent, CGRect *frame) {
+    if (CGRectIsNull(extent) || CGRectIsEmpty(extent))
+        return NO;
+    double minX = floor(CGRectGetMinX(extent));
+    double minY = floor(CGRectGetMinY(extent));
+    double maxX = ceil(CGRectGetMaxX(extent));
+    double maxY = ceil(CGRectGetMaxY(extent));
+    if (!isfinite(minX) || !isfinite(minY) || !isfinite(maxX) ||
+        !isfinite(maxY))
+        return NO;
+    maxX = fmin(maxX, minX + CA_REMOTE_MAX_FRAME_SIDE);
+    minY = fmax(minY, maxY - CA_REMOTE_MAX_FRAME_SIDE);
+    // The origin goes into the frame message as 32-bit integers.
+    if (minX < INT32_MIN || minY < INT32_MIN || minX > INT32_MAX ||
+        minY > INT32_MAX)
+        return NO;
+    *frame = CGRectMake(minX, minY, maxX - minX, maxY - minY);
+    return YES;
+}
+
 - (void) render {
     CALayer *layer = _layer;
-    CGSize size = layer != nil ? [layer bounds].size : CGSizeZero;
-    GLint width = (GLint) ceil(size.width);
-    GLint height = (GLint) ceil(size.height);
+    CGRect extent = CGRectNull, rootFrame = CGRectNull, frame;
 
-    if (layer == nil || width <= 0 || height <= 0 ||
-        width > CA_REMOTE_MAX_FRAME_SIDE || height > CA_REMOTE_MAX_FRAME_SIDE) {
+    // The tree is not clipped to the root layer's bounds: Core Animation
+    // clips only at layers that mask to their bounds, and a host shows all
+    // of a tree, so the frame covers whatever the tree draws.
+    if (layer != nil) {
+        [layer layoutIfNeeded];
+        extent = [_renderer _drawnExtentOfLayerTree: layer
+                                          rootFrame: &rootFrame
+                                             atTime: CACurrentMediaTime()];
+    }
+
+    if (!frameRectForExtent(extent, &frame)) {
         _current = -1;
         return;
     }
+    GLint width = (GLint) frame.size.width;
+    GLint height = (GLint) frame.size.height;
 
     CGLContextObj previous = CGLGetCurrentContext();
     if (CGLSetCurrentContext(_glContext) != kCGLNoError)
         return;
 
-    if ([self prepareFramebufferWidth: width height: height]) {
+    // Hosts may still be reading the last frame: draw into the other surface.
+    int next = _current == 0 ? 1 : 0;
+    IOSurfaceRef surface = [self surfaceAtIndex: next
+                                          width: width
+                                         height: height];
+    if (surface != NULL && [self prepareFramebufferForSurface: surface index: next]) {
         [self _drawLayerTree: layer
-                       width: width
-                      height: height
+                      inRect: frame
                  topRowFirst: YES];
 
-        // Hosts may still be reading the last frame: draw into the other
-        // surface.
-        int next = _current == 0 ? 1 : 0;
-        IOSurfaceRef surface = [self surfaceAtIndex: next
-                                              width: width
-                                             height: height];
-        if (surface != NULL &&
-            IOSurfaceLock(surface, 0, NULL) == kIOReturnSuccess) {
-            glPixelStorei(GL_PACK_ALIGNMENT, 4);
-            glPixelStorei(GL_PACK_ROW_LENGTH,
-                          (GLint) (IOSurfaceGetBytesPerRow(surface) / 4));
-            glReadPixels(0, 0, width, height, GL_BGRA,
-                         GL_UNSIGNED_INT_8_8_8_8_REV,
-                         IOSurfaceGetBaseAddress(surface));
-            glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-            // The unlock moves the seed on, so hosts upload the new pixels.
+        // The lock waits for the drawing to finish (and has OpenGL.c copy
+        // the texture into the surface where it only holds a copy of it);
+        // the unlock moves the seed on, so hosts bind the new pixels.
+        if (IOSurfaceLock(surface, 0, NULL) == kIOReturnSuccess) {
             IOSurfaceUnlock(surface, 0, NULL);
+            _geometries[next] = (CARemoteFrameGeometry) {
+                .originX = (int32_t) frame.origin.x,
+                .originY = (int32_t) frame.origin.y,
+                .rootMinY = (float) CGRectGetMinY(rootFrame),
+                .rootMaxY = (float) CGRectGetMaxY(rootFrame),
+            };
             _current = next;
         } else {
             _current = -1;
         }
+    } else {
+        _current = -1;
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -382,7 +437,8 @@ static void handleContextMessages(void *context);
 }
 
 // Returns NO when the host has gone.
-static BOOL sendFrame(mach_port_t destination, mach_port_t surfacePort) {
+static BOOL sendFrame(mach_port_t destination, mach_port_t surfacePort,
+                      CARemoteFrameGeometry geometry) {
     CARemoteFrameMessage message = {0};
     message.header.msgh_bits =
             MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
@@ -394,6 +450,7 @@ static BOOL sendFrame(mach_port_t destination, mach_port_t surfacePort) {
     message.surface.disposition = MACH_MSG_TYPE_COPY_SEND;
     message.surface.type = MACH_MSG_PORT_DESCRIPTOR;
     message.version = CA_REMOTE_PROTOCOL_VERSION;
+    message.geometry = geometry;
 
     // Never wait for a host: one whose queue is full has newer frames queued.
     mach_msg_return_t result = mach_msg(&message.header,
@@ -405,9 +462,10 @@ static BOOL sendFrame(mach_port_t destination, mach_port_t surfacePort) {
 
 - (void) _publishFrame {
     mach_port_t surfacePort = [NS_EXTRA(CAContext, self)->_renderContext currentSurfacePort];
+    CARemoteFrameGeometry geometry = [NS_EXTRA(CAContext, self)->_renderContext currentGeometry];
     unsigned int kept = 0;
     for (unsigned int i = 0; i < NS_EXTRA(CAContext, self)->_subscriberCount; i++) {
-        if (sendFrame(NS_EXTRA(CAContext, self)->_subscribers[i], surfacePort))
+        if (sendFrame(NS_EXTRA(CAContext, self)->_subscribers[i], surfacePort, geometry))
             NS_EXTRA(CAContext, self)->_subscribers[kept++] = NS_EXTRA(CAContext, self)->_subscribers[i];
         else
             mach_port_deallocate(mach_task_self(), NS_EXTRA(CAContext, self)->_subscribers[i]);
@@ -435,7 +493,8 @@ static BOOL sendFrame(mach_port_t destination, mach_port_t surfacePort) {
         NS_EXTRA(CAContext, self)->_subscribers[NS_EXTRA(CAContext, self)->_subscriberCount++] = port;
         if (NS_EXTRA(CAContext, self)->_layer != nil)
             [NS_EXTRA(CAContext, self)->_renderContext startTimerIfNeeded];
-    } else if (sendFrame(port, surfacePort)) {
+    } else if (sendFrame(port, surfacePort,
+                         [NS_EXTRA(CAContext, self)->_renderContext currentGeometry])) {
         NS_EXTRA(CAContext, self)->_subscribers[NS_EXTRA(CAContext, self)->_subscriberCount++] = port;
     } else {
         mach_port_deallocate(mach_task_self(), port);

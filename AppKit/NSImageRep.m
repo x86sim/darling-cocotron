@@ -18,7 +18,9 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
 #import <AppKit/NSBitmapImageRep.h>
+#import <AppKit/NSGraphicsContext.h>
 #import <AppKit/NSGraphicsContextFunctions.h>
+#import <AppKit/NSImage.h>
 #import <AppKit/NSImageRep.h>
 #import <AppKit/NSPDFImageRep.h>
 #import <AppKit/NSPICTImageRep.h>
@@ -402,6 +404,38 @@ static NSArray *typesForFileTypes(NSArray *fileTypes) {
     return result;
 }
 
+// An image of the representation drawn at the proposed size (its own size without a rect); NSBitmapImageRep
+// overrides this with the image it holds. The caller does not own the result.
+- (CGImageRef) CGImageForProposedRect: (NSRect *) proposedDestRect
+                              context: (NSGraphicsContext *) context
+                                hints: (NSDictionary<NSString *, id> *) hints
+{
+    NSSize size = proposedDestRect != NULL ? proposedDestRect->size : [self size];
+    if (!(size.width > 0 && size.height > 0 && isfinite(size.width) && isfinite(size.height)))
+        return NULL;
+    size_t width = ceil(size.width), height = ceil(size.height);
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    // An explicit byte order: Onyx2D stores the default order as ABGR, unlike Apple's RGBA.
+    CGContextRef bitmap = CGBitmapContextCreate(NULL, width, height, 8, width * 4, colorSpace,
+                                                kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(colorSpace);
+    if (bitmap == NULL)
+        return NULL;
+    CGContextClearRect(bitmap, CGRectMake(0, 0, width, height));
+
+    // The thread dictionary may be the only owner of the current context.
+    NSGraphicsContext *previous = [[NSGraphicsContext currentContext] retain];
+    [NSGraphicsContext setCurrentContext: [NSGraphicsContext graphicsContextWithGraphicsPort: bitmap flipped: NO]];
+    [self drawInRect: NSMakeRect(0, 0, width, height)];
+    [NSGraphicsContext setCurrentContext: previous];
+    [previous release];
+
+    CGImageRef image = CGBitmapContextCreateImage(bitmap);
+    CGContextRelease(bitmap);
+    return (CGImageRef) [(id) image autorelease];
+}
+
 - (BOOL) drawInRect: (NSRect) rect {
     CGContextRef context = NSCurrentGraphicsPort();
     NSSize size = [self size];
@@ -417,6 +451,59 @@ static NSArray *typesForFileTypes(NSArray *fileTypes) {
         CGContextRestoreGState(context);
     }
 
+    return result;
+}
+
+// Draws the part of the representation given by fromRect (all of it for an empty rectangle) into
+// rect, scaled, with the given compositing operation and opacity. The NSImageHintInterpolation hint
+// selects the interpolation quality for this drawing only.
+- (BOOL) drawInRect: (NSRect) rect
+           fromRect: (NSRect) fromRect
+          operation: (NSCompositingOperation) operation
+           fraction: (CGFloat) fraction
+     respectFlipped: (BOOL) respectFlipped
+              hints: (NSDictionary<NSString *, id> *) hints
+{
+    NSGraphicsContext *graphicsContext = [NSGraphicsContext currentContext];
+    NSSize size = [self size];
+    if (graphicsContext == nil || !(size.width > 0 && size.height > 0))
+        return NO;
+    if (NSIsEmptyRect(fromRect))
+        fromRect = NSMakeRect(0, 0, size.width, size.height);
+    if (!(fromRect.size.width > 0 && fromRect.size.height > 0))
+        return NO;
+    // Observed on macOS 26.7.3: an empty destination draws nothing and still returns YES.
+    if (!(rect.size.width > 0 && rect.size.height > 0))
+        return YES;
+
+    CGContextRef context = [graphicsContext graphicsPort];
+    NSCompositingOperation previousOperation = [graphicsContext compositingOperation];
+    NSImageInterpolation previousInterpolation = [graphicsContext imageInterpolation];
+    BOOL result;
+
+    CGContextSaveGState(context);
+    @try {
+        CGContextSetAlpha(context, fraction);
+        [graphicsContext setCompositingOperation: operation];
+        id interpolation = [hints objectForKey: NSImageHintInterpolation];
+        if ([interpolation respondsToSelector: @selector(unsignedIntegerValue)])
+            [graphicsContext setImageInterpolation: (NSImageInterpolation) [interpolation unsignedIntegerValue]];
+        CGContextClipToRect(context, NSRectToCGRect(rect));
+        if (respectFlipped && [graphicsContext isFlipped]) {
+            // Upright in a flipped context: mirror the destination about its own centre.
+            CGContextTranslateCTM(context, 0, NSMinY(rect) + NSMaxY(rect));
+            CGContextScaleCTM(context, 1, -1);
+        }
+        CGFloat scaleX = rect.size.width / fromRect.size.width;
+        CGFloat scaleY = rect.size.height / fromRect.size.height;
+        result = [self drawInRect: NSMakeRect(rect.origin.x - fromRect.origin.x * scaleX,
+                                              rect.origin.y - fromRect.origin.y * scaleY,
+                                              size.width * scaleX, size.height * scaleY)];
+    } @finally {
+        CGContextRestoreGState(context);
+        [graphicsContext setCompositingOperation: previousOperation];
+        [graphicsContext setImageInterpolation: previousInterpolation];
+    }
     return result;
 }
 

@@ -107,6 +107,7 @@ static NSInteger defaultButtonNumber(NSEventType type) {
                  modifierFlags: modifierFlags
                         window: [NSApp windowWithWindowNumber: windowNumber]];
     if (self != nil) {
+        _timestamp = timestamp;
         _eventNumber = eventNumber;
         _trackingNumber = tracking;
         _userData = userData;
@@ -128,6 +129,7 @@ static NSInteger defaultButtonNumber(NSEventType type) {
                  location: location
             modifierFlags: modifierFlags
                    window: [NSApp windowWithWindowNumber: windowNumber]];
+    _timestamp = timestamp;
     _buttonNumber = defaultButtonNumber(type);
     _clickCount = clickCount;
     _eventNumber = eventNumber;
@@ -190,6 +192,9 @@ static NSInteger defaultButtonNumber(NSEventType type) {
         point.y = NSHeight([[screens objectAtIndex: 0] frame]) - point.y;
     CGEventSetLocation(event, NSPointToCGPoint(point));
 
+    // CGEvent times are nanoseconds on the clock NSEvent times count seconds of.
+    CGEventSetTimestamp(event, (CGEventTimestamp) ([self timestamp] * 1e9));
+
     // NSEventModifierFlags and CGEventFlags use the same bits.
     CGEventSetFlags(event, (CGEventFlags) [self modifierFlags]);
 
@@ -246,6 +251,53 @@ static NSInteger defaultButtonNumber(NSEventType type) {
 
 - (void) _setButtonNumber: (NSInteger) num {
     _buttonNumber = num;
+}
+
+- (void) _setPreciseScrollingDeltaX: (CGFloat) deltaX deltaY: (CGFloat) deltaY phase: (NSEventPhase) phase {
+    if (_type != NSScrollWheel)
+        [NSException raise: NSInternalInconsistencyException
+                    format: @"-[%@ %s] needs a scroll wheel event, not type %d",
+                            [self class], sel_getName(_cmd), (int) _type];
+
+    _hasPreciseScrollingDeltas = YES;
+    _scrollingDeltaX = deltaX;
+    _scrollingDeltaY = deltaY;
+    // QUIRK: the legacy deltaX and deltaY of a precise scroll event are a tenth of the scrolling deltas (the
+    // deltas are in points, the legacy ones in lines of ten points). Not documented. Evidence: black-box
+    // observation on macOS 26.7.3 and 10.14.4 (tier 2), scroll events made with CGEventCreateScrollWheelEvent2 in
+    // pixel units: 10 points gave deltaY 1, 25 gave deltaX 2.5.
+    // Test: appkit-precise-scroll-events (test_quirk_precise_legacy_deltas_are_a_tenth)
+    _deltaX = deltaX / 10;
+    _deltaY = deltaY / 10;
+    _scrollPhase = phase;
+}
+
+- (BOOL) hasPreciseScrollingDeltas {
+    return _hasPreciseScrollingDeltas;
+}
+
+- (CGFloat) scrollingDeltaX {
+    return _hasPreciseScrollingDeltas ? _scrollingDeltaX : [super scrollingDeltaX];
+}
+
+- (CGFloat) scrollingDeltaY {
+    return _hasPreciseScrollingDeltas ? _scrollingDeltaY : [super scrollingDeltaY];
+}
+
+- (NSEventPhase) phase {
+    return _hasPreciseScrollingDeltas ? _scrollPhase : [super phase];
+}
+
+- (void) _setWindowWasKeyOnArrival: (BOOL) key {
+    _keyStateOnArrival = key ? 1 : 2;
+}
+
+- (BOOL) _hasWindowKeyStateOnArrival {
+    return _keyStateOnArrival != 0;
+}
+
+- (BOOL) _windowWasKeyOnArrival {
+    return _keyStateOnArrival == 1;
 }
 
 @end

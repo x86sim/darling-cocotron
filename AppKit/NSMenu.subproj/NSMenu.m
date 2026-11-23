@@ -27,6 +27,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSSubmenuView.h>
 #import <AppKit/NSKeyEquivalentMatching.h>
 #import <AppKit/NSWindow.h>
+#import <AppKit/NSScreen.h>
+#import <Foundation/NSProcessInfo.h>
 #import <Foundation/NSKeyedArchiver.h>
 
 const NSNotificationName NSMenuWillSendActionNotification = @"NSMenuWillSendActionNotification";
@@ -47,10 +49,36 @@ NSString *const _NSRecentDocumentsMenuName = @"Recents";
 NSString *const _NSServicesMenuName = @"Services";
 NSString *const _NSWindowsMenuName = @"Window";
 
+// Defined in NSMenuView.m
+extern void _NSMenuCancelTracking(NSMenu *menu);
+extern id _NSMenuTrackingBegin(NSMenu *menu);
+extern void _NSMenuTrackingEnd(id session);
+extern BOOL _NSMenuTrackingCancelRequested(id session);
+
 @implementation NSMenu
 
 NS_EXTRA_SYNTHESIZE_ASSIGN(NSMenu, showsStateColumn, _showsStateColumn, BOOL, showsStateColumn, setShowsStateColumn:)
 NS_EXTRA_SYNTHESIZE_COPY(NSMenu, identifier, _identifier, NSUserInterfaceItemIdentifier, identifier, setIdentifier:)
+NS_EXTRA_SYNTHESIZE_RETAIN(NSMenu, appearance, _appearance, NSAppearance *, appearance, setAppearance:)
+
++ (NSSet *) keyPathsForValuesAffectingEffectiveAppearance {
+    return [NSSet setWithObject: @"appearance"];
+}
+
+// NSAppearanceCustomization: the menu's own appearance, else the one it
+// inherits. Observed on macOS 26.7.3: the application's for a menu that has no
+// supermenu and is not attached to anything. GUESS: a submenu or a menu of a
+// view or window inherits from its supermenu, view or window first; the
+// reference says "the nearest ancestor that has set an appearance" and the
+// probe did not reach those cases. Menu views do not
+// draw from it yet, and a change of the application's appearance is not
+// reported to observers of a menu that has none.
+// https://developer.apple.com/documentation/appkit/nsappearancecustomization
+- (NSAppearance *) effectiveAppearance {
+    NSAppearance *own = [self appearance];
+
+    return own != nil ? own : [NSApp effectiveAppearance];
+}
 
 + (void) popUpContextMenu: (NSMenu *) menu
                 withEvent: (NSEvent *) event
@@ -90,6 +118,175 @@ NS_EXTRA_SYNTHESIZE_COPY(NSMenu, identifier, _identifier, NSUserInterfaceItemIde
     }
 }
 
+// Shows the menu as a pop-up menu and tracks it until an item is chosen or
+// the menu is dismissed. The top left corner of `item` (which must belong to
+// the menu), or of the menu's content when `item` is nil, goes to `location`,
+// given in `view`'s coordinates, or in screen coordinates when `view` is nil;
+// the menu is then moved as little as needed to keep it on that screen. The
+// chosen item's action is sent before this returns. YES when an item was
+// chosen, NO when tracking was cancelled.
+- (BOOL) popUpMenuPositioningItem: (NSMenuItem *) item
+                       atLocation: (NSPoint) location
+                           inView: (NSView *) view
+{
+    NSInteger itemIndex = item == nil ? NSNotFound : [self indexOfItem: item];
+
+    if (item != nil && itemIndex == NSNotFound)
+        return NO;
+
+    // As on macOS: the begin notification, then -menuNeedsUpdate:, then
+    // -menuWillOpen:, all before the menu is shown; -menuDidClose: and the end
+    // notification come from the tracking that follows.
+    id session = _NSMenuTrackingBegin(self);
+
+    [[NSNotificationCenter defaultCenter]
+            postNotificationName: NSMenuDidBeginTrackingNotification
+                          object: self];
+    [self _updateWithoutSubmenus];
+    if ([self numberOfItems] == 0) {
+        _NSMenuTrackingEnd(session);
+        [[NSNotificationCenter defaultCenter]
+                postNotificationName: NSMenuDidEndTrackingNotification
+                              object: self];
+        return NO;
+    }
+
+    NSPoint screenPoint = location;
+    if (view != nil) {
+        screenPoint = [view convertPoint: location toView: nil];
+        screenPoint = [[view window] convertBaseToScreen: screenPoint];
+    }
+
+    NSMenuWindow *menuWindow = [[NSMenuWindow alloc] initWithMenu: self];
+    NSMenuView *menuView = [menuWindow menuView];
+    NSSize size = [menuWindow frame].size;
+    // Where the anchor (the item's top left, or the menu's) is in the window,
+    // measured from the window's top left corner.
+    NSPoint anchor = NSZeroPoint;
+    // The menu view counts the items it shows.
+    if (itemIndex != NSNotFound)
+        itemIndex = [[menuView itemArray] indexOfObjectIdenticalTo: item];
+    if (itemIndex != NSNotFound) {
+        NSRect itemRect = [(NSSubmenuView *) menuView rectForItemAtIndex: itemIndex];
+        NSPoint topLeft = [menuView convertPoint: itemRect.origin toView: nil];
+
+        anchor = NSMakePoint(topLeft.x, size.height - topLeft.y);
+    }
+    NSRect frame = NSMakeRect(screenPoint.x - anchor.x, screenPoint.y + anchor.y - size.height, size.width, size.height);
+
+    NSScreen *screen = nil;
+    for (NSScreen *candidate in [NSScreen screens])
+        if (NSPointInRect(screenPoint, [candidate frame])) {
+            screen = candidate;
+            break;
+        }
+    if (screen == nil)
+        screen = [NSScreen mainScreen];
+    if (screen != nil) {
+        NSRect visible = [screen visibleFrame];
+
+        if (NSMaxX(frame) > NSMaxX(visible))
+            frame.origin.x = NSMaxX(visible) - frame.size.width;
+        if (NSMinX(frame) < NSMinX(visible))
+            frame.origin.x = NSMinX(visible);
+        if (NSMinY(frame) < NSMinY(visible))
+            frame.origin.y = NSMinY(visible);
+        if (NSMaxY(frame) > NSMaxY(visible))
+            frame.origin.y = NSMaxY(visible) - frame.size.height;
+    }
+
+    id<NSMenuDelegate> delegate = [self delegate];
+    if ([delegate respondsToSelector: @selector(menuWillOpen:)])
+        [delegate menuWillOpen: self];
+
+    // Cancelled from the delegate: nothing was shown.
+    if (_NSMenuTrackingCancelRequested(session)) {
+        [menuWindow release];
+        _NSMenuTrackingEnd(session);
+        [[NSNotificationCenter defaultCenter]
+                postNotificationName: NSMenuDidEndTrackingNotification
+                              object: self];
+        return NO;
+    }
+
+    [menuWindow setReleasedWhenClosed: YES];
+    [menuWindow setFrame: frame display: NO];
+    [menuWindow orderFront: nil];
+
+    // Tracking starts from the event that made the menu appear when that was a
+    // button press, so that releasing the button over an item chooses it;
+    // otherwise (a key press, a timer) from the pointer's current position.
+    NSEvent *current = [NSApp currentEvent];
+    NSEventType type = NSLeftMouseDown;
+    NSTimeInterval timestamp = [[NSProcessInfo processInfo] systemUptime];
+    switch ([current type]) {
+    case NSLeftMouseDown:
+    case NSRightMouseDown:
+    case NSOtherMouseDown:
+        type = [current type];
+        timestamp = [current timestamp];
+        break;
+    default:
+        break;
+    }
+    NSEvent *start = [NSEvent mouseEventWithType: type
+                                        location: [menuWindow convertScreenToBase: [NSEvent mouseLocation]]
+                                   modifierFlags: 0
+                                       timestamp: timestamp
+                                    windowNumber: [menuWindow windowNumber]
+                                         context: nil
+                                     eventNumber: 0
+                                      clickCount: 1
+                                        pressure: 0];
+
+    NSMenuItem *chosen = [menuView _trackForEvent: start session: session];
+
+    [menuWindow close];
+
+    if (chosen == nil)
+        return NO;
+
+    NSMenu *owner = [chosen menu] != nil ? [chosen menu] : self;
+    NSInteger index = [owner indexOfItem: chosen];
+
+    if (index != NSNotFound)
+        [owner performActionForItemAtIndex: index];
+    else
+        [NSApp sendAction: [chosen action] to: [chosen target] from: chosen];
+    return YES;
+}
+
+// Ends the tracking of this menu, when it is the menu being tracked (a pop-up
+// menu, or the menu bar), as if the user had dismissed it: no item is chosen,
+// so a pop-up menu's popUpMenuPositioningItem:atLocation:inView: returns NO,
+// and NSMenuDidEndTrackingNotification is posted. Animations do not exist
+// here, so both variants end the tracking the same way.
+- (void) cancelTracking {
+    _NSMenuCancelTracking(self);
+}
+
+- (void) cancelTrackingWithoutAnimation {
+    _NSMenuCancelTracking(self);
+}
+
+// The menu bar is visible unless the application's presentation options hide
+// it (or auto-hide it).
++ (BOOL) menuBarVisible {
+    NSApplicationPresentationOptions options = [NSApp presentationOptions];
+
+    return (options & (NSApplicationPresentationHideMenuBar |
+                       NSApplicationPresentationAutoHideMenuBar)) == 0;
+}
+
+// The visibility is the presentation options: NO replaces them all with a
+// hidden Dock and menu bar (the options require the Dock to be hidden too),
+// YES replaces them with the default ones, as on macOS.
++ (void) setMenuBarVisible: (BOOL) visible {
+    [NSApp setPresentationOptions: visible ? NSApplicationPresentationDefault
+                                           : (NSApplicationPresentationHideDock |
+                                              NSApplicationPresentationHideMenuBar)];
+}
+
 + (NSZone *) menuZone {
     return NSDefaultMallocZone();
 }
@@ -99,6 +296,8 @@ NS_EXTRA_SYNTHESIZE_COPY(NSMenu, identifier, _identifier, NSUserInterfaceItemIde
     [coder encodeObject: NS_EXTRA(NSMenu, self)->_name forKey: @"NSName"];
     [coder encodeObject: NS_EXTRA(NSMenu, self)->_itemArray forKey: @"NSMenuItems"];
     [coder encodeBool: !NS_EXTRA(NSMenu, self)->_autoenablesItems forKey: @"NSNoAutoenable"];
+    if (NS_EXTRA(NSMenu, self)->_identifier != nil)
+        [coder encodeObject: NS_EXTRA(NSMenu, self)->_identifier forKey: @"NSMenuIdentifier"];
 }
 
 - (void) setMenuChangedMessagesEnabled: (BOOL) flag {
@@ -118,6 +317,9 @@ NS_EXTRA_SYNTHESIZE_COPY(NSMenu, identifier, _identifier, NSUserInterfaceItemIde
         NS_EXTRA(NSMenu, self)->_itemArray = [[NSMutableArray alloc]
                 initWithArray: [keyed decodeObjectForKey: @"NSMenuItems"]];
         NS_EXTRA(NSMenu, self)->_autoenablesItems = ![keyed decodeBoolForKey: @"NSNoAutoenable"];
+        // The identifier applications look their menus up by (nibs and archives
+        // store it under this key on macOS).
+        NS_EXTRA(NSMenu, self)->_identifier = [[keyed decodeObjectForKey: @"NSMenuIdentifier"] copy];
     } else {
         // One layout for every class version, as recorded from Mac archives: a flag word
         // (bit 31: no automatic enabling of items, bit 29: no state column), the title,
@@ -133,6 +335,12 @@ NS_EXTRA_SYNTHESIZE_COPY(NSMenu, identifier, _identifier, NSUserInterfaceItemIde
                                                                            : [[NSMutableArray alloc] init];
         [NS_EXTRA(NSMenu, self)->_itemArray release];
         NS_EXTRA(NSMenu, self)->_itemArray = items;
+    }
+    // The items do not archive their menu (a nib does not store it either): the menu that
+    // decoded them is the one they belong to, as if they had been added to it.
+    for (NSMenuItem *item in NS_EXTRA(NSMenu, self)->_itemArray) {
+        [item performSelector: @selector(_setMenu:) withObject: self];
+        [[item submenu] setSupermenu: self];
     }
     return self;
 }
@@ -156,6 +364,7 @@ NS_EXTRA_SYNTHESIZE_COPY(NSMenu, identifier, _identifier, NSUserInterfaceItemIde
                                 withObject: nil];
     [NS_EXTRA(NSMenu, self)->_itemArray release];
     [NS_EXTRA(NSMenu, self)->_identifier release];
+    [NS_EXTRA(NSMenu, self)->_appearance release];
     NS_EXTRA_FREE(NSMenu, self);
     [super dealloc];
 }
@@ -163,6 +372,14 @@ NS_EXTRA_SYNTHESIZE_COPY(NSMenu, identifier, _identifier, NSUserInterfaceItemIde
 - copyWithZone: (NSZone *) zone {
     NSMenu *copy = NSCopyObject(self, 0, zone);
     NS_EXTRA_COPY(NSMenu, copy, self);
+    NS_EXTRA(NSMenu, copy)->_identifier =
+        [NS_EXTRA(NSMenu, self)->_identifier copyWithZone: zone];
+    // Observed on macOS 26.7.3: a copy keeps the appearance, as it keeps the identifier.
+    [NS_EXTRA(NSMenu, copy)->_appearance retain];
+    // QUIRK: a copy of a submenu has no supermenu. Not documented. Evidence: black-box observation on macOS
+    // 26.7.3 (tier 2): the supermenu of a copy of a submenu, and of a copy of a menu with a supermenu, was nil.
+    // Test: appkit-menu-appearance (test_copy_of_a_hierarchy)
+    copy->_supermenu = nil;
 
     copy->_title = [_title copyWithZone: zone];
     NS_EXTRA(NSMenu, copy)->_name = [NS_EXTRA(NSMenu, self)->_name copyWithZone: zone];
@@ -422,28 +639,46 @@ BOOL itemIsEnabled(NSMenuItem *item) {
 }
 
 - (void) update {
-    if ([NS_EXTRA(NSMenu, self)->_delegate respondsToSelector: @selector(menuNeedsUpdate:)]) {
-        [NS_EXTRA(NSMenu, self)->_delegate menuNeedsUpdate: self];
+    [self _updateWithoutSubmenus];
+
+    for (NSMenuItem *item in [NSArray arrayWithArray: NS_EXTRA(NSMenu, self)->_itemArray])
+        [[item submenu] update];
+}
+
+// The delegate's -menuNeedsUpdate:, which may add, remove or change items.
+static void askDelegateToUpdate(NSMenu *menu) {
+    id delegate = NS_EXTRA(NSMenu, menu)->_delegate;
+
+    if ([delegate respondsToSelector: @selector(menuNeedsUpdate:)])
+        [delegate menuNeedsUpdate: menu];
+}
+
+// Brings the enabled state of one item in line with its validation, when the menu enables its items itself,
+// and returns the result of the validation (the item's own state when the menu does not).
+static BOOL validateItem(NSMenu *menu, NSMenuItem *item) {
+    if (!NS_EXTRA(NSMenu, menu)->_autoenablesItems)
+        return [item isEnabled];
+
+    BOOL enabled = itemIsEnabled(item) ? YES : NO;
+    BOOL currentlyEnabled = [item isEnabled] ? YES : NO;
+
+    if (enabled != currentlyEnabled &&
+        ![item _binderForBinding: @"enabled" create: NO]) {
+        [item setEnabled: enabled];
+        [menu itemChanged: item];
     }
+    return enabled;
+}
+
+// The delegates -menuNeedsUpdate: and the validation of this menus own
+// items; a submenu is brought up to date when it is shown.
+- (void) _updateWithoutSubmenus {
+    askDelegateToUpdate(self);
 
     NSInteger i, count = [NS_EXTRA(NSMenu, self)->_itemArray count];
 
-    for (i = 0; i < count; i++) {
-        NSMenuItem *item = [NS_EXTRA(NSMenu, self)->_itemArray objectAtIndex: i];
-
-        if (NS_EXTRA(NSMenu, self)->_autoenablesItems) {
-            BOOL enabled = itemIsEnabled(item) ? YES : NO;
-            BOOL currentlyEnabled = [item isEnabled] ? YES : NO;
-
-            if (enabled != currentlyEnabled &&
-                ![item _binderForBinding: @"enabled" create: NO]) {
-                [item setEnabled: enabled];
-                [self itemChanged: item];
-            }
-        }
-
-        [[item submenu] update];
-    }
+    for (i = 0; i < count; i++)
+        validateItem(self, [NS_EXTRA(NSMenu, self)->_itemArray objectAtIndex: i]);
 }
 
 - (void) itemChanged: (NSMenuItem *) item {
@@ -474,23 +709,58 @@ BOOL itemIsEnabled(NSMenuItem *item) {
                         userInfo: userInfo];
 }
 
+// Asks the delegate of this menu, then those of the submenus below it, in order, whether it has a key
+// equivalent for the event of its own (-menuHasKeyEquivalent:forEvent:target:action:). The first to answer
+// YES has its action sent to its target, from the menu it belongs to, and ends the search.
+- (BOOL) _delegateHandlesKeyEquivalent: (NSEvent *) event {
+    id delegate = NS_EXTRA(NSMenu, self)->_delegate;
+
+    if ([delegate respondsToSelector: @selector(menuHasKeyEquivalent:forEvent:target:action:)]) {
+        id target = nil;
+        SEL action = NULL;
+
+        if ([delegate menuHasKeyEquivalent: self forEvent: event target: &target action: &action]) {
+            if (action != NULL)
+                [NSApp sendAction: action to: target from: self];
+            return YES;
+        }
+    }
+
+    for (NSMenuItem *item in [NSArray arrayWithArray: NS_EXTRA(NSMenu, self)->_itemArray]) {
+        if ([[item submenu] _delegateHandlesKeyEquivalent: event])
+            return YES;
+    }
+    return NO;
+}
+
+// QUIRK: the search for a key equivalent never sends -menuNeedsUpdate: to the delegates. It asks them for
+// -menuHasKeyEquivalent:forEvent:target:action: first (this menu's delegate and those below it, then again by each
+// submenu that is searched), then validates the items of the menu that enables its items itself, then walks them
+// in order, a submenu through its own -performKeyEquivalent:. So a delegate that changes the key equivalents of
+// items when it updates has not done so yet. Not documented. Evidence: black-box observation on macOS 26.7.3
+// (tier 2), 22 scenarios including delegates that rewrite a key and delegates that answer; the order of the calls
+// is the one the scenarios of the test pin.
+// Test: appkit-menu-key-equivalent-after-update (test_quirk_key_equivalent_search_*)
 - (BOOL) performKeyEquivalent: (NSEvent *) event {
-    NSInteger i, count = [NS_EXTRA(NSMenu, self)->_itemArray count];
+    if ([self _delegateHandlesKeyEquivalent: event])
+        return YES;
 
-    if (NS_EXTRA(NSMenu, self)->_autoenablesItems)
-        [self update];
+    // The items are validated first, and an action or a validation may change the menu: the walk goes over a copy.
+    NSArray *items = [NSArray arrayWithArray: NS_EXTRA(NSMenu, self)->_itemArray];
 
-    for (i = 0; i < count; i++) {
-        NSMenuItem *item = [NS_EXTRA(NSMenu, self)->_itemArray objectAtIndex: i];
+    NSMutableArray *validated = [NSMutableArray arrayWithCapacity: [items count]];
 
+    for (NSMenuItem *item in items)
+        [validated addObject: [NSNumber numberWithBool: validateItem(self, item)]];
+
+    for (NSMenuItem *item in items) {
         if (NSKeyEquivalentMatchesEvent([item keyEquivalent],
                                         [item keyEquivalentModifierMask], event)) {
-            // With automatic enabling, -update above brought isEnabled in
-            // line with validation. Without it only isEnabled counts and
-            // validation is not consulted.
+            // With automatic enabling the validation above brought isEnabled in line with it. Without it only
+            // isEnabled counts and validation is not consulted.
             BOOL enabled = [item isEnabled];
             if (enabled && NS_EXTRA(NSMenu, self)->_autoenablesItems)
-                enabled = itemIsEnabled(item);
+                enabled = [[validated objectAtIndex: [items indexOfObjectIdenticalTo: item]] boolValue];
             if (enabled)
                 [NSApp sendAction: [item action]
                                to: [item target]
@@ -549,6 +819,82 @@ BOOL itemIsEnabled(NSMenuItem *item) {
     }
 
     return nil;
+}
+
+@end
+
+// An alternate goes with the item right before it in the menu when the two
+// have the same key equivalent, letter case aside.
+static BOOL isAlternateOfItem(NSMenuItem *item, NSMenuItem *previous) {
+    return [item isAlternate] && previous != nil && ![previous isSeparatorItem] &&
+           [[item keyEquivalent] caseInsensitiveCompare: [previous keyEquivalent]] == NSOrderedSame;
+}
+
+// The modifier keys an item's key equivalent needs: an upper-case key
+// equivalent includes Shift.
+static NSEventModifierFlags itemModifiers(NSMenuItem *item) {
+    NSEventModifierFlags modifiers = NSCommandKeyMask | NSAlternateKeyMask |
+                                     NSControlKeyMask | NSShiftKeyMask;
+    NSEventModifierFlags mask = [item keyEquivalentModifierMask] & modifiers;
+    NSString *key = [item keyEquivalent];
+
+    if ([key length] > 0 && ![key isEqualToString: [key lowercaseString]])
+        mask |= NSShiftKeyMask;
+    return mask;
+}
+
+// Of an item and its alternates, the one for the modifier keys held: the
+// first one shown unless one of the others is for exactly those keys, or for
+// those keys added to the first one's.
+static NSMenuItem *shownItemOfGroup(NSArray *group, NSEventModifierFlags flags) {
+    NSMenuItem *first = nil;
+
+    for (NSMenuItem *item in group)
+        if (![item isHidden]) {
+            first = item;
+            break;
+        }
+    if (first == nil)
+        return nil;
+
+    NSEventModifierFlags held = flags & (NSCommandKeyMask | NSAlternateKeyMask |
+                                         NSControlKeyMask | NSShiftKeyMask);
+    if (held != 0) {
+        NSEventModifierFlags withFirst = held | itemModifiers(first);
+        for (NSMenuItem *item in group) {
+            NSEventModifierFlags mask = itemModifiers(item);
+            if (item != first && ![item isHidden] && (mask == held || mask == withFirst))
+                return item;
+        }
+    }
+    return first;
+}
+
+@implementation NSMenu (ShownItems)
+
+- (NSArray *) _shownItemsWithModifierFlags: (NSEventModifierFlags) flags {
+    NSMutableArray *shown = [NSMutableArray array];
+    NSMutableArray *group = [NSMutableArray array];
+
+    for (NSMenuItem *item in [self itemArray]) {
+        if ([group count] > 0 && isAlternateOfItem(item, [group lastObject])) {
+            [group addObject: item];
+            continue;
+        }
+        if ([group count] > 0) {
+            NSMenuItem *chosen = shownItemOfGroup(group, flags);
+            if (chosen != nil)
+                [shown addObject: chosen];
+        }
+        [group removeAllObjects];
+        [group addObject: item];
+    }
+    if ([group count] > 0) {
+        NSMenuItem *chosen = shownItemOfGroup(group, flags);
+        if (chosen != nil)
+            [shown addObject: chosen];
+    }
+    return shown;
 }
 
 @end

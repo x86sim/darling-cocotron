@@ -28,6 +28,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSWindow.h>
 #import <Foundation/NSDate.h>
 #import <Foundation/NSException.h>
+#import "../private-include/AppKit/NSEventTime.h"
 #import <Foundation/NSRaise.h>
 
 // The object +addLocalMonitorForEventsMatchingMask:handler: returns.
@@ -135,7 +136,8 @@ static BOOL _mouseCoalescingEnabled = YES;
                        window: (NSWindow *) window
 {
     _type = type;
-    _timestamp = [NSDate timeIntervalSinceReferenceDate];
+    // Event times are seconds since the system started (see -[NSEvent timestamp]).
+    _timestamp = NSEventCurrentTime();
     _locationInWindow = location;
     _modifierFlags = modifierFlags;
     _windowNumber = [window windowNumber];
@@ -244,7 +246,7 @@ static BOOL _mouseCoalescingEnabled = YES;
                           isARepeat: (BOOL) isARepeat
                             keyCode: (unsigned short) keyCode
 {
-    return [[[NSEvent_keyboard alloc]
+    NSEvent *event = [[[NSEvent_keyboard alloc]
                            initWithType: type
                                location: location
                           modifierFlags: modifierFlags
@@ -254,6 +256,8 @@ static BOOL _mouseCoalescingEnabled = YES;
             charactersIgnoringModifiers: charactersIgnoringModifiers
                               isARepeat: isARepeat
                                 keyCode: keyCode] autorelease];
+    event->_timestamp = timestamp;
+    return event;
 }
 
 + (instancetype) otherEventWithType: (NSEventType) type
@@ -317,8 +321,8 @@ static BOOL _mouseCoalescingEnabled = YES;
     return 0;
 }
 
-// Only magnify and rotate events (NSEvent_gesture) carry a phase. No backend
-// produces precise (trackpad) scrolling yet: every scroll event is a wheel
+// Only magnify and rotate events (NSEvent_gesture) and scroll events marked as
+// precise (NSEvent_mouse) carry a phase. Every other scroll event is a wheel
 // notch measured in lines, with no phase, as a mouse wheel reports on macOS.
 - (NSEventPhase) phase {
     return NSEventPhaseNone;

@@ -182,13 +182,19 @@ typedef NS_ENUM(NSInteger, NSTableRowActionEdge) {
         NSRect _editingFrame, _editingBorder;
         NSArray *_sortDescriptors;
 
+        // Drop target proposed by the table and retargeted by the data source; -1 with
+        // NSTableViewDropOn is the whole table.
         NSInteger _draggingRow;
+        NSTableViewDropOperation _draggingOperation;
+        BOOL _draggingTargetKnown;  // validated by the data source, not yet dropped
+        BOOL _draggingTargetShown;  // drop feedback is visible
         NSDragOperation _draggingSourceMaskLocal;
         NSDragOperation _draggingSourceMaskNonLocal;
 
         NSMutableDictionary *_registeredNibs;
         NSMutableDictionary *_cellViews;    // views in the table, keyed by cell position
         NSMutableDictionary *_reuseQueues;  // identifier -> views waiting for reuse
+        NSMutableDictionary *_rowViews;     // row -> NSTableRowView in the table
         NSString *_typeSelectString;
         NSString *_toolTipSignature;
         NSTimeInterval _typeSelectTime;
@@ -199,6 +205,12 @@ typedef NS_ENUM(NSInteger, NSTableRowActionEdge) {
         BOOL _rowActionsVisible;
         BOOL _usesStaticContents;
         NSTableViewDraggingDestinationFeedbackStyle _draggingDestinationFeedbackStyle;
+        // Decoded from a nib and not yet sent -awakeFromNib.
+        BOOL _awaitingAwakeFromNib;
+        // A data source set while loading from a nib is checked on the next -numberOfRows.
+        BOOL _dataSourceCheckPending;
+        NSString *_autosaveName;
+        BOOL _autosaveTableColumns;
     NS_EXTRA_IVARS_END(NSTableView)
 }
 
@@ -209,6 +221,8 @@ typedef NS_ENUM(NSInteger, NSTableRowActionEdge) {
 - (NSInteger) rowForView: (NSView *) view;
 - (NSInteger) columnForView: (NSView *) view;
 - (nullable __kindof NSView *) viewAtColumn: (NSInteger) column row: (NSInteger) row makeIfNecessary: (BOOL) makeIfNecessary;
+- (nullable __kindof NSTableRowView *) rowViewAtRow: (NSInteger) row makeIfNecessary: (BOOL) makeIfNecessary;
+- (void) enumerateAvailableRowViewsUsingBlock: (void (NS_NOESCAPE ^)(__kindof NSTableRowView *rowView, NSInteger row)) handler;
 
 @property(nonatomic) SEL doubleAction;
 
@@ -272,6 +286,7 @@ typedef NS_ENUM(NSInteger, NSTableRowActionEdge) {
 - (void) setDraggingSourceOperationMask: (NSDragOperation) mask
                                forLocal: (BOOL) isLocal;
 - (NSDragOperation) draggingSourceOperationMaskForLocal: (BOOL) isLocal;
+- (void) setDropRow: (NSInteger) row dropOperation: (NSTableViewDropOperation) dropOperation;
 
 
 - (void) addTableColumn: (NSTableColumn *) column;
@@ -386,6 +401,9 @@ typedef NS_ENUM(NSInteger, NSTableRowActionEdge) {
 - (nullable NSView *) tableView: (NSTableView *) tableView
     viewForTableColumn: (nullable NSTableColumn *) tableColumn
                    row: (NSInteger) row;
+- (nullable NSTableRowView *) tableView: (NSTableView *) tableView rowViewForRow: (NSInteger) row;
+- (void) tableView: (NSTableView *) tableView didAddRowView: (NSTableRowView *) rowView forRow: (NSInteger) row;
+- (void) tableView: (NSTableView *) tableView didRemoveRowView: (NSTableRowView *) rowView forRow: (NSInteger) row;
 - (NSIndexSet *) tableView: (NSTableView *) tableView
         selectionIndexesForProposedSelection: (NSIndexSet *) proposedSelectionIndexes;
 - (void) tableView: (NSTableView *) tableView didClickTableColumn: (NSTableColumn *) tableColumn;

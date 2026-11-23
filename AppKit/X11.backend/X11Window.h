@@ -54,6 +54,8 @@ extern NSString *const X11WindowBackingDidFlushNotification;
     BOOL _overrideRedirect;
     BOOL _dock; // the menu bar window (see X11MenuBarWindow)
     BOOL _menuWindow; // a menu or pop-up window
+    BOOL _skipTaskbar; // not an application window: no task-bar or pager entry (see -updateWindowManagerHints)
+    X11Window *_transientParent; // the window named by WM_TRANSIENT_FOR (retained)
     BOOL _fullscreenRequested;
     BOOL _fullscreenReported; // what the window manager last said, told to the delegate
     BOOL _isOpaque;
@@ -73,6 +75,9 @@ extern NSString *const X11WindowBackingDidFlushNotification;
     // frames wait for the display refresh.
     id _layerDrawableOwner;
     BOOL _layerDrawableSyncs;
+    // The union of a series of Expose events received so far (see -addExposedRect:isLast:exposedUnion:).
+    O2Rect _pendingExpose;
+    BOOL _hasPendingExpose;
     // The presentation hints as last written to the window.
     BOOL _bypassCompositorHint;
     BOOL _variableRefreshHint;
@@ -91,6 +96,13 @@ extern NSString *const X11WindowBackingDidFlushNotification;
     // property, mapping and unmapping make it read again.
     BOOL _miniaturizedKnown;
     BOOL _miniaturized;
+    // The state the delegate was last told of (platformWindowMiniaturized: and platformWindowDeminiaturized:).
+    BOOL _miniaturizedReported;
+    // Whether X11Display found the window covered (see X11Occlusion.h).
+    BOOL _occluded;
+    // Geometry of the last ConfigureNotify (see -noteConfigureGeometryChanged:).
+    BOOL _configureKnown;
+    int _configureX, _configureY, _configureWidth, _configureHeight;
 }
 
 + (void) removeDecorationForWindow: (Window) w onDisplay: (Display *) dpy;
@@ -123,6 +135,7 @@ extern NSString *const X11WindowBackingDidFlushNotification;
 // Called by the display after it re-read a changed scale (see
 // -[X11Display reevaluateBackingScale]).
 - (void) displayBackingScaleChangedFrom: (CGFloat) oldScale;
+- (void) setWindowIcon;
 
 // Points to the device pixels libX11 takes. AppKit-level geometry is in points;
 // every value handed to X is in device pixels. One rounding serves the X window
@@ -144,6 +157,9 @@ extern NSString *const X11WindowBackingDidFlushNotification;
 // ordered to the front, mapped or given another level.
 - (void) restackForLevels;
 - (BOOL) isMapped;
+- (void) setOccluded: (BOOL) occluded;
+// Records the geometry of a ConfigureNotify; NO when it repeats the previous one.
+- (BOOL) noteConfigureGeometryChanged: (XConfigureEvent *) event;
 // Whether the window is fullscreen (_NET_WM_STATE_FULLSCREEN), as last asked
 // for or as the window manager last set it.
 - (BOOL) isFullscreen;
@@ -166,6 +182,9 @@ extern NSString *const X11WindowBackingDidFlushNotification;
 - (BOOL) isMenuOrPopup;
 - (void) mapNotified;
 
+// X reports an exposed area as a series of rectangles. Collects them and, for the last one of
+// the series, returns YES with their union in *exposedUnion.
+- (BOOL) addExposedRect: (O2Rect) rect isLast: (BOOL) last exposedUnion: (O2Rect *) exposedUnion;
 @end
 
 // Whether an EWMH window manager is running on the display.

@@ -43,7 +43,7 @@ struct xkb_keymap;
 struct xkb_state;
 
 @class WaylandOutputManager;
-@class WaylandCursor, WaylandWindow, WaylandPasteboard, WaylandDraggingManager;
+@class WaylandCursor, WaylandWindow, WaylandPasteboard, WaylandDraggingManager, WaylandAppMenu, WaylandToplevelIcons;
 
 @protocol WaylandFractionalScaleOwner
 - (void) preferredScaleChanged: (uint32_t) scale120;
@@ -79,7 +79,9 @@ typedef enum {
     WaylandObjectOutputHeadMode,
     WaylandObjectOutputConfiguration,
     WaylandObjectActivationToken,
+    WaylandObjectLayerSurface,
     WaylandObjectTouch,
+    WaylandObjectIconManager,
 } WaylandObjectKind;
 
 // The dispatcher installed on every proxy (see WaylandLibrary.h for why listeners
@@ -108,6 +110,8 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     struct wl_proxy *_activation, *_activationToken;
     uint32_t _activationName;
     WaylandWindow *_activationWindow;
+    // Windows of an inactive application that were not mapped are being mapped for an activation.
+    BOOL _mappingForActivation;
     uint32_t _viewporterName, _fractionalScaleManagerName;
     struct wl_proxy *_logicalOutputManager, *_legacyLogicalOutputManager;
     uint32_t _logicalOutputManagerName;
@@ -115,10 +119,26 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     WaylandOutputManager *_outputManager;
     uint32_t _outputManagerName;
     struct wl_proxy *_subcompositor;
+    // KDE's appmenu protocol, when the compositor has it: each toplevel tells it
+    // where on the session bus the application's main menu is (see
+    // -[WaylandWindow updateApplicationMenu]).
+    struct wl_proxy *_appMenuManager;
+    uint32_t _appMenuManagerName, _appMenuManagerVersion;
+    // KDE's plasma-shell protocol, when the compositor has it: a toplevel that is not an application
+    // window asks it to keep the window out of task lists and switchers (xdg-shell has no way to).
+    struct wl_proxy *_plasmaShell;
+    uint32_t _plasmaShellName, _plasmaShellVersion;
+    // xdg-toplevel-icon, when the compositor has it: the application icon for every toplevel.
+    WaylandToplevelIcons *_toplevelIcons;
+    // The exported main menu; nil while the menu is drawn inside the windows.
+    WaylandAppMenu *_appMenu;
     BOOL _eglAvailable;
     struct wl_proxy *_shm;
     struct wl_proxy *_wmBase;
     struct wl_proxy *_decorationManager;
+    // wlr-layer-shell, when the compositor has it: the menu bar is a layer surface.
+    struct wl_proxy *_layerShell;
+    uint32_t _layerShellName;
     struct wl_proxy *_dataDeviceManager;
     uint32_t _compositorVersion;
 
@@ -158,6 +178,7 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     // WaylandWindows, not retained, most recently activated first.
     CFMutableArrayRef _windows;
     NSMutableArray *_afterDispatch;
+    BOOL _afterDispatchRunQueued;
 
     WaylandWindow *_pointerWindow;
     CGPoint _pointerSurfacePoint;
@@ -218,6 +239,8 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 - (uint32_t) dragSerialForEvent: (NSEvent *) event;
 - (void) consumeDragPress;
 - (void) flush;
+// Gives every window the current application icon (see WaylandToplevelIcon.h).
+- (void) updateWindowIcons;
 - (void) processPendingEvents;
 - (uint32_t) clipboardSerial;
 - (int32_t) scaleForOutput: (struct wl_proxy *) output;
@@ -225,6 +248,7 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 - (void) preferredScaleChanged: (uint32_t) scale120;
 - (void) windowScaleChanged: (WaylandWindow *) window;
 - (WaylandWindow *) popupParentForWindow: (WaylandWindow *) window;
+- (WaylandWindow *) popupParentForGenericPopup: (WaylandWindow *) window;
 - (WaylandWindow *) levelParentForWindow: (WaylandWindow *) window;
 - (uint32_t) popupGrabSerialForParent: (WaylandWindow *) parent;
 - (struct wl_proxy *) seat;
@@ -237,6 +261,7 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
                          max: (size_t) max
                      entered: (NSSet *) entered;
 - (void) unmapPopupsForParent: (WaylandWindow *) parent;
+- (void) mapPopupsWaitingForParent;
 - (void) cancelPopupMenus;
 - (void) updatePointerLock;
 - (void) releasePointerLock;
@@ -250,7 +275,15 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 - (void) windowCreated: (WaylandWindow *) window;
 - (void) windowActivated: (WaylandWindow *) window;
 - (void) windowUnmapped: (WaylandWindow *) window;
+- (void) applicationFocusMayHaveLeft;
+- (BOOL) mappingForActivation;
+- (void) mapDeferredWindows;
 - (void) windowDestroyed: (WaylandWindow *) window;
+
+// Where the main menu is exported on the session bus, for the appmenu objects
+// of the toplevels; nil while it is not exported.
+- (NSString *) applicationMenuServiceName;
+- (NSString *) applicationMenuObjectPath;
 
 - (struct wl_proxy *) newFractionalScaleForSurface: (struct wl_proxy *) surface owner: (id<WaylandFractionalScaleOwner>) owner;
 - (void)publishKeyboardLayout;

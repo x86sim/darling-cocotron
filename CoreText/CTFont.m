@@ -62,6 +62,42 @@ static id cascadeOfAttributes(CTFontDescriptorRef attributes) {
             autorelease];
 }
 
+static O2Font_freetype *copyFreeTypeFont(CTFontRef font) {
+    CGFontRef graphicsFont = CTFontCopyGraphicsFont(font, NULL);
+    if ([(id) graphicsFont isKindOfClass: [O2Font_freetype class]])
+        return (O2Font_freetype *) graphicsFont;
+    if (graphicsFont != NULL)
+        CGFontRelease(graphicsFont);
+    return nil;
+}
+
+static CTFontRef createFont(CGFontRef graphicsFont, CGFloat size);
+
+// Applies the kCTFontVariationAttribute of a descriptor to a font that is
+// owned by the caller. Returns the font itself when there is nothing to apply
+// (no variation, or a font without variation axes), else a new owned font that
+// keeps the size and the cascade list, and releases the old one.
+static CTFontRef fontWithVariationOfAttributes(CTFontRef font, CTFontDescriptorRef attributes) {
+    if (font == NULL || attributes == NULL)
+        return font;
+    NSDictionary *variation =
+            [(id) CTFontDescriptorCopyAttribute(attributes, kCTFontVariationAttribute) autorelease];
+    if (![variation isKindOfClass: [NSDictionary class]] || [variation count] == 0)
+        return font;
+    O2Font_freetype *freeType = copyFreeTypeFont(font);
+    O2Font_freetype *varied = [freeType copyWithVariation: variation];
+    [freeType release];
+    if (varied == nil)
+        return font;
+    CTFontRef result = createFont((CGFontRef) varied, CTFontGetSize(font));
+    [varied release];
+    if (result == NULL)
+        return font;
+    fontWithCascade(result, fontCascade(font));
+    CFRelease(font);
+    return result;
+}
+
 static CTFontRef createFont(CGFontRef graphicsFont, CGFloat size) {
     // A size of 0 means the default size of 12 points.
     if (size == 0)
@@ -150,11 +186,13 @@ CTFontRef CTFontCreateWithFontDescriptor(CTFontDescriptorRef descriptor, CGFloat
     CFDataRef data = KTFontDescriptorGetFontData(descriptor);
     if (data != NULL) {
         CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
-        CGFontRef graphicsFont = CGFontCreateWithDataProvider(provider);
+        CGFontRef graphicsFont = (CGFontRef) O2FontCreateWithDataProviderAndFaceIndex(
+                (O2DataProviderRef) provider, KTFontDescriptorGetFaceIndex(descriptor));
         CGDataProviderRelease(provider);
         if (graphicsFont != NULL) {
             CTFontRef result = createFont(graphicsFont, size);
             CGFontRelease(graphicsFont);
+            result = fontWithVariationOfAttributes(result, descriptor);
             return fontWithCascade(result, cascadeOfAttributes(descriptor));
         }
     }
@@ -166,6 +204,7 @@ CTFontRef CTFontCreateWithFontDescriptor(CTFontDescriptorRef descriptor, CGFloat
         return NULL;
     CTFontRef result = CTFontCreateWithName(name, size, matrix);
     CFRelease(name);
+    result = fontWithVariationOfAttributes(result, descriptor);
     return fontWithCascade(result, cascadeOfAttributes(descriptor));
 }
 
@@ -210,15 +249,97 @@ CTFontRef CTFontCreateCopyWithAttributes(CTFontRef font, CGFloat size,
         if (name != NULL) {
             CTFontRef result = CTFontCreateWithName(name, size, matrix);
             CFRelease(name);
-            if (result != NULL)
+            if (result != NULL) {
+                result = fontWithVariationOfAttributes(result, attributes);
                 return fontWithCascade(result, cascade);
+            }
         }
     }
 
     CGFontRef graphicsFont = [object copyGraphicsFont];
     CTFontRef result = createFont(graphicsFont, size);
     CGFontRelease(graphicsFont);
+    result = fontWithVariationOfAttributes(result, attributes);
     return fontWithCascade(result, cascade);
+}
+
+// Observed on macOS 26.7.3 and Mac OS X 10.14.4 (black-box, through the public API, identical): within one
+// family a copy with the italic, bold, expanded, condensed or color-glyph trait set differently from the
+// original's is looked up among the faces and gives NULL when there is none (Helvetica has no expanded,
+// condensed or color-glyph face); setting the monospace, UI-optimized, composite or class-mask bits leaves the
+// font as it is, so they are not compared. Not reproduced: the vertical trait, which the original reports in the
+// copy. Test: coretext-font-copy-with-traits-and-family.
+static const CTFontSymbolicTraits sameFamilyStyleTraits =
+        kCTFontTraitItalic | kCTFontTraitBold | kCTFontTraitExpanded | kCTFontTraitCondensed |
+        kCTFontTraitColorGlyphs;
+// GUESS: moving to another family keeps only what a face of any family can differ in, the slant
+// and the boldness (observed: Helvetica to Courier keeps the slant and bold bits, and the target family's
+// monospace trait is its own). Monospace, condensed and expanded describe a whole family, so requiring them to
+// equal the original's would find nothing across families.
+static const CTFontSymbolicTraits crossFamilyStyleTraits = kCTFontTraitItalic | kCTFontTraitBold;
+
+static CGFloat weightOfFont(CTFontRef font) {
+    CGFloat weight = 0;
+    CFDictionaryRef traits = CTFontCopyTraits(font);
+    CFNumberRef number = traits != NULL ? CFDictionaryGetValue(traits, kCTFontWeightTrait) : NULL;
+    if (number != NULL)
+        CFNumberGetValue(number, kCFNumberCGFloatType, &weight);
+    if (traits != NULL)
+        CFRelease(traits);
+    return weight;
+}
+
+// A new font of `family` whose style traits, over the bits in `compared`, are those of `wanted`,
+// or NULL when the family has no such face. A size of 0 keeps the size of the original. The
+// matrix is handed to the creation call as given: fonts here carry no matrix, so NULL, which
+// stands for the original's matrix, has nothing to preserve. The cascade list of the original is carried over to
+// the copy (observed on macOS 26.7.3 and Mac OS X 10.14.4, together with the feature settings, which fonts here do
+// not have); the variation is not.
+// GUESS: when several faces have the wanted traits (a family with Light, Regular and Medium
+// has three non-bold faces) the one whose weight trait is nearest to `targetWeight` is taken,
+// the first listed among equals. The documentation names no rule.
+static CTFontRef copyFontInFamily(CTFontRef font, CGFloat size, const CGAffineTransform *matrix,
+                                  CFStringRef family, CTFontSymbolicTraits wanted,
+                                  CTFontSymbolicTraits compared, CGFloat targetWeight)
+{
+    if (ktFont(font) == nil || family == NULL)
+        return NULL;
+    if (size == 0)
+        size = CTFontGetSize(font);
+
+    const void *keys[] = { kCTFontFamilyNameAttribute };
+    const void *values[] = { family };
+    CFDictionaryRef attributes = CFDictionaryCreate(NULL, keys, values, 1,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CTFontDescriptorRef query = CTFontDescriptorCreateWithAttributes(attributes);
+    CFRelease(attributes);
+    CFArrayRef faces = CTFontDescriptorCreateMatchingFontDescriptors(query, NULL);
+    CFRelease(query);
+    if (faces == NULL)
+        return NULL;
+
+    CTFontRef best = NULL;
+    CGFloat bestDistance = 0;
+    for (CFIndex i = 0; i < CFArrayGetCount(faces); i++) {
+        CTFontRef candidate = CTFontCreateWithFontDescriptor(
+                (CTFontDescriptorRef) CFArrayGetValueAtIndex(faces, i), size, matrix);
+        if (candidate == NULL)
+            continue;
+        CGFloat distance = weightOfFont(candidate) - targetWeight;
+        if (distance < 0)
+            distance = -distance;
+        if ((CTFontGetSymbolicTraits(candidate) & compared) != (wanted & compared) ||
+            (best != NULL && distance >= bestDistance)) {
+            CFRelease(candidate);
+            continue;
+        }
+        if (best != NULL)
+            CFRelease(best);
+        best = candidate;
+        bestDistance = distance;
+    }
+    CFRelease(faces);
+    return fontWithCascade(best, fontCascade(font));
 }
 
 CTFontRef CTFontCreateCopyWithSymbolicTraits(CTFontRef font, CGFloat size,
@@ -226,15 +347,33 @@ CTFontRef CTFontCreateCopyWithSymbolicTraits(CTFontRef font, CGFloat size,
                                              CTFontSymbolicTraits symTraitValue, 
                                              CTFontSymbolicTraits symTraitMask)
 {
-    printf("STUB %s\n", __PRETTY_FUNCTION__);
-    return nil;
+    if (ktFont(font) == nil)
+        return NULL;
+    // GUESS: the documentation gives "the value of the symbolic traits" and "the mask bits"
+    // without saying how they combine. The mask is taken to select the bits of the value that
+    // replace the original's traits; the original's other bits stay.
+    CTFontSymbolicTraits original = CTFontGetSymbolicTraits(font);
+    CTFontSymbolicTraits wanted = (original & ~symTraitMask) | (symTraitValue & symTraitMask);
+    // GUESS: a request that clears the bold trait aims at the regular weight (0.0 on the scale
+    // of kCTFontWeightTrait). Aiming at the original's weight would turn a Black face into the
+    // heaviest face that is not bold, a Semibold one. Otherwise the original's weight is kept.
+    CGFloat targetWeight = ((original & kCTFontTraitBold) && !(wanted & kCTFontTraitBold))
+            ? 0 : weightOfFont(font);
+    CFStringRef family = CTFontCopyFamilyName(font);
+    CTFontRef result = copyFontInFamily(font, size, matrix, family, wanted,
+                                        sameFamilyStyleTraits, targetWeight);
+    if (family != NULL)
+        CFRelease(family);
+    return result;
 }
 
 CTFontRef CTFontCreateCopyWithFamily(CTFontRef font, CGFloat size,
                                      const CGAffineTransform *matrix, CFStringRef family)
 {
-    printf("STUB %s\n", __PRETTY_FUNCTION__);
-    return nil;
+    if (ktFont(font) == nil)
+        return NULL;
+    return copyFontInFamily(font, size, matrix, family, CTFontGetSymbolicTraits(font),
+                            crossFamilyStyleTraits, weightOfFont(font));
 }
 
 CTFontRef CTFontCreateForString(CTFontRef currentFont, CFStringRef string, CFRange range)
@@ -355,6 +494,10 @@ CTFontDescriptorRef CTFontCopyFontDescriptor(CTFontRef font)
         [attributes setObject: cascade forKey: (NSString *) kCTFontCascadeListAttribute];
     if (objc_getAssociatedObject(object, &systemUIFontKey) != nil)
         [attributes setObject: (id) kCFBooleanTrue forKey: (NSString *) KTFontSystemUIAttribute];
+    NSDictionary *variation = (NSDictionary *) CTFontCopyVariation(font);
+    if (variation != nil)
+        [attributes setObject: variation forKey: (NSString *) kCTFontVariationAttribute];
+    [variation release];
     [name release];
     [family release];
     [traits release];
@@ -724,14 +867,42 @@ void CTFontGetVerticalTranslationsForGlyphs(CTFontRef font, const CGGlyph *glyph
 
 CFArrayRef CTFontCopyVariationAxes(CTFontRef font)
 {
-    printf("STUB %s\n", __PRETTY_FUNCTION__);
-    return nil;
+    O2Font_freetype *freeType = copyFreeTypeFont(font);
+    NSArray *axes = [freeType copyVariationAxes];
+    [freeType release];
+    if (axes == nil)
+        return NULL;
+
+    NSMutableArray *result = [[NSMutableArray alloc] init];
+    for (NSDictionary *axis in axes) {
+        NSMutableDictionary *info = [NSMutableDictionary dictionary];
+        [info setObject: [axis objectForKey: @"tag"]
+                 forKey: (NSString *) kCTFontVariationAxisIdentifierKey];
+        [info setObject: [axis objectForKey: @"minimum"]
+                 forKey: (NSString *) kCTFontVariationAxisMinimumValueKey];
+        [info setObject: [axis objectForKey: @"maximum"]
+                 forKey: (NSString *) kCTFontVariationAxisMaximumValueKey];
+        [info setObject: [axis objectForKey: @"default"]
+                 forKey: (NSString *) kCTFontVariationAxisDefaultValueKey];
+        NSString *name = [axis objectForKey: @"name"];
+        if (name != nil)
+            [info setObject: name forKey: (NSString *) kCTFontVariationAxisNameKey];
+        // Only the hidden axes carry the key.
+        if ([[axis objectForKey: @"hidden"] boolValue])
+            [info setObject: (id) kCFBooleanTrue
+                     forKey: (NSString *) kCTFontVariationAxisHiddenKey];
+        [result addObject: info];
+    }
+    [axes release];
+    return (CFArrayRef) result;
 }
 
 CFDictionaryRef CTFontCopyVariation(CTFontRef font)
 {
-    printf("STUB %s\n", __PRETTY_FUNCTION__);
-    return nil;
+    O2Font_freetype *freeType = copyFreeTypeFont(font);
+    NSDictionary *settings = [freeType copyVariationSettings];
+    [freeType release];
+    return (CFDictionaryRef) settings;
 }
 
 CFArrayRef CTFontCopyFeatures(CTFontRef font)
@@ -740,10 +911,12 @@ CFArrayRef CTFontCopyFeatures(CTFontRef font)
     return nil;
 }
 
+// The documented result is the non-default feature settings applied to the font, or NULL when the default
+// settings apply. No font made here has settings applied: creating one from a descriptor does not read the
+// descriptor's feature-settings attribute, so the default settings always apply.
 CFArrayRef CTFontCopyFeatureSettings(CTFontRef font)
 {
-    printf("STUB %s\n", __PRETTY_FUNCTION__);
-    return nil;
+    return NULL;
 }
 
 bool CTFontGetGlyphsForCharacters(CTFontRef font, const UniChar *characters,

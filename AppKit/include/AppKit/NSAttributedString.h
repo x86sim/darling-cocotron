@@ -231,6 +231,9 @@ typedef NS_ENUM(NSInteger, NSTextScalingType) {
 - (NSUInteger) lineBreakByHyphenatingBeforeIndex: (NSUInteger) index
                                      withinRange: (NSRange) range;
 - (NSUInteger) nextWordFromIndex: (NSUInteger) index forward: (BOOL) forward;
+// Deprecated by Apple in 10.11 (data detectors replace it).
+- (NSURL *) URLAtIndex: (NSUInteger) location
+        effectiveRange: (NSRangePointer) effectiveRange;
 
 #pragma mark -
 #pragma mark Calculating Ranges
@@ -264,17 +267,10 @@ typedef NS_ENUM(NSInteger, NSTextScalingType) {
 
 - (void) drawAtPoint: (NSPoint) point;
 - (void) drawInRect: (NSRect) rect;
-- (void) drawWithRect: (NSRect) rect options: (NSStringDrawingOptions) options;
-- (void) drawWithRect: (NSRect) rect
-              options: (NSStringDrawingOptions) options
-              context: (NSStringDrawingContext * _Nullable) context;
 - (NSSize) size;
 
 #pragma mark -
 #pragma mark Getting the Bounding Rectangle of Rendered Strings
-
-- (NSRect) boundingRectWithSize: (NSSize) size
-                        options: (NSStringDrawingOptions) options;
 
 #pragma mark -
 #pragma mark Getting Attribute Data

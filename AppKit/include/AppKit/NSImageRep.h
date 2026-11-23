@@ -17,6 +17,7 @@ COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
+#import <AppKit/NSGraphicsContext.h>
 #import <Foundation/NSGeometry.h>
 #import <Foundation/NSObject.h>
 
@@ -93,6 +94,16 @@ typedef NS_ENUM(NSInteger, NSImageLayoutDirection) {
 - (BOOL) draw;
 - (BOOL) drawAtPoint: (NSPoint) point;
 - (BOOL) drawInRect: (NSRect) rect;
+- (BOOL) drawInRect: (NSRect) rect
+           fromRect: (NSRect) fromRect
+          operation: (NSCompositingOperation) operation
+           fraction: (CGFloat) fraction
+     respectFlipped: (BOOL) respectFlipped
+              hints: (nullable NSDictionary<NSString *, id> *) hints;
+
+- (nullable CGImageRef) CGImageForProposedRect: (nullable NSRect *) proposedDestRect
+                                       context: (nullable NSGraphicsContext *) context
+                                         hints: (nullable NSDictionary<NSString *, id> *) hints;
 
 @end
 

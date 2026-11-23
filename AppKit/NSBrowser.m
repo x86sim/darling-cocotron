@@ -16,6 +16,7 @@ FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+#import "NSDelegateNotifications.h"
 #import <AppKit/NSApplication.h>
 #import <AppKit/NSBrowser.h>
 #import <AppKit/NSBrowserCell.h>
@@ -34,6 +35,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 @interface NSBrowser (Private)
 - (NSRect) frameOfScroller;
 @end
+
+NSString *const NSBrowserColumnConfigurationDidChangeNotification = @"NSBrowserColumnConfigurationDidChangeNotification";
 
 @implementation NSBrowser
 
@@ -423,8 +426,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 }
 
 - (void) setDelegate: delegate {
-    // check delegate validity
-    if (![delegate respondsToSelector: @selector(browser:
+    // check delegate validity; no delegate is valid
+    if (delegate != nil && ![delegate respondsToSelector: @selector(browser:
                                                createRowsForColumn:inMatrix:)])
         if (![delegate respondsToSelector: @selector(browser:
                                                    numberOfRowsInColumn:)] &&
@@ -434,7 +437,14 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
                         format: @"-[NSBrowser setDelegate:] doesn't implement "
                                 @"delegate methods"];
 
+    // The delegate is an observer of the browser's notification.
+    NSDelegateNotification notes[] = {
+        {NSBrowserColumnConfigurationDidChangeNotification, @selector(browserColumnConfigurationDidChange:)},
+        {nil, NULL}};
+
+    NSDelegateNotificationsRemove(_delegate, self, notes);
     _delegate = delegate;
+    NSDelegateNotificationsAdd(_delegate, self, notes);
 }
 
 - (void) setBackgroundColor: (NSColor *) color {
@@ -879,16 +889,12 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
     [NS_EXTRA(NSBrowser, self)->_horizontalScroller setNeedsDisplay: YES];
 }
 
+// QUIRK: the title is not drawn: on macOS 10.14 a titled browser keeps the title area (-titleFrameOfColumn:) but
+// draws nothing in it. Evidence: black-box renders on macOS 10.14.4 (tier 2): -drawTitleOfColumn:inRect: called
+// directly for a column with the title "Title" draws no pixels, and the title area of a titled browser stays
+// transparent in -cacheDisplayInRect:toBitmapImageRep:. Subclasses can still draw titles by overriding this method.
+// Test: appkit-browser-title-drawing.m
 - (void) drawTitleOfColumn: (NSInteger) column inRect: (NSRect) rect {
-    NSString *title = [self titleOfColumn: column];
-    NSSize titleSize = [title sizeWithAttributes: nil];
-    NSRect titleFrame = NSInsetRect(rect, 2, 0);
-
-    titleFrame.size.height = titleSize.height;
-    titleFrame.origin.y += floor((rect.size.height - titleSize.height) / 2);
-
-    [[self titleOfColumn: column] _clipAndDrawInRect: titleFrame
-                                      withAttributes: nil];
 }
 
 - (NSScrollView *) createScrollViewAtIndex: (NSInteger) index {

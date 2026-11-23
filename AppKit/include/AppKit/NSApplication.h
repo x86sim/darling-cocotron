@@ -26,6 +26,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSUserInterfaceLayoutDirection.h>
 #import <Foundation/NSNotification.h>
 #import <Foundation/NSRunLoop.h>
+#import <AppKit/NSAccessibilityProtocols.h>
 
 @class NSDocument;
 
@@ -175,6 +176,8 @@ typedef NSString *NSAboutPanelOptionKey NS_TYPED_ENUM;
         NSImage *_applicationIconImage;
 
         BOOL _isActive;
+        BOOL _activationPolicySet;
+        NSInteger _activationPolicy;
         BOOL _isHidden;
         BOOL _windowsNeedUpdate;
         NSDockTile *_dockTile;
@@ -188,6 +191,8 @@ typedef NSString *NSAboutPanelOptionKey NS_TYPED_ENUM;
         BOOL _windowClosedSinceTerminateCheck;
         BOOL _automaticCustomizeTouchBarMenuItemEnabled;
         BOOL _defaultHelpBookSearchEnabled;
+        // The occlusion state last reported, so a change is notified once.
+        NSApplicationOcclusionState _occlusionState;
     NS_EXTRA_IVARS_END(NSApplication)
 }
 
@@ -345,7 +350,12 @@ typedef NSString *NSAboutPanelOptionKey NS_TYPED_ENUM;
 - (void) _windowDidBecomeActive: (null_unspecified NSWindow *) window;
 - (void) _windowWillBecomeDeactive: (null_unspecified NSWindow *) window;
 - (void) _windowDidBecomeDeactive: (null_unspecified NSWindow *) window;
+- (BOOL) _mayTakeInputFocus;
+- (void) _systemFocusMovedToAnotherClient;
 
+@end
+
+@interface NSApplication (NSAccessibility) <NSAccessibility, NSAccessibilityElement>
 @end
 
 APPKIT_EXPORT __kindof NSApplication *NSApp;
@@ -398,6 +408,9 @@ APPKIT_EXPORT __kindof NSApplication *NSApp;
 - (void) applicationWillTerminate: (NSNotification *) aNotification;
 - (void) applicationWillUnhide: (NSNotification *) aNotification;
 - (void) applicationWillUpdate: (NSNotification *) aNotification;
+- (void) application: (NSApplication *) app willEncodeRestorableState: (NSCoder *) coder;
+- (void) application: (NSApplication *) app didDecodeRestorableState: (NSCoder *) coder;
+- (BOOL) applicationSupportsSecureRestorableState: (NSApplication *) app;
 
 @end
 
@@ -411,6 +424,16 @@ APPKIT_EXPORT BOOL NSPerformService(NSString *itemName,
 @interface NSApplication (NSWindowEnumeration)
 - (void) enumerateWindowsWithOptions: (NSWindowListOptions) options
                                 usingBlock: (void (NS_NOESCAPE ^)(NSWindow *window, BOOL *stop)) block;
+@end
+
+@interface NSApplication (NSWindowRestoration)
+// Asks the restoration class recorded in the window state to recreate the
+// window; NO when the state names no usable class.
+- (BOOL) restoreWindowWithIdentifier: (NSString *) identifier
+                               state: (NSCoder *) state
+                   completionHandler: (void (^)(NSWindow *_Nullable window, NSError *_Nullable error)) completionHandler;
+- (void) extendStateRestoration;
+- (void) completeStateRestoration;
 @end
 
 // Performance-test hooks; they do nothing here.

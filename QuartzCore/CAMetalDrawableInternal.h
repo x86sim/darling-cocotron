@@ -54,6 +54,8 @@ class CAMetalDrawableTexture: public Indium::PrivateTexture {
 	bool _framebufferOnly = false;
 	bool _exportsSemaphore = true;
 
+	void destroyVulkanObjects();
+
 public:
 	CAMetalDrawableTexture(CGSize size, Indium::PixelFormat pixelFormat, bool framebufferOnly, bool exportsSemaphore, std::shared_ptr<Indium::PrivateDevice> privateDevice);
 	virtual ~CAMetalDrawableTexture();
@@ -76,6 +78,7 @@ public:
 	virtual size_t arrayLength() const override;
 	virtual size_t sampleCount() const override;
 	virtual bool framebufferOnly() const override;
+	virtual Indium::TextureUsage usage() const override;
 	virtual bool allowGPUOptimizedContents() const override;
 	virtual bool shareable() const override;
 	virtual Indium::TextureSwizzleChannels swizzle() const override;

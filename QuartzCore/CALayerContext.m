@@ -106,10 +106,15 @@
 
 // A transparent or hidden root layer still has a native child window.
 - (void) setHidden: (BOOL) hidden {
-    if (hidden)
+    _hidden = hidden;
+    if (hidden) {
         [_subwindow hide];
-    else
+    } else {
         [_subwindow show];
+        // Nothing was drawn while it was hidden.
+        if (_layer != nil)
+            [self startTimerIfNeeded];
+    }
 }
 
 // The pixels beneath the subwindow were redrawn: the layers blend with them again.
@@ -333,15 +338,13 @@ static BOOL drawableSizes(CGSubWindow *subwindow, CGSize size, GLint *width,
 }
 
 - (void) _drawLayerTree: (CALayer *) layer
-                  width: (GLint) width
-                 height: (GLint) height
+                 inRect: (CGRect) rect
             topRowFirst: (BOOL) topRowFirst
 {
     [self _drawLayerTree: layer
-                   width: width
-                  height: height
-             pixelsWidth: width
-            pixelsHeight: height
+                  inRect: rect
+             pixelsWidth: (GLsizei) rect.size.width
+            pixelsHeight: (GLsizei) rect.size.height
              topRowFirst: topRowFirst];
 }
 
@@ -350,6 +353,21 @@ static BOOL drawableSizes(CGSubWindow *subwindow, CGSize size, GLint *width,
 - (void) _drawLayerTree: (CALayer *) layer
                   width: (GLint) width
                  height: (GLint) height
+            pixelsWidth: (GLsizei) pixelsWidth
+           pixelsHeight: (GLsizei) pixelsHeight
+            topRowFirst: (BOOL) topRowFirst
+{
+    [self _drawLayerTree: layer
+                  inRect: CGRectMake(0, 0, width, height)
+             pixelsWidth: pixelsWidth
+            pixelsHeight: pixelsHeight
+             topRowFirst: topRowFirst];
+}
+
+// The projection covers rect, in the coordinates of the tree's root layer's
+// superlayer, and the viewport the given number of pixels.
+- (void) _drawLayerTree: (CALayer *) layer
+                 inRect: (CGRect) rect
             pixelsWidth: (GLsizei) pixelsWidth
            pixelsHeight: (GLsizei) pixelsHeight
             topRowFirst: (BOOL) topRowFirst
@@ -363,9 +381,11 @@ static BOOL drawableSizes(CGSubWindow *subwindow, CGSize size, GLint *width,
     // Framebuffer row 0 is the bottom of the picture on a window. Pixels read
     // back into memory whose first row is the top are drawn upside down.
     if (topRowFirst)
-        glOrtho(0, width, height, 0, -1, 1);
+        glOrtho(CGRectGetMinX(rect), CGRectGetMaxX(rect),
+                CGRectGetMaxY(rect), CGRectGetMinY(rect), -1, 1);
     else
-        glOrtho(0, width, 0, height, -1, 1);
+        glOrtho(CGRectGetMinX(rect), CGRectGetMaxX(rect),
+                CGRectGetMinY(rect), CGRectGetMaxY(rect), -1, 1);
 
     GLsizei i = 0;
     GLuint deleteIds[[_deleteTextureIds count]];
@@ -383,8 +403,12 @@ static BOOL drawableSizes(CGSubWindow *subwindow, CGSize size, GLint *width,
     [self prepareMetalLayersInLayerTree: layer];
 
     // A subwindow that cannot blend with its parent supplies what is beneath it.
+    // One that can (no backdrop) is cleared to transparent, so the window shows
+    // through where the layers leave it uncovered or partly transparent.
     CGImageRef backdrop = [_subwindow createBackdropImage];
     [_renderer _setBackdropImage: backdrop];
+    if (backdrop == NULL)
+        [_renderer _setClearsToTransparent: YES];
     CGImageRelease(backdrop);
 
     [_renderer render];
@@ -430,6 +454,15 @@ static BOOL layerTreeNeedsAnotherFrame(CALayer *layer) {
 }
 
 - (void) timer: (NSTimer *) timer {
+    // Nothing is drawn or presented for a hidden context; showing it again
+    // starts the timer.
+    if (_hidden) {
+        _renderRequested = NO;
+        [_timer invalidate];
+        [_timer release];
+        _timer = nil;
+        return;
+    }
     // Consume requests for this frame before callbacks can request another.
     _renderRequested = NO;
     [_renderer beginFrameAtTime: CACurrentMediaTime() timeStamp: NULL];

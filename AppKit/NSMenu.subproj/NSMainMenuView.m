@@ -33,7 +33,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 @implementation NSMainMenuView
 
 + (NSFont *) menuFont {
-    return [NSFont menuFontOfSize: 0];
+    return [NSFont menuBarFontOfSize: 0];
 }
 
 + (CGFloat) menuHeight {
@@ -459,6 +459,7 @@ static void drawSunkenBorder(NSRect rect) {
         NSMenuItem *item = [items objectAtIndex: _selectedItemIndex];
 
         if ([item hasSubmenu]) {
+            [[item submenu] _updateWithoutSubmenus];
             if ([[[item submenu] itemArray] count] > 0) {
                 NSMenuWindow *branch =
                         [[NSMenuWindow alloc] initWithMenu: [item submenu]];

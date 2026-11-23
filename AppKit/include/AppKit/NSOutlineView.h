@@ -69,6 +69,8 @@ APPKIT_EXPORT NSString *const NSOutlineViewShowHideButtonKey;
         BOOL _indentationMarkerFollowsCell;
         BOOL _autoresizesOutlineColumn;
         BOOL _autosaveExpandedItems;
+        id _proposedDropItem;  // not retained
+        NSInteger _proposedDropChildIndex;
         CGFloat _editingCellPadding;
     NS_EXTRA_IVARS_END(NSOutlineView)
 }
@@ -143,6 +145,15 @@ APPKIT_EXPORT NSString *const NSOutlineViewShowHideButtonKey;
         willDisplayOutlineCell: (id) cell
                 forTableColumn: (nullable NSTableColumn *) tableColumn
                           item: (id) item;
+@optional
+- (nullable NSTableRowView *) outlineView: (NSOutlineView *) outlineView rowViewForItem: (id) item;
+- (void) outlineView: (NSOutlineView *) outlineView didAddRowView: (NSTableRowView *) rowView forRow: (NSInteger) row;
+- (void) outlineView: (NSOutlineView *) outlineView didRemoveRowView: (NSTableRowView *) rowView forRow: (NSInteger) row;
+- (nullable NSView *) outlineView: (NSOutlineView *) outlineView
+               viewForTableColumn: (nullable NSTableColumn *) tableColumn
+                             item: (id) item;
+- (BOOL) outlineView: (NSOutlineView *) outlineView isGroupItem: (id) item;
+- (BOOL) outlineView: (NSOutlineView *) outlineView shouldShowOutlineCellForItem: (id) item;
 @end
 
 @interface NSObject (NSOutlineView_notifications)

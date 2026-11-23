@@ -28,6 +28,8 @@
 #import <AppKit/NSPopUpWindow.h>
 #import <AppKit/NSRaise.h>
 #import <AppKit/NSWindow.h>
+#import "../NSWindow-Private.h"
+#import "../DarlingWindowPresentation.h"
 #import <Foundation/NSBundle.h>
 #import <Foundation/NSException.h>
 #import <Foundation/NSMutableData.h>
@@ -444,86 +446,56 @@ static void preeditCaretCallback(XIC ic, XPointer clientData, XPointer callData)
     return ret;
 }
 
-static NSData *makeWindowIcon() {
-    static NSMutableData *res;
+// The edge lengths the window icon is offered at. The window manager picks the one that fits its
+// title bar, task bar or switcher best.
+static const int WindowIconSides[] = {16, 32, 48, 64, 128, 256};
 
-    if (res != nil)
-        return res;
+// _NET_WM_ICON: for each size the width and height, then width * height ARGB pixels (not premultiplied),
+// every value in a long as the property is a 32 bit format. nil when the application has no icon.
+static NSData *makeWindowIcon(X11Display *display) {
+    NSMutableData *res = nil;
 
-    // Figure out the path.
-    NSBundle *bundle = [NSBundle mainBundle];
-    NSString *name = [bundle objectForInfoDictionaryKey: @"CFBundleIconFile"];
-    if (name == nil || [name length] == 0)
-        return nil;
-    NSString *path = [bundle pathForImageResource: name];
-    if (path == nil) {
-        NSLog(@"Cannot find an icon file named %@", name);
-        return nil;
-    }
-    NSURL *url = [NSURL fileURLWithPath: path];
+    for (size_t i = 0; i < sizeof(WindowIconSides) / sizeof(WindowIconSides[0]); i++) {
+        int side = WindowIconSides[i];
+        NSData *pixels = [display applicationIconPixelsOfSide: side];
+        if (pixels == nil)
+            return nil;
+        if (res == nil)
+            res = [NSMutableData data];
 
-    O2ImageSource *imageSource = [O2ImageSource newImageSourceWithURL: url
-                                                              options: nil];
-    if (imageSource == nil) {
-        NSLog(@"Cannot parse the icon");
-        return nil;
-    }
-
-    res = [[NSMutableData alloc] initWithCapacity: 32 * 32 * 4 + 2];
-    O2ColorSpace *colorSpace = O2ColorSpaceCreateDeviceRGB();
-
-    // Go over the images, turning them into the required format
-    // and appending them to res.
-    for (NSUInteger i = 0; i < [imageSource count]; i++) {
-
-        O2Image *image = [imageSource createImageAtIndex: i options: nil];
-        NSUInteger width = O2ImageGetWidth(image);
-        NSUInteger height = O2ImageGetHeight(image);
-
-        // Render the image in ARGB.
-        O2BitmapContext *context = (O2BitmapContext *) O2BitmapContextCreate(
-                NULL, width, height, 8, width * 4, colorSpace,
-                kO2ImageAlphaPremultipliedFirst | kO2BitmapByteOrder32Host);
-
-        [context drawImage: image inRect: O2RectMake(0, 0, width, height)];
-        int *imageData = O2BitmapContextGetData(context);
-
-        // Convert to the format accepted by Xlib.
-        NSMutableData *data =
-                [NSMutableData dataWithLength: width * height * sizeof(long)];
-        long *dataPtr = (long *) [data mutableBytes];
-        int count = width * height;
-        for (int i = 0; i < count; i++) {
-            dataPtr[i] = imageData[i];
+        long header[2] = {side, side};
+        [res appendBytes: header length: sizeof(header)];
+        NSMutableData *data = [NSMutableData dataWithLength: (size_t) side * side * sizeof(long)];
+        long *out = (long *) [data mutableBytes];
+        const uint32_t *in = (const uint32_t *) [pixels bytes];
+        for (int p = 0; p < side * side; p++) {
+            uint32_t argb = in[p];
+            uint32_t alpha = argb >> 24;
+            if (alpha != 0 && alpha != 255) {
+                uint32_t red = MIN(255u, ((argb >> 16) & 0xff) * 255 / alpha);
+                uint32_t green = MIN(255u, ((argb >> 8) & 0xff) * 255 / alpha);
+                uint32_t blue = MIN(255u, (argb & 0xff) * 255 / alpha);
+                argb = (alpha << 24) | (red << 16) | (green << 8) | blue;
+            }
+            out[p] = argb;
         }
-
-        struct {
-            long w, h;
-        } size = {width, height};
-        [res appendBytes: &size length: sizeof(size)];
         [res appendData: data];
-
-        [context release];
-        [image release];
     }
-
-    [colorSpace release];
-    [imageSource release];
-
     return res;
 }
 
+// Sets _NET_WM_ICON from the application icon, or removes it when there is none (so the window manager
+// falls back to its own choice).
 - (void) setWindowIcon {
+    Atom property = XInternAtom(_display, "_NET_WM_ICON", False);
+    NSData *data = makeWindowIcon((X11Display *) [NSDisplay currentDisplay]);
 
-    NSData *data = makeWindowIcon();
-
-    if (data == nil)
+    if (data == nil) {
+        XDeleteProperty(_display, _window, property);
         return;
-
-    XChangeProperty(
-            _display, _window, XInternAtom(_display, "_NET_WM_ICON", False),
-            XInternAtom(_display, "CARDINAL", False), 32, PropModeReplace,
-            [data bytes], [data length] / sizeof(long));
+    }
+    XChangeProperty(_display, _window, property, XInternAtom(_display, "CARDINAL", False), 32, PropModeReplace,
+                    [data bytes], [data length] / sizeof(long));
 }
 
 - (instancetype) initWithDelegate: (NSWindow *) delegate {
@@ -572,7 +544,7 @@ static NSData *makeWindowIcon() {
     // receives keyboard focus from a compositor and cannot be made fullscreen.
     // The menu bar window is a dock window: the window manager has to manage
     // it for its strut to count.
-    _dock = [delegate isKindOfClass: [X11MenuBarWindow class]];
+    _dock = [delegate isKindOfClass: [NSMenuBarWindow class]];
     // Menu and pop-up windows are panels, but they are the first kind named
     // above: a managed window would take the input focus from the window the
     // menu belongs to when it is clicked, and the application would see
@@ -582,8 +554,12 @@ static NSData *makeWindowIcon() {
     BOOL isMenuWindow = [delegate isKindOfClass: [NSMenuWindow class]] ||
                         [delegate isKindOfClass: [NSPopUpWindow class]];
     _menuWindow = isMenuWindow;
+    // Borderless means no frame of any kind; a miniaturizable or closable bit alone does not give a
+    // window a frame, so a pop-up created with such a mask is as borderless as one with none.
+    BOOL borderless = (_styleMask & ~(NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskClosable)) ==
+                      NSBorderlessWindowMask;
     xattr.override_redirect =
-            (_styleMask == NSBorderlessWindowMask && !_dock &&
+            (borderless && !_dock &&
              (isMenuWindow || (!isPanel && ![delegate canBecomeKeyWindow])))
                     ? True
                     : False;
@@ -653,40 +629,7 @@ static NSData *makeWindowIcon() {
     else
         XSetWindowBackgroundPixmap(_display, _window, None);
 
-    _isModal = [delegate isSheet] || [NSApp modalWindow] == delegate;
-    // FIXME: There should be no need for this.
-    _isModal |= [delegate isKindOfClass: NSClassFromString(@"NSSavePanel")];
-
-    const char *windowType;
-    BOOL isTransient = YES;
-    if (_isModal) {
-        windowType = "_NET_WM_WINDOW_TYPE_DIALOG";
-    } else if (_dock) {
-        windowType = "_NET_WM_WINDOW_TYPE_DOCK";
-        isTransient = NO;
-    } else if ([delegate isKindOfClass: [NSMenuWindow class]]) {
-        // EWMH: _MENU is for torn-off managed windows; the menus of a menu bar
-        // are dropdown menus, which are typically unmanaged.
-        windowType = "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU";
-    } else if (isMenuWindow) {
-        windowType = "_NET_WM_WINDOW_TYPE_POPUP_MENU";
-    } else if (isPanel) {
-        windowType = "_NET_WM_WINDOW_TYPE_UTILITY";
-    } else {
-        windowType = "_NET_WM_WINDOW_TYPE_NORMAL";
-        isTransient = NO;
-    }
-    long windowTypeAtom = (long) XInternAtom(_display, windowType, False);
-    XChangeProperty(_display, _window,
-                    XInternAtom(_display, "_NET_WM_WINDOW_TYPE", False),
-                    XA_ATOM, 32, PropModeReplace,
-                    (const unsigned char *) &windowTypeAtom, 1);
-
-    if (isTransient && [NSApp mainWindow]) {
-        X11Window *mainWindow =
-                (X11Window *) [[NSApp mainWindow] platformWindow];
-        XSetTransientForHint(_display, _window, [mainWindow windowHandle]);
-    }
+    [self updateWindowManagerHints];
 
     [self createXInputContext];
 
@@ -702,6 +645,132 @@ static NSData *makeWindowIcon() {
     [self setWindowIcon];
 
     return YES;
+}
+
+// What the window manager is told about the window, from what the window is (see
+// DarlingWindowPresentation.h for the rule and the documentation it rests on): its type, whether it
+// is listed in a task bar or pager, which window it belongs to, whether it takes the input focus,
+// and that it is positioned by the application. Asked at creation and again just before each
+// mapping, as a child window is attached and a window becomes the main window after it was created.
+// A window manager reads these when the window is mapped, and a window whose properties change
+// while it is mapped is not asked to move or restack.
+- (void) updateWindowManagerHints {
+    NSWindow *delegate = _delegate;
+    BOOL isPanel = [delegate isKindOfClass: [NSPanel class]];
+    BOOL isMenu = [delegate isKindOfClass: [NSMenuWindow class]];
+    BOOL isPopUp = [delegate isKindOfClass: [NSPopUpWindow class]];
+    DarlingWindowPresentation presentation = DarlingWindowPresentationApplication;
+    if (!_dock && [delegate respondsToSelector: @selector(_windowPresentation)])
+        presentation = (DarlingWindowPresentation) [delegate _windowPresentation];
+    BOOL canBecomeKey = [delegate canBecomeKeyWindow];
+
+    _isModal = [delegate isSheet] || [NSApp modalWindow] == delegate;
+    // FIXME: There should be no need for this.
+    _isModal |= [delegate isKindOfClass: NSClassFromString(@"NSSavePanel")];
+
+    const char *windowType;
+    BOOL isTransient = YES;
+    if (_isModal) {
+        windowType = "_NET_WM_WINDOW_TYPE_DIALOG";
+    } else if (_dock) {
+        windowType = "_NET_WM_WINDOW_TYPE_DOCK";
+        isTransient = NO;
+    } else if (isMenu) {
+        // EWMH: _MENU is for torn-off managed windows; the menus of a menu bar
+        // are dropdown menus, which are typically unmanaged.
+        windowType = "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU";
+    } else if (isPopUp) {
+        windowType = "_NET_WM_WINDOW_TYPE_POPUP_MENU";
+    } else if (presentation == DarlingWindowPresentationPopup) {
+        // A tool tip never takes the focus and does not react to the mouse; any other pop-up is a
+        // pop-up menu to the window manager.
+        windowType = !canBecomeKey && [delegate ignoresMouseEvents] ? "_NET_WM_WINDOW_TYPE_TOOLTIP"
+                                                                    : "_NET_WM_WINDOW_TYPE_POPUP_MENU";
+    } else if (isPanel) {
+        windowType = "_NET_WM_WINDOW_TYPE_UTILITY";
+    } else if (presentation == DarlingWindowPresentationAuxiliary) {
+        windowType = "_NET_WM_WINDOW_TYPE_NORMAL";
+    } else {
+        windowType = "_NET_WM_WINDOW_TYPE_NORMAL";
+        isTransient = NO;
+    }
+    long windowTypeAtom = (long) XInternAtom(_display, windowType, False);
+    XChangeProperty(_display, _window,
+                    XInternAtom(_display, "_NET_WM_WINDOW_TYPE", False),
+                    XA_ATOM, 32, PropModeReplace,
+                    (const unsigned char *) &windowTypeAtom, 1);
+
+    _skipTaskbar = !_dock && presentation != DarlingWindowPresentationApplication;
+
+    // The window a window belongs to: the one it is attached to as a child window, else the
+    // application's main window. A window must not become its own ancestor.
+    X11Window *parent = nil;
+    if (isTransient) {
+        NSWindow *candidates[3] = {[delegate parentWindow], [NSApp mainWindow], [NSApp keyWindow]};
+        for (int i = 0; i < 3 && parent == nil; i++) {
+            X11Window *platform = (X11Window *) [candidates[i] platformWindow];
+            if (![platform isKindOfClass: [X11Window class]] || platform == self || platform->_window == 0)
+                continue;
+            const void *ancestors[16];
+            int count = 0;
+            for (X11Window *up = platform->_transientParent; up != nil && count < 16; up = up->_transientParent)
+                ancestors[count++] = up;
+            if (DarlingWindowParentAllowed(self, platform, ancestors, count))
+                parent = platform;
+        }
+    }
+    if (parent != _transientParent) {
+        [parent retain];
+        [_transientParent release];
+        _transientParent = parent;
+    }
+    if (parent != nil)
+        XSetTransientForHint(_display, _window, parent->_window);
+    else
+        XDeleteProperty(_display, _window, XA_WM_TRANSIENT_FOR);
+
+    // Whether the window takes the input focus when the window manager maps it (ICCCM 4.1.7). A
+    // window that is not an application window, or one of an application that is not active, is
+    // not given the focus by being shown either: the user time 0 says no user action caused it
+    // (EWMH _NET_WM_USER_TIME). Making it the key window
+    // asks for the focus explicitly (-requestInputFocus).
+    XWMHints hints = {0};
+    hints.flags = InputHint;
+    hints.input = canBecomeKey ? True : False;
+    XSetWMHints(_display, _window, &hints);
+    Atom userTime = XInternAtom(_display, "_NET_WM_USER_TIME", False);
+    // An application that is not active does not take the focus by showing a window either.
+    if (!_dock && (presentation != DarlingWindowPresentationApplication || ![NSApp _mayTakeInputFocus])) {
+        unsigned long zero = 0;
+        XChangeProperty(_display, _window, userTime, XA_CARDINAL, 32, PropModeReplace,
+                        (const unsigned char *) &zero, 1);
+    } else {
+        XDeleteProperty(_display, _window, userTime);
+    }
+    [self updateSizeHints: _styleMask];
+}
+
+// The window's presentation can change while it is on screen (its collection behavior): tell the window
+// manager whether the window is listed in the task bar and pager now.
+- (void) presentationChanged {
+    if (!_mapped || _window == 0 || _dock)
+        return;
+    BOOL wasSkipping = _skipTaskbar;
+    [self updateWindowManagerHints];
+    if (_skipTaskbar == wasSkipping)
+        return;
+    XEvent event = {0};
+    event.xclient.type = ClientMessage;
+    event.xclient.window = _window;
+    event.xclient.message_type = XInternAtom(_display, "_NET_WM_STATE", False);
+    event.xclient.format = 32;
+    event.xclient.data.l[0] = _skipTaskbar ? 1 : 0; // add or remove
+    event.xclient.data.l[1] = (long) XInternAtom(_display, "_NET_WM_STATE_SKIP_TASKBAR", False);
+    event.xclient.data.l[2] = (long) XInternAtom(_display, "_NET_WM_STATE_SKIP_PAGER", False);
+    event.xclient.data.l[3] = 1; // source indication: application
+    XSendEvent(_display, DefaultRootWindow(_display), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &event);
+    XFlush(_display);
 }
 
 - (void) dealloc {
@@ -732,11 +801,20 @@ static NSData *makeWindowIcon() {
         sh->min_height = sh->max_height = device.height;
     }
 
-    // An untitled window that is managed (a borderless game or custom-chrome window)
-    // positions itself: say so, or a window manager may place it as it likes
-    // (ICCCM 4.1.2.3).
-    if (!_overrideRedirect && !(mask & NSWindowStyleMaskTitled))
+    // AppKit always gives a window an explicit frame, so every managed window positions itself:
+    // say so, or a window manager may place it as it likes, typically in the middle of the screen
+    // or over its parent (ICCCM 4.1.2.3).
+    if (!_overrideRedirect)
         sh->flags |= USPosition | PPosition;
+
+    // The frame is the client window's own rectangle, so a move must put the
+    // client window, not the window manager's frame around it, where the frame
+    // says (ICCCM 4.1.2.3, StaticGravity); with the default NorthWestGravity a
+    // decorated window lands lower and to the right by the size of its frame.
+    if (!_overrideRedirect) {
+        sh->flags |= PWinGravity;
+        sh->win_gravity = StaticGravity;
+    }
 
     XSetWMSizeHints(_display, _window, sh, XA_WM_NORMAL_HINTS);
     XFree(sh);
@@ -764,8 +842,12 @@ static NSData *makeWindowIcon() {
 
 - (void) requestFullscreen: (BOOL) fullscreen force: (BOOL) force {
     if (!_mapped) {
-        long states[2];
+        long states[4];
         int states_cnt = 0;
+        if (_skipTaskbar) {
+            states[states_cnt++] = (long) XInternAtom(_display, "_NET_WM_STATE_SKIP_TASKBAR", False);
+            states[states_cnt++] = (long) XInternAtom(_display, "_NET_WM_STATE_SKIP_PAGER", False);
+        }
         if (_isModal) {
             states[states_cnt++] =
                     (long) XInternAtom(_display, "_NET_WM_STATE_MODAL", False);
@@ -793,6 +875,18 @@ static NSData *makeWindowIcon() {
     if (event->atom != XInternAtom(_display, "_NET_WM_STATE", False))
         return;
     _miniaturizedKnown = NO;
+    // The window manager may have hidden or restored the window (_NET_WM_STATE_HIDDEN),
+    // whoever asked: tell the delegate when the state differs from the last one told.
+    BOOL miniaturized = [self isMiniaturized];
+    if (miniaturized != _miniaturizedReported) {
+        _miniaturizedReported = miniaturized;
+        SEL changed = miniaturized ? @selector(platformWindowMiniaturized:)
+                                   : @selector(platformWindowDeminiaturized:);
+        if ([_delegate respondsToSelector: changed])
+            [_delegate performSelector: changed withObject: self];
+    }
+    if ([_delegate respondsToSelector: @selector(platformWindowOcclusionChanged:)])
+        [_delegate platformWindowOcclusionChanged: self];
     if (_mapped) {
         _fullscreenRequested = X11FullscreenIsSet(_display, _window);
         [self updateLayerPresentationHints];
@@ -876,38 +970,51 @@ static NSData *makeWindowIcon() {
     [self updateLayerPresentationHints];
 }
 
-// A window gets the window manager's full frame (with a title bar) when its
-// style mask has NSWindowStyleMaskTitled or NSWindowStyleMaskResizable; a mask
-// with neither bit asks for no frame. The mask is passed in rather than read
-// from _styleMask because -setStyleMask: hands the new mask here before it
-// stores it.
-//
-// Platform discrepancy: Mac OS X 10.14 treats a Resizable mask without Titled
-// (including Borderless|Resizable) like a titled one: it adds a 22 pt title
-// bar and the window can become key. macOS 26 shows no title bar for such
-// windows and they cannot become key. We follow 10.14.
+// A window gets the window manager's full frame (with a title bar) when it
+// has a title bar (see -[NSWindow _hasTitlebarForStyleMask:]: a titled
+// window, or a resizable one in a program built against an old SDK); other
+// masks ask for no frame. The mask is passed in rather than read from
+// _styleMask because -setStyleMask: hands the new mask here before it stores
+// it.
 - (void) updateDecorationsForStyleMask: (NSUInteger) mask {
-    // A full-size content view with a transparent title bar shows no title bar at all: the content
-    // is all there is (the application draws its own header), so the window manager's frame would
-    // be a second title bar on top of it.
-    BOOL titlebarInvisible = (mask & NSWindowStyleMaskFullSizeContentView) && [_delegate titlebarAppearsTransparent];
+    // A window that shows nothing of a title bar of its own (see NSWindow) has the content as all
+    // there is (the application draws its own header), so the window manager's frame would be a
+    // second title bar on top of it.
+    BOOL titlebarInvisible = [self hasInvisibleTitlebarForStyleMask: mask];
 
-    if ((mask & (NSWindowStyleMaskTitled | NSWindowStyleMaskResizable)) && !_invisibleWithoutCompositor &&
-        !titlebarInvisible)
+    if ([self hasTitlebarForStyleMask: mask] && !_invisibleWithoutCompositor && !titlebarInvisible)
         XDeleteProperty(_display, _window,
                         XInternAtom(_display, "_MOTIF_WM_HINTS", False));
     else
         [[self class] removeDecorationForWindow: _window onDisplay: _display];
-    _chromeless = titlebarInvisible && (mask & NSWindowStyleMaskTitled) != 0;
+    BOOL chromeless = titlebarInvisible && (mask & NSWindowStyleMaskTitled) != 0;
+    if (_window != 0 && chromeless != _chromeless) {
+        _chromeless = chromeless;
+        // Whether the window positions itself depends on it.
+        [self updateSizeHints: mask];
+    }
+    _chromeless = chromeless;
     [self updateWindowShape];
 }
 
+- (BOOL) hasTitlebarForStyleMask: (NSUInteger) mask {
+    if ([_delegate respondsToSelector: @selector(_hasTitlebarForStyleMask:)])
+        return [(NSWindow *) _delegate _hasTitlebarForStyleMask: mask];
+    return (mask & NSWindowStyleMaskTitled) != 0;
+}
+
+- (BOOL) hasInvisibleTitlebarForStyleMask: (NSUInteger) mask {
+    return [_delegate respondsToSelector: @selector(_hasInvisibleTitlebarForStyleMask:)] &&
+           [(NSWindow *) _delegate _hasInvisibleTitlebarForStyleMask: mask];
+}
+
 // Corner radius, in points, of a window that has no frame of its own to be drawn by the window manager.
-// QUIRK: macOS draws such a window (a titled window with a full-size content view and a transparent title
-// bar) with rounded corners of about 5 points, a thin outline and a shadow; the window manager draws none of
-// them for a window it was asked not to decorate. The corners are cut with the SHAPE extension and the outline
-// is drawn into the window (-flushBuffer), neither of which needs a compositor; the shadow can only come from
-// a compositor and is not drawn. Evidence: black-box observation of such windows on macOS 10.14.4 (tier 2).
+// QUIRK: macOS draws such a window (a titled window that shows no title bar of its own, see
+// -[NSWindow _hasInvisibleTitlebarForStyleMask:]) with rounded corners of about 5 points, a thin outline and
+// a shadow; the window manager draws none of them for a window it was asked not to decorate. The corners are
+// cut with the SHAPE extension and the outline is drawn into the window (-flushBuffer), neither of which needs
+// a compositor; the shadow can only come from a compositor and is not drawn. Evidence: black-box observation
+// of such windows on macOS 10.14.4 (tier 2).
 // Test: tests/x11-chromeless-corners.sh (shape of the window), tests/x11-rounded-shape.c (the shape).
 static const int X11ChromelessCornerRadius = 5;
 
@@ -983,8 +1090,6 @@ static const int X11ChromelessCornerRadius = 5;
 }
 
 - (void) setStyleMask: (NSUInteger) mask {
-    NSLog(@"X11Window setStyleMask: 0x%lx\n", (unsigned long) mask);
-
     [self setStyleMaskInternal: mask force: NO];
 
     _styleMask = mask;
@@ -1102,6 +1207,8 @@ static const int X11ChromelessCornerRadius = 5;
 
 - (void) ensureMapped {
     if (!_mapped) {
+        // What the window is can have changed since it was created or last shown.
+        [self updateWindowManagerHints];
         // A withdrawn window loses _NET_WM_STATE (EWMH), so the window has to say
         // again, before it is mapped, what it is: fullscreen if it covers a monitor,
         // and modal, which requestFullscreen: writes as well.
@@ -1266,6 +1373,8 @@ static const int X11ChromelessCornerRadius = 5;
 
     [_delegate platformWindowDidInvalidateCGContext: self];
     _delegate = nil;
+    [_transientParent release];
+    _transientParent = nil;
 
     [_caContext release];
     _caContext = nil;
@@ -1467,6 +1576,7 @@ static const int X11ChromelessCornerRadius = 5;
 - (void) hideWindow {
     XUnmapWindow(_display, _window);
     _mapped = NO;
+    _occluded = NO;
     _miniaturizedKnown = NO;
     if (_menuWindow)
         [(X11Display *) [NSDisplay currentDisplay] menuWindowUnmapped: self];
@@ -1479,6 +1589,17 @@ static const int X11ChromelessCornerRadius = 5;
     _keyRequested = NO;
 }
 
+// Stacks this window directly above or below another top-level window. With a window manager the two client
+// windows live in frames of their own and are not siblings, so a plain stacking request naming the other window
+// as sibling is a BadMatch; XReconfigureWMWindow makes the ICCCM request for that case (a ConfigureRequest sent
+// to the root window, which the window manager carries out for the frames).
+- (void) stackRelativeToWindow: (Window) sibling mode: (int) mode {
+    XWindowChanges changes;
+    changes.sibling = sibling;
+    changes.stack_mode = mode;
+    XReconfigureWMWindow(_display, _window, DefaultScreen(_display), CWSibling | CWStackMode, &changes);
+}
+
 - (void) placeAboveWindow: (NSInteger) otherNumber {
     X11Window *other = [X11Window windowWithWindowNumber: otherNumber];
     [self ensureMappedIfVisible];
@@ -1486,8 +1607,7 @@ static const int X11ChromelessCornerRadius = 5;
     if (!other) {
         XRaiseWindow(_display, _window);
     } else {
-        Window w[2] = {_window, other->_window};
-        XRestackWindows(_display, w, 2);
+        [self stackRelativeToWindow: other->_window mode: Above];
     }
     [self restackForLevels];
 }
@@ -1499,8 +1619,7 @@ static const int X11ChromelessCornerRadius = 5;
     if (!other) {
         XLowerWindow(_display, _window);
     } else {
-        Window w[2] = {other->_window, _window};
-        XRestackWindows(_display, w, 1);
+        [self stackRelativeToWindow: other->_window mode: Below];
     }
 }
 
@@ -1669,12 +1788,68 @@ BOOL X11WindowManagerIsRunning(Display *display) {
     XFlush(_display);
 }
 
+// Whether the window manager lists the atom in _NET_SUPPORTED on the root window (EWMH).
+static BOOL X11WindowManagerSupports(Display *display, const char *name) {
+    Atom wanted = XInternAtom(display, name, False);
+    Atom type;
+    int format;
+    unsigned long count, after;
+    unsigned char *data = NULL;
+    BOOL found = NO;
+    if (XGetWindowProperty(display, DefaultRootWindow(display),
+                           XInternAtom(display, "_NET_SUPPORTED", False), 0, 4096, False, XA_ATOM,
+                           &type, &format, &count, &after, &data) == Success &&
+        data != NULL && type == XA_ATOM && format == 32) {
+        Atom *atoms = (Atom *) data;
+        for (unsigned long i = 0; i < count && !found; i++)
+            found = atoms[i] == wanted;
+    }
+    if (data != NULL)
+        XFree(data);
+    return found;
+}
+
+// -[NSWindow performWindowDragWithEvent:]: the window manager moves the window
+// for as long as the left button stays down (EWMH _NET_WM_MOVERESIZE). The
+// pointer grab the press gave this client is released first, as EWMH asks, so
+// the button release goes to the window manager. NO when the window manager
+// cannot do it, the window is not managed, or the button is already up.
+- (BOOL) moveByWindowManagerForEvent: (NSEvent *) event {
+    if (_window == 0 || _overrideRedirect ||
+        !X11WindowManagerSupports(_display, "_NET_WM_MOVERESIZE"))
+        return NO;
+
+    Window root, child;
+    int rootX, rootY, winX, winY;
+    unsigned int mask = 0;
+    if (!XQueryPointer(_display, _window, &root, &child, &rootX, &rootY, &winX, &winY, &mask) ||
+        !(mask & Button1Mask))
+        return NO;
+
+    XUngrabPointer(_display, CurrentTime);
+    XEvent message = {0};
+    message.xclient.type = ClientMessage;
+    message.xclient.window = _window;
+    message.xclient.message_type = XInternAtom(_display, "_NET_WM_MOVERESIZE", False);
+    message.xclient.format = 32;
+    message.xclient.data.l[0] = rootX;
+    message.xclient.data.l[1] = rootY;
+    message.xclient.data.l[2] = 8; // _NET_WM_MOVERESIZE_MOVE
+    message.xclient.data.l[3] = Button1;
+    message.xclient.data.l[4] = 1; // source indication: application
+    XSendEvent(_display, root, False, SubstructureRedirectMask | SubstructureNotifyMask, &message);
+    XFlush(_display);
+    return YES;
+}
+
 - (void) miniaturize {
     XIconifyWindow(_display, _window, DefaultScreen(_display));
 }
 
+// ICCCM: a client asks to leave the iconic state by mapping its window again (raising an iconified
+// window does not restore it).
 - (void) deminiaturize {
-    XRaiseWindow(_display, _window);
+    XMapRaised(_display, _window);
 }
 
 // NSWindow asks this of every window on each pass of the event loop, and
@@ -1686,6 +1861,26 @@ BOOL X11WindowManagerIsRunning(Display *display) {
         _miniaturizedKnown = YES;
     }
     return _miniaturized;
+}
+
+- (BOOL) isOccluded {
+    return _occluded;
+}
+
+- (BOOL) noteConfigureGeometryChanged: (XConfigureEvent *) event {
+    if (_configureKnown && event->x == _configureX && event->y == _configureY &&
+        event->width == _configureWidth && event->height == _configureHeight)
+        return NO;
+    _configureKnown = YES;
+    _configureX = event->x;
+    _configureY = event->y;
+    _configureWidth = event->width;
+    _configureHeight = event->height;
+    return YES;
+}
+
+- (void) setOccluded: (BOOL) occluded {
+    _occluded = occluded;
 }
 
 - (BOOL) readMiniaturized {
@@ -1771,6 +1966,19 @@ BOOL X11WindowManagerIsRunning(Display *display) {
     CGLFlushDrawable(_cglContext);
 
     CGLSetCurrentContext(prevContext);
+}
+
+- (BOOL) addExposedRect: (O2Rect) rect isLast: (BOOL) last exposedUnion: (O2Rect *) exposedUnion {
+    if (_hasPendingExpose)
+        rect = NSUnionRect(_pendingExpose, rect);
+    if (!last) {
+        _pendingExpose = rect;
+        _hasPendingExpose = YES;
+        return NO;
+    }
+    _hasPendingExpose = NO;
+    *exposedUnion = rect;
+    return YES;
 }
 
 - (void) flushBuffer {

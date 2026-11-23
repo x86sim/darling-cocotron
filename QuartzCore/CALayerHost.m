@@ -19,13 +19,15 @@
 */
 
 // A CALayerHost subscribes to the remote CAContext named by its contextId
-// and draws the frames the context sends, at their size, from its own
-// origin. When the context goes away, it draws nothing again. See CAContext.m
+// and draws the frames the context sends, at their size, where the hosted
+// tree would be as a sublayer of the host. When the context goes away, it
+// draws nothing again. See CAContext.m
 // for the other end and CARemoteContextProtocol.h for the messages.
 
 #import <QuartzCore/CALayerHost.h>
 #import <QuartzCore/CALayerContext.h>
 #import <IOSurface/IOSurface.h>
+#import <OpenGL/gl.h>
 #import "CALayerInternal.h"
 #import "CARemoteContextProtocol.h"
 
@@ -51,6 +53,7 @@
     IOSurfaceRef _surfaces[2];
     mach_port_t _surfacePorts[2];
     IOSurfaceRef _frame;
+    CARemoteFrameGeometry _geometry;
 }
 - (instancetype) initWithHost: (CALayerHost *) host contextId: (CAContextID) contextId;
 - (void) cancel;
@@ -58,6 +61,10 @@
 - (BOOL) isConnected;
 // The last frame, or NULL.
 - (IOSurfaceRef) frame;
+// Which of the two surfaces the frame is in.
+- (int) frameSlot;
+// Where the last frame lies in the context's coordinate space.
+- (CARemoteFrameGeometry) geometry;
 @end
 
 @implementation CALayerHostConnection
@@ -179,8 +186,18 @@ static void handleHostMessages(void *context);
     return _frame;
 }
 
+- (CARemoteFrameGeometry) geometry {
+    return _geometry;
+}
+
+- (int) frameSlot {
+    return _frame != NULL && _frame == _surfaces[1] ? 1 : 0;
+}
+
 // Takes the send right in the message.
-- (void) receiveSurfacePort: (mach_port_t) port {
+- (void) receiveSurfacePort: (mach_port_t) port
+                   geometry: (CARemoteFrameGeometry) geometry
+{
     if (!MACH_PORT_VALID(port)) {
         _frame = NULL;
         return;
@@ -191,6 +208,7 @@ static void handleHostMessages(void *context);
         if (_surfacePorts[i] == port) {
             mach_port_deallocate(mach_task_self(), port);
             _frame = _surfaces[i];
+            _geometry = geometry;
             return;
         }
     }
@@ -214,6 +232,7 @@ static void handleHostMessages(void *context);
     _surfaces[slot] = surface;
     _surfacePorts[slot] = port;
     _frame = surface;
+    _geometry = geometry;
 }
 
 - (void) contextDidGoAway {
@@ -264,7 +283,8 @@ static void handleHostMessages(void *context) {
             mach_msg_destroy(header);
             continue;
         }
-        [self receiveSurfacePort: frame->surface.name];
+        [self receiveSurfacePort: frame->surface.name
+                        geometry: frame->geometry];
         changed = YES;
     }
 
@@ -277,6 +297,9 @@ static void handleHostMessages(void *context) {
 @implementation CALayerHost
 
 - (void) dealloc {
+    [[self _context] deleteTextureId: NS_EXTRA(CALayerHost, self)->_otherTextureId];
+    [NS_EXTRA(CALayerHost, self)->_otherTextureId release];
+    [NS_EXTRA(CALayerHost, self)->_otherTextureContents release];
     [NS_EXTRA(CALayerHost, self)->_connection cancel];
     [NS_EXTRA(CALayerHost, self)->_connection release];
     [super dealloc];
@@ -303,16 +326,86 @@ static void handleHostMessages(void *context) {
     [self _frameDidChange];
 }
 
+// Whether the layer, or one above it, is hidden or fully transparent, so
+// that a new frame changes nothing that is drawn.
+- (BOOL) _isInvisible {
+    for (CALayer *layer = self; layer != nil; layer = [layer superlayer])
+        if ([layer isHidden] || [layer opacity] <= 0)
+            return YES;
+    return NO;
+}
+
+// Showing the layer again (hidden, opacity) asks for a frame, which then
+// draws the latest one.
 - (void) _frameDidChange {
+    if ([self _isInvisible])
+        return;
     [[self _context] startTimerIfNeeded];
+}
+
+// The renderer keeps one texture per layer and binds a new surface to it when
+// the contents change. The frames alternate between two surfaces, so the
+// texture would be bound to the other surface at every frame; instead each
+// surface keeps a texture, and the layer's texture state is swapped to the
+// surface's when the frame moves to the other one. Called while the layer is
+// being drawn, with the rendering context current.
+- (void) _selectTextureForSlot: (int) slot {
+    if (slot == NS_EXTRA(CALayerHost, self)->_activeSlot)
+        return;
+    NS_EXTRA(CALayerHost, self)->_activeSlot = slot;
+
+    NSNumber *textureId = [[self _textureId] retain];
+    id contents = [[self _textureContents] retain];
+    uint32_t seed = [self _textureSeed];
+
+    [self _setTextureId: NS_EXTRA(CALayerHost, self)->_otherTextureId];
+    [self _setTextureContents: NS_EXTRA(CALayerHost, self)->_otherTextureContents];
+    [self _setTextureSeed: NS_EXTRA(CALayerHost, self)->_otherTextureSeed];
+
+    [NS_EXTRA(CALayerHost, self)->_otherTextureId release];
+    [NS_EXTRA(CALayerHost, self)->_otherTextureContents release];
+    NS_EXTRA(CALayerHost, self)->_otherTextureId = textureId;
+    NS_EXTRA(CALayerHost, self)->_otherTextureContents = contents;
+    NS_EXTRA(CALayerHost, self)->_otherTextureSeed = seed;
+
+    if ([self _textureId] == nil) {
+        GLuint texture;
+        glGenTextures(1, &texture);
+        [self _setTextureId: [NSNumber numberWithUnsignedInt: texture]];
+    }
+}
+
+- (void) _setContext: (CALayerContext *) context {
+    if ([self _context] != context) {
+        [[self _context] deleteTextureId: NS_EXTRA(CALayerHost, self)->_otherTextureId];
+        [NS_EXTRA(CALayerHost, self)->_otherTextureId release];
+        NS_EXTRA(CALayerHost, self)->_otherTextureId = nil;
+    }
+    [super _setContext: context];
 }
 
 - (id) _contentsForRendering: (CGRect *) rect {
     IOSurfaceRef frame = [NS_EXTRA(CALayerHost, self)->_connection frame];
     if (frame == NULL)
         return [super _contentsForRendering: rect];
-    // The hosted tree is drawn at its own size, from the host's origin.
-    *rect = CGRectMake(0, 0, IOSurfaceGetWidth(frame), IOSurfaceGetHeight(frame));
+    [self _selectTextureForSlot: [NS_EXTRA(CALayerHost, self)->_connection frameSlot]];
+    CARemoteFrameGeometry geometry = [NS_EXTRA(CALayerHost, self)->_connection geometry];
+    CGFloat width = IOSurfaceGetWidth(frame);
+    CGFloat height = IOSurfaceGetHeight(frame);
+    CGFloat y = geometry.originY;
+    // The hosted root layer is placed in this layer's coordinates as a
+    // sublayer would be, but the hosted tree keeps the orientation it has in
+    // its own context: the host's flipped state does not reach into it. In
+    // flipped coordinates, the root's frame is mirrored into place and the
+    // picture around it stays upright.
+    if ([self contentsAreFlipped])
+        y = (CGFloat) geometry.rootMinY + (CGFloat) geometry.rootMaxY -
+            (geometry.originY + height);
+    // Sublayers are positioned relative to the bounds origin; *rect is
+    // relative to the bounds' corner.
+    CGRect bounds = [self bounds];
+    *rect = CGRectMake(geometry.originX - bounds.origin.x, y - bounds.origin.y,
+                       width, height);
     return (id) frame;
 }
 

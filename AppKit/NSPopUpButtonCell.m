@@ -22,6 +22,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSGraphicsStyle.h>
 #import <AppKit/NSImage.h>
 #import <AppKit/NSMenu.h>
+#import <AppKit/NSMenuView.h>
 #import <AppKit/NSPopUpButtonCell.h>
 #import <AppKit/NSPopUpWindow.h>
 #import <AppKit/NSRaise.h>
@@ -29,6 +30,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
 NSNotificationName NSPopUpButtonCellWillPopUpNotification =
         @"NSPopUpButtonCellWillPopUpNotification";
+
+@interface NSButtonCell (AquaToolbarBezel)
+- (NSRect) _aquaBezelArtworkRectForFrame: (NSRect) frame inView: (NSView *) controlView;
+@end
 
 @implementation NSPopUpButtonCell
 
@@ -39,6 +44,8 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
     _selectedIndex = -1;
     NS_EXTRA(NSPopUpButtonCell, self)->_arrowPosition = NSPopUpArrowAtCenter;
     NS_EXTRA(NSPopUpButtonCell, self)->_preferredEdge = NSMaxYEdge;
+    NS_EXTRA(NSPopUpButtonCell, self)->_altersStateOfSelectedItem = YES;
+    NS_EXTRA(NSPopUpButtonCell, self)->_usesItemFromMenu = YES;
     // QUIRK: a new pop-up or pull-down button has the rounded bezel style. Not documented. Evidence:
     // black-box observation on macOS 10.14.4 (tier 2): -bezelStyle of a new NSPopUpButton is 1
     // (NSRoundedBezelStyle). Test: appkit-popup-aqua.m
@@ -61,6 +68,8 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
         NS_EXTRA(NSPopUpButtonCell, self)->_arrowPosition = [coder decodeIntForKey: @"NSArrowPosition"];
         NS_EXTRA(NSPopUpButtonCell, self)->_preferredEdge = [coder decodeIntForKey: @"NSPreferredEdge"];
         NS_EXTRA(NSPopUpButtonCell, self)->_usesItemFromMenu = [coder decodeBoolForKey: @"NSUsesItemFromMenu"];
+        // Written only when set (macOS 26.7.3, black-box).
+        NS_EXTRA(NSPopUpButtonCell, self)->_altersStateOfSelectedItem = [coder decodeBoolForKey: @"NSAltersState"];
 
         [self synchronizeTitleAndSelectedItem];
     } else {
@@ -70,10 +79,11 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
 
         // The flag word, in Mac archives: bit 31 pulls down, bits 28-29 the preferred edge,
         // bit 27 uses the item from the menu, bit 26 alters the state of the selected
-        // item (not supported here) and bits 24-25 the arrow position.
+        // item and bits 24-25 the arrow position.
         NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown = (flags >> 31) & 1;
         NS_EXTRA(NSPopUpButtonCell, self)->_preferredEdge = (flags >> 28) & 3;
         NS_EXTRA(NSPopUpButtonCell, self)->_usesItemFromMenu = (flags >> 27) & 1;
+        NS_EXTRA(NSPopUpButtonCell, self)->_altersStateOfSelectedItem = (flags >> 26) & 1;
         NS_EXTRA(NSPopUpButtonCell, self)->_arrowPosition = (flags >> 24) & 3;
 
         // We can't call synchronizeTitleAndSelectedItem, as the _menu may not be finished decoding and we can't access the items
@@ -93,11 +103,19 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
 
 - initTextCell: (NSString *) string pullsDown: (BOOL) pullDown {
     self = [super initTextCell: string];
-    _menu = [[NSMenu alloc] initWithTitle: string];
-    [_menu addItemWithTitle: string action: [self action] keyEquivalent: @""];
+    _menu = [[NSMenu alloc] initWithTitle: string ?: @""];
+    // The title becomes the first item; an empty title adds none.
+    if ([string length] > 0) {
+        [_menu addItemWithTitle: string action: [self action] keyEquivalent: @""];
+        _selectedIndex = 0;
+    } else {
+        _selectedIndex = -1;
+    }
     NS_EXTRA(NSPopUpButtonCell, self)->_arrowPosition = NSPopUpArrowAtCenter;
     NS_EXTRA(NSPopUpButtonCell, self)->_preferredEdge = NSMaxYEdge;
     NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown = pullDown;
+    NS_EXTRA(NSPopUpButtonCell, self)->_altersStateOfSelectedItem = YES;
+    NS_EXTRA(NSPopUpButtonCell, self)->_usesItemFromMenu = YES;
     // QUIRK: the title of a new pop-up or pull-down button is left aligned (a plain button's is centered). Not
     // documented. Evidence: black-box observation on macOS 10.14.4 (tier 2): -alignment is 0 and the rendered title
     // starts at the title area's left edge. Test: tests/appkit-popup-title-rect.m (test_quirk_popup_title_left_aligned)
@@ -133,6 +151,36 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
 
 - (void) setUsesItemFromMenu: (BOOL) flag {
     NS_EXTRA(NSPopUpButtonCell, self)->_usesItemFromMenu = flag;
+    [self synchronizeTitleAndSelectedItem];
+}
+
+- (void) setMenuItem: (NSMenuItem *) item {
+    [super setMenuItem: item];
+    if (!NS_EXTRA(NSPopUpButtonCell, self)->_usesItemFromMenu)
+        [self synchronizeTitleAndSelectedItem];
+}
+
+// The cell's menu item is the item it shows.
+- (NSMenuItem *) menuItem {
+    return [self _displayedItem];
+}
+
+// The item whose title and image the button shows: the selected item of a
+// pop-up menu or the first item of a pull-down menu, or, when the cell does
+// not use an item from its menu, the cell's own menu item (none by default).
+- (NSMenuItem *) _displayedItem {
+    if (!NS_EXTRA(NSPopUpButtonCell, self)->_usesItemFromMenu)
+        return [super menuItem];
+
+    NSArray *itemArray = [_menu itemArray];
+
+    if (_selectedIndex < 0 || NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown) {
+        if ([itemArray count] > 0)
+            return [itemArray objectAtIndex: 0];
+    } else if (_selectedIndex < [itemArray count]) {
+        return [itemArray objectAtIndex: _selectedIndex];
+    }
+    return nil;
 }
 
 - (BOOL) autoenablesItems {
@@ -238,6 +286,21 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
     edge = NS_EXTRA(NSPopUpButtonCell, self)->_preferredEdge;
 }
 
+// Appends an item for the title without looking for an earlier item of the
+// same title. The first item of an empty menu becomes the selected one.
+- (NSMenuItem *) _appendItemWithTitle: (NSString *) title {
+    NSMenuItem *item = [_menu addItemWithTitle: title
+                                        action: @selector(_popUpItemAction:)
+                                 keyEquivalent: @""];
+    [item setTarget: self];
+
+    if (_selectedIndex < 0) {
+        _selectedIndex = 0;
+        [self _setStateOfItemAtIndex: 0 to: NSControlStateValueOn];
+    }
+    return item;
+}
+
 - (void) _addItemWithTitle: (NSString *) title {
 
     NSMenuItem *duplicate = [_menu itemWithTitle: title];
@@ -246,14 +309,7 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
         [_menu removeItem: duplicate];
     }
 
-    [_menu addItemWithTitle: title
-                     action: @selector(_popUpItemAction:)
-              keyEquivalent: @""];
-    NSMenuItem *item = [[_menu itemArray] lastObject];
-    [item setTarget: self];
-
-    if (_selectedIndex < 0)
-        _selectedIndex = 0;
+    [self _appendItemWithTitle: title];
 }
 
 - (void) addItemWithTitle: (NSString *) title {
@@ -315,9 +371,11 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
 
     if (selectedIndex != _selectedIndex) {
         [self willChangeValueForKey: @"selectedItem"];
+        [self _setStateOfItemAtIndex: _selectedIndex to: NSControlStateValueOff];
         _selectedIndex = selectedIndex;
         [self didChangeValueForKey: @"selectedItem"];
     }
+    [self _setStateOfItemAtIndex: _selectedIndex to: NSControlStateValueOn];
     [self synchronizeTitleAndSelectedItem];
 }
 
@@ -356,16 +414,33 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
     return result;
 }
 
-- (void) synchronizeTitleAndSelectedItem {
-    NSArray *itemArray = [_menu itemArray];
-    NSMenuItem *item = nil;
+- (BOOL) altersStateOfSelectedItem {
+    return NS_EXTRA(NSPopUpButtonCell, self)->_altersStateOfSelectedItem;
+}
 
-    if (_selectedIndex < 0 || NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown) {
-        if ([itemArray count] > 0)
-            item = [itemArray objectAtIndex: 0];
-    } else if (_selectedIndex < [itemArray count]) {
-        item = [itemArray objectAtIndex: _selectedIndex];
-    }
+// As on macOS 26.7.3 (black-box): turning it off clears the state of every item, turning it on
+// sets the selected item's state and leaves the others alone.
+- (void) setAltersStateOfSelectedItem: (BOOL) flag {
+    NS_EXTRA(NSPopUpButtonCell, self)->_altersStateOfSelectedItem = flag;
+    if (flag)
+        [self _setStateOfItemAtIndex: _selectedIndex to: NSControlStateValueOn];
+    else
+        for (NSMenuItem *item in [_menu itemArray])
+            [item setState: NSControlStateValueOff];
+}
+
+// With altersStateOfSelectedItem, the item a pop-up menu selects is turned on and the one it
+// selected before is turned off (macOS 26.7.3, black-box). A pull-down menu's items keep their
+// states.
+- (void) _setStateOfItemAtIndex: (NSInteger) index to: (NSControlStateValue) state {
+    if (!NS_EXTRA(NSPopUpButtonCell, self)->_altersStateOfSelectedItem || NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown)
+        return;
+    if (index >= 0 && index < [_menu numberOfItems])
+        [[_menu itemAtIndex: index] setState: state];
+}
+
+- (void) synchronizeTitleAndSelectedItem {
+    NSMenuItem *item = [self _displayedItem];
     // With no items the title is the empty string rather than nil.
     NSString *oldTitle = [[self title] retain];
 
@@ -454,13 +529,26 @@ static void popUpTitleInsets(BOOL pullsDown, NSControlSize size, CGFloat *left, 
     }
 }
 
+// QUIRK: with the textured rounded bezel style the title area starts 7 points from the left edge and leaves 23
+// points (pop-up) or 24 (pull-down) at the right for the chevrons, 22 for a small pop-up. Not documented. Evidence:
+// black-box observation of -titleRectForBounds: with 100 point bounds on macOS 10.14.4 (tier 2), probe
+// mac-probes/aqua-toolbar.m of the research notes. Test: appkit-toolbar-controls-aqua.m (test_quirk_textured_popup)
+static void texturedPopUpTitleInsets(BOOL pullsDown, NSControlSize size, CGFloat *left, CGFloat *taken) {
+    *left = 7;
+    *taken = pullsDown ? 24 : (size == NSSmallControlSize ? 22 : 23);
+}
+
 - (NSRect) titleRectForBounds: (NSRect) rect {
     rect = [super titleRectForBounds: rect];
     if (NS_EXTRA(NSPopUpButtonCell, self)->_arrowPosition != NSPopUpNoArrow) {
         if ([self isBordered]) {
             CGFloat left, taken;
 
-            popUpTitleInsets(NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown, [self controlSize], &left, &taken);
+            if (NS_EXTRA(NSButtonCell, self)->_bezelStyle == NSTexturedRoundedBezelStyle)
+                texturedPopUpTitleInsets(NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown, [self controlSize], &left,
+                                         &taken);
+            else
+                popUpTitleInsets(NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown, [self controlSize], &left, &taken);
             rect.origin.x += left;
             rect.size.width = MAX(0, rect.size.width - taken);
             return rect;
@@ -508,6 +596,26 @@ static void popUpTitleInsets(BOOL pullsDown, NSControlSize size, CGFloat *left, 
     // Now draw the arrow, unless the bezel included it
     if ([self isBordered] && NS_EXTRA(NSButtonCell, self)->_bezelStyle == NSRoundedBezelStyle)
         return;
+    if ([self isBordered] && NS_EXTRA(NSButtonCell, self)->_bezelStyle == NSTexturedRoundedBezelStyle) {
+        if (NS_EXTRA(NSPopUpButtonCell, self)->_arrowPosition == NSPopUpNoArrow)
+            return;
+
+        // the chevrons are drawn by the style, on the bezel's artwork, for a view that is not flipped
+        NSRect art = [self _aquaBezelArtworkRectForFrame: frame inView: controlView];
+        CGContextRef context = [[NSGraphicsContext currentContext] graphicsPort];
+
+        CGContextSaveGState(context);
+        if ([controlView isFlipped]) {
+            CGContextTranslateCTM(context, 0, 2 * art.origin.y + art.size.height);
+            CGContextScaleCTM(context, 1, -1);
+        }
+        [[controlView graphicsStyle] drawTexturedPopUpArrowsInRect: art
+                                                         pullsDown: NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown
+                                                           enabled: [self isEnabled]
+                                                       controlSize: [self controlSize]];
+        CGContextRestoreGState(context);
+        return;
+    }
     if (NS_EXTRA(NSPopUpButtonCell, self)->_arrowPosition != NSPopUpNoArrow) {
         NSImage *arrowImage =
                 (NS_EXTRA(NSPopUpButtonCell, self)->_arrowPosition != NSPopUpNoArrow) ? [self arrowImage] : NULL;
@@ -603,15 +711,7 @@ static void popUpTitleInsets(BOOL pullsDown, NSControlSize size, CGFloat *left, 
 }
 
 - (NSImage *) image {
-    NSArray *itemArray = [_menu itemArray];
-    NSMenuItem *item = nil;
-    if (_selectedIndex < 0 || NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown) {
-        if ([itemArray count] > 0)
-            item = [itemArray objectAtIndex: 0];
-    } else {
-        item = [itemArray objectAtIndex: _selectedIndex];
-    }
-    return [item image];
+    return [[self _displayedItem] image];
 }
 
 - (NSCellImagePosition) imagePosition {
@@ -653,15 +753,32 @@ static void popUpTitleInsets(BOOL pullsDown, NSControlSize size, CGFloat *left, 
     origin = [controlView convertPoint: origin toView: nil];
     origin = [[controlView window] convertBaseToScreen: origin];
 
-    [[_menu delegate] menuNeedsUpdate: _menu];
-    //	[[_menu delegate] menuWillOpen: _menu];
+    // The delegate calls are optional, and go to the menu itself, not to the copy shown for a pull-down: the
+    // update (-menuNeedsUpdate: once, then the validation of the items), the tracking notification and
+    // -menuWillOpen:, in the order macOS makes them; after the tracking come -menuDidClose: and the end
+    // notification. The list of items does not open submenus, so a submenu's delegate is not asked: macOS
+    // updates and opens a submenu of a pop-up, which is not implemented here.
+    // QUIRK: a pop-up (not pull-down) button's menu is updated before NSMenuDidBeginTrackingNotification is
+    // posted, a pull-down's after it. Not documented. Evidence: black-box observation on macOS 26.7.3 (tier 2).
+    // Test: appkit-popupbuttoncell-menu-delegate (test_quirk_pop_up_updates_before_begin_notification)
+    BOOL pullsDown = NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown;
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+
+    if (pullsDown) {
+        [center postNotificationName: NSMenuDidBeginTrackingNotification object: _menu];
+        [_menu _updateWithoutSubmenus];
+    } else {
+        [_menu _updateWithoutSubmenus];
+        [center postNotificationName: NSMenuDidBeginTrackingNotification object: _menu];
+    }
+    if ([[_menu delegate] respondsToSelector: @selector(menuWillOpen:)])
+        [[_menu delegate] menuWillOpen: _menu];
     NSMenu *menu = _menu;
     if (NS_EXTRA(NSPopUpButtonCell, self)->_pullsDown && [_menu numberOfItems]) {
         // Don't display the first item for pullDowns controls
         menu = [[_menu copy] autorelease];
         [menu removeItemAtIndex: 0];
     }
-    [menu update];
 
     NSPopUpWindow *window = [[NSPopUpWindow alloc]
             initWithFrame: NSMakeRect(origin.x, origin.y, cellFrame.size.width,
@@ -690,7 +807,9 @@ static void popUpTitleInsets(BOOL pullsDown, NSControlSize size, CGFloat *left, 
     }
     _selectedIndex = (itemIndex == NSNotFound) ? -1 : itemIndex;
     [window close]; // release when closed=YES
-                    //	[[_menu delegate] menuDidClose: _menu];
+    if ([[_menu delegate] respondsToSelector: @selector(menuDidClose:)])
+        [[_menu delegate] menuDidClose: _menu];
+    [center postNotificationName: NSMenuDidEndTrackingNotification object: _menu];
 
     return itemIndex != NSNotFound;
 }

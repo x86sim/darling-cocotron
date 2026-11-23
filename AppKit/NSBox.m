@@ -34,6 +34,19 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
 @implementation NSBox
 
+// The custom box properties, which a box keeps whatever its type. The defaults are those of
+// macOS 10.14.4 and 26.7.3: a one point border in the secondary label color, no corner radius,
+// and a clear fill.
+- (NSMutableDictionary *) _customBoxProperties {
+    if (NS_EXTRA(NSBox, self)->_customData == nil)
+        NS_EXTRA(NSBox, self)->_customData = [[NSMutableDictionary alloc] initWithObjectsAndKeys:
+                [NSNumber numberWithDouble: 1], @"NSBorderWidth2",
+                [NSNumber numberWithDouble: 0], @"NSCornerRadius2",
+                [NSColor secondaryLabelColor], @"NSBorderColor2",
+                [NSColor colorWithCalibratedWhite: 0 alpha: 0], @"NSFillColor2", nil];
+    return NS_EXTRA(NSBox, self)->_customData;
+}
+
 - (void) encodeWithCoder: (NSCoder *) coder {
     [super encodeWithCoder: coder];
     [coder encodeInt: NS_EXTRA(NSBox, self)->_borderType forKey: @"NSBox borderType"];
@@ -61,30 +74,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
                 setAutoresizingMask: NSViewWidthSizable | NSViewHeightSizable];
         [[_subviews lastObject] setAutoresizesSubviews: YES];
 
-        if (NS_EXTRA(NSBox, self)->_boxType == NSBoxCustom) {
-            id obj;
-            NS_EXTRA(NSBox, self)->_customData = [[NSMutableDictionary alloc] init];
+        for (NSString *key in @[ @"NSBorderWidth2", @"NSCornerRadius2", @"NSBorderColor2", @"NSFillColor2" ]) {
+            id value = [keyed decodeObjectForKey: key];
 
-            obj = [keyed decodeObjectForKey: @"NSBorderWidth2"];
-            if (obj == nil)
-                obj = [NSNumber numberWithDouble: 1];
-            [NS_EXTRA(NSBox, self)->_customData setObject: obj forKey: @"NSBorderWidth2"];
-
-            obj = [keyed decodeObjectForKey: @"NSCornerRadius2"];
-            if (obj == nil)
-                obj = [NSNumber numberWithDouble: 0];
-
-            [NS_EXTRA(NSBox, self)->_customData setObject: obj forKey: @"NSCornerRadius2"];
-
-            obj = [keyed decodeObjectForKey: @"NSBorderColor2"];
-            if (obj == nil)
-                obj = [NSColor colorWithCalibratedWhite: 0.000 alpha: 0.420];
-            [NS_EXTRA(NSBox, self)->_customData setObject: obj forKey: @"NSBorderColor2"];
-
-            obj = [keyed decodeObjectForKey: @"NSFillColor2"];
-            if (obj == nil)
-                obj = [NSColor colorWithCalibratedWhite: 0.000 alpha: 0.000];
-            [NS_EXTRA(NSBox, self)->_customData setObject: obj forKey: @"NSFillColor2"];
+            if (value != nil)
+                [[self _customBoxProperties] setObject: value forKey: key];
         }
     } else {
         NSInteger version = [coder versionForClassName: @"NSBox"];
@@ -336,8 +330,58 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
     [self setFrame: content];
 }
 
+// The content view is made to enclose its subviews (by its own -sizeToFit when it has one), then the
+// box is resized around it, keeping the space it had between its edges and the content view.
 - (void) sizeToFit {
-    NSUnimplementedMethod();
+    NSView *content = [self contentView];
+    if (content == nil)
+        return;
+
+    NSRect bounds = [self bounds];
+    NSRect contentFrame = [content frame];
+    CGFloat left = NSMinX(contentFrame), bottom = NSMinY(contentFrame);
+    CGFloat right = NSWidth(bounds) - NSMaxX(contentFrame), top = NSHeight(bounds) - NSMaxY(contentFrame);
+
+    // The frames below are set one by one; no view is to be resized by autoresizing meanwhile.
+    BOOL boxAutoresizes = [self autoresizesSubviews], contentAutoresizes = [content autoresizesSubviews];
+    [self setAutoresizesSubviews: NO];
+    [content setAutoresizesSubviews: NO];
+
+    NSPoint originShift = NSZeroPoint;
+    if ([content respondsToSelector: @selector(sizeToFit)]) {
+        [content performSelector: @selector(sizeToFit)];
+    } else {
+        // The content view takes the size of the union of its subviews' frames (a hidden subview counts
+        // too) and the subviews are shifted so the union starts at its origin. The box moves by the same
+        // offset, so the subviews stay where they were on screen. A content view without subviews
+        // becomes empty (zero size), and the box then wraps only the margins and the title.
+        // Observed by black-box test on macOS 26.7.3 and 10.14.4; the test below pins the geometry.
+        NSRect enclosing = NSZeroRect;
+        BOOL first = YES;
+        for (NSView *subview in [content subviews]) {
+            enclosing = first ? [subview frame] : NSUnionRect(enclosing, [subview frame]);
+            first = NO;
+        }
+        for (NSView *subview in [content subviews])
+            [subview setFrameOrigin: NSMakePoint(NSMinX([subview frame]) - NSMinX(enclosing),
+                                                 NSMinY([subview frame]) - NSMinY(enclosing))];
+        originShift = first ? NSZeroPoint : enclosing.origin;
+        [content setFrameSize: enclosing.size];
+    }
+
+    NSSize size = NSMakeSize(left + NSWidth([content frame]) + right, bottom + NSHeight([content frame]) + top);
+    if (NS_EXTRA(NSBox, self)->_titlePosition != NSNoTitle && [[self title] length] > 0) {
+        // The box is at least as wide as the title cell plus 10 points on either side.
+        size.width = MAX(size.width, [_titleCell cellSize].width + 20);
+    }
+
+    NSPoint origin = [self frame].origin;
+    [self setFrameOrigin: NSMakePoint(origin.x + originShift.x, origin.y + originShift.y)];
+    [self setFrameSize: size];
+    [content setFrame: NSMakeRect(left, bottom, floor(size.width - left - right), size.height - bottom - top)];
+    [content setAutoresizesSubviews: contentAutoresizes];
+    [self setAutoresizesSubviews: boxAutoresizes];
+    [self setNeedsDisplay: YES];
 }
 
 - (void) drawRect: (NSRect) rect {
@@ -394,17 +438,19 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
             grooveRect.origin.y = 4;
         }
         [[self graphicsStyle] drawAquaBoxInRect: grooveRect];
-    } else if (NS_EXTRA(NSBox, self)->_boxType != NSBoxSeparator) {
+    } else if (NS_EXTRA(NSBox, self)->_boxType != NSBoxSeparator && NS_EXTRA(NSBox, self)->_boxType != NSBoxCustom) {
         // Separator are transparent except for drawing a line
         [[NSColor controlColor] setFill];
         NSRectFill(grooveRect);
     }
 
     if (NS_EXTRA(NSBox, self)->_boxType == NSBoxCustom) {
+        // The fill is drawn over what is behind the box, so a clear fill color (the default)
+        // leaves it showing.
+        CGFloat radius = [self cornerRadius];
 
-        // Ignoring corner radius for now.
-        [[self fillColor] set];
-        NSRectFill(rect);
+        [[self fillColor] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect: _bounds xRadius: radius yRadius: radius] fill];
 
         if (NS_EXTRA(NSBox, self)->_borderType != NSNoBorder) {
             [[self borderColor] set];
@@ -463,37 +509,41 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 }
 
 - (CGFloat) borderWidth {
-    return [[NS_EXTRA(NSBox, self)->_customData objectForKey: @"NSBorderWidth2"] doubleValue];
+    return [[[self _customBoxProperties] objectForKey: @"NSBorderWidth2"] doubleValue];
 }
 
 - (CGFloat) cornerRadius; {
-    return [[NS_EXTRA(NSBox, self)->_customData objectForKey: @"NSCornerRadius2"] doubleValue];
+    return [[[self _customBoxProperties] objectForKey: @"NSCornerRadius2"] doubleValue];
 }
 
 - (NSColor *) borderColor; {
-    return [NS_EXTRA(NSBox, self)->_customData objectForKey: @"NSBorderColor2"];
+    return [[self _customBoxProperties] objectForKey: @"NSBorderColor2"];
 }
 
 - (NSColor *) fillColor; {
-    return [NS_EXTRA(NSBox, self)->_customData objectForKey: @"NSFillColor2"];
+    return [[self _customBoxProperties] objectForKey: @"NSFillColor2"];
 }
 
 - (void) setBorderWidth: (CGFloat) value {
-    [NS_EXTRA(NSBox, self)->_customData setObject: [NSNumber numberWithDouble: value]
-                    forKey: @"NSBorderWidth2"];
+    [[self _customBoxProperties] setObject: [NSNumber numberWithDouble: value] forKey: @"NSBorderWidth2"];
+    [self setNeedsDisplay: YES];
 }
 
 - (void) setCornerRadius: (CGFloat) value {
-    [NS_EXTRA(NSBox, self)->_customData setObject: [NSNumber numberWithDouble: value]
-                    forKey: @"NSCornerRadius2"];
+    [[self _customBoxProperties] setObject: [NSNumber numberWithDouble: value] forKey: @"NSCornerRadius2"];
+    [self setNeedsDisplay: YES];
 }
 
 - (void) setBorderColor: (NSColor *) value {
-    [NS_EXTRA(NSBox, self)->_customData setObject: value forKey: @"NSBorderColor2"];
+    if (value != nil)
+        [[self _customBoxProperties] setObject: value forKey: @"NSBorderColor2"];
+    [self setNeedsDisplay: YES];
 }
 
 - (void) setFillColor: (NSColor *) value {
-    [NS_EXTRA(NSBox, self)->_customData setObject: value forKey: @"NSFillColor2"];
+    if (value != nil)
+        [[self _customBoxProperties] setObject: value forKey: @"NSFillColor2"];
+    [self setNeedsDisplay: YES];
 }
 
 - (void) updateCell: (NSCell *) cell {

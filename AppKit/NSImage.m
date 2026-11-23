@@ -17,6 +17,7 @@ COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
+#import "NSImageSystemTemplates.h"
 #import <AppKit/NSBezierPath.h>
 #import <AppKit/NSBitmapImageRep.h>
 #import <AppKit/NSCachedImageRep.h>
@@ -29,6 +30,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSAppearance.h>
 #import <AppKit/NSApplication.h>
 #import "NSImageDrawingCache.h"
+#import "NSAssetCatalog.h"
+#import "NSImage+TemplateDrawing.h"
 #import <AppKit/NSLinkedOnOrAfter.h>
 #import <AppKit/NSImageRep.h>
 #import <AppKit/NSPDFImageRep.h>
@@ -40,6 +43,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 @interface NSImageSymbolConfiguration (Private)
 - (CGFloat) _placeholderSide;
 @end
+
+// Defined in NSImageSymbolGlyphs.m.
+BOOL NSImageSymbolHasGlyph(NSString *name);
+void NSImageSymbolDrawGlyph(NSString *name, NSRect rect);
 
 NSImageName const NSImageNameActionTemplate = @"NSActionTemplate";
 NSImageName const NSImageNameAddTemplate = @"NSAddTemplate";
@@ -411,16 +418,30 @@ NSImageName const NSImageNameTouchBarVolumeUpTemplate =
                 [image setName: name];
                 if (image) {
                     // Images whose name ends in "Template" are template images.
-                    if ([name hasSuffix: @"Template"])
+                    // So are the default state images of menu items.
+                    if ([name hasSuffix: @"Template"] || [name isEqualToString: @"NSMenuCheckmark"] ||
+                        [name isEqualToString: @"NSMenuMixedState"])
                         [image setTemplate: YES];
                     break;
                 }
             }
         }
     }
+    // Then the image sets of the bundles' asset catalogs.
+    if (image == nil) {
+        for (NSBundle *bundle in [self _checkBundles]) {
+            image = [[NSAssetCatalog catalogForBundle: bundle] imageNamed: name];
+            if (image != nil) {
+                [image setName: name];
+                break;
+            }
+        }
+    }
 
     if (image == nil)
         image = [self _drawnTemplateNamed: name];
+    if (image == nil)
+        image = NSImageSystemTemplateNamed(name);
 
     // Cocoa AppKit always returns the same shared cached image
     return image;
@@ -840,6 +861,7 @@ NSImageName const NSImageNameTouchBarVolumeUpTemplate =
     [NS_EXTRA(NSImage, self)->_representations release];
     [NS_EXTRA(NSImage, self)->_accessibilityDescription release];
     [NS_EXTRA(NSImage, self)->_symbolConfiguration release];
+    [NS_EXTRA(NSImage, self)->_symbolName release];
     [NS_EXTRA(NSImage, self)->_scaledRepCache release];
     [NS_EXTRA(NSImage, self)->_drawingHandlerRepCache release];
     [NS_EXTRA(NSImage, self)->_focusSnapshot release];
@@ -856,6 +878,7 @@ NSImageName const NSImageNameTouchBarVolumeUpTemplate =
     NS_EXTRA(NSImage, result)->_representations = [NS_EXTRA(NSImage, self)->_representations mutableCopy];
     NS_EXTRA(NSImage, result)->_accessibilityDescription = [NS_EXTRA(NSImage, self)->_accessibilityDescription copy];
     NS_EXTRA(NSImage, result)->_symbolConfiguration = [NS_EXTRA(NSImage, self)->_symbolConfiguration retain];
+    NS_EXTRA(NSImage, result)->_symbolName = [NS_EXTRA(NSImage, self)->_symbolName copy];
     NS_EXTRA(NSImage, result)->_scaledRepCache = nil;
     NS_EXTRA(NSImage, result)->_drawingHandlerRepCache = nil;
 
@@ -2353,18 +2376,19 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
 }
 
 // Darling does not ship SF Symbols artwork (it is Apple's proprietary asset
-// catalog), so every system symbol is drawn as the same generic template glyph:
-// a rounded square outline sized like a symbol at the configured point size.
-// Apple returns nil for names it doesn't know; here only nil or empty names do,
-// because there is no symbol list to check against and apps usually expect an
-// image for the names they ship with.
-+ (NSImage *) _symbolPlaceholderWithDescription: (NSString *) description
-                                  configuration:
-                                          (NSImageSymbolConfiguration *)
-                                                  configuration
+// catalog). A few symbols that apps commonly use have simple drawings of our
+// own (NSImageSymbolGlyphs.m); every other system symbol is drawn as the same
+// generic template glyph: a rounded square outline. Both are sized like a
+// symbol at the configured point size. Apple returns nil for names it doesn't
+// know; here only nil or empty names do, because there is no symbol list to
+// check against and apps usually expect an image for the names they ship with.
++ (NSImage *) _systemSymbolImageNamed: (NSString *) name
+                          description: (NSString *) description
+                        configuration: (NSImageSymbolConfiguration *) configuration
 {
+    BOOL hasGlyph = NSImageSymbolHasGlyph(name);
     static BOOL logged = NO;
-    if (!logged) {
+    if (!hasGlyph && !logged) {
         logged = YES;
         NSLog(@"NSImage: SF Symbols are not available, system symbol images "
               @"are drawn as placeholders");
@@ -2376,10 +2400,14 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
 
     CGFloat side = [configuration _placeholderSide];
     NSSize size = NSMakeSize(side, side);
+    NSString *glyph = [[name copy] autorelease];
     NSCustomImageRep *rep = [[NSCustomImageRep alloc]
-            initWithDrawSelector: @selector(_drawSymbolPlaceholder:)
-                        delegate: [NSImageSymbolConfiguration class]];
-    [rep setSize: size];
+            initWithSize: size
+                 flipped: NO
+          drawingHandler: ^BOOL(NSRect rect) {
+              NSImageSymbolDrawGlyph(glyph, rect);
+              return YES;
+          }];
 
     NSImage *image = [[[self alloc] initWithSize: size] autorelease];
     [image addRepresentation: rep];
@@ -2387,6 +2415,7 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
     [image setTemplate: YES];
     [image setAccessibilityDescription: description];
     NS_EXTRA(NSImage, image)->_symbolConfiguration = [configuration retain];
+    NS_EXTRA(NSImage, image)->_symbolName = [glyph copy];
     return image;
 }
 
@@ -2395,8 +2424,9 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
 {
     if ([name length] == 0)
         return nil;
-    return [self _symbolPlaceholderWithDescription: description
-                                     configuration: nil];
+    return [self _systemSymbolImageNamed: name
+                             description: description
+                           configuration: nil];
 }
 
 + (instancetype) imageWithSystemSymbolName: (NSString *) name
@@ -2405,6 +2435,14 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
 {
     return [self imageWithSystemSymbolName: name
                   accessibilityDescription: description];
+}
+
++ (instancetype) imageWithSymbolName: (NSString *) name
+                       variableValue: (double) value
+{
+    return [self imageWithSystemSymbolName: name
+                             variableValue: value
+                  accessibilityDescription: nil];
 }
 
 + (instancetype) _imageWithSystemSymbolName: (NSString *) name {
@@ -2420,8 +2458,9 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
     NSImageSymbolConfiguration *merged = [NS_EXTRA(NSImage, self)->_symbolConfiguration
             configurationByApplyingConfiguration: configuration];
     return [[self class]
-            _symbolPlaceholderWithDescription: NS_EXTRA(NSImage, self)->_accessibilityDescription
-                                configuration: merged];
+            _systemSymbolImageNamed: NS_EXTRA(NSImage, self)->_symbolName
+                        description: NS_EXTRA(NSImage, self)->_accessibilityDescription
+                      configuration: merged];
 }
 
 - (NSImageSymbolConfiguration *) symbolConfiguration {
@@ -2451,6 +2490,7 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
 - (void) dealloc {
     [_paletteColors release];
     [_hierarchicalColor release];
+    [_textStyle release];
     [super dealloc];
 }
 
@@ -2465,6 +2505,33 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
     NSImageSymbolConfiguration *result = [[[self alloc] init] autorelease];
     result->_prefersMulticolor = YES;
     return result;
+}
+
++ (instancetype) configurationPreferringMonochrome {
+    NSImageSymbolConfiguration *result = [[[self alloc] init] autorelease];
+    result->_prefersMonochrome = YES;
+    return result;
+}
+
++ (instancetype) configurationPreferringHierarchical {
+    NSImageSymbolConfiguration *result = [[[self alloc] init] autorelease];
+    result->_prefersHierarchical = YES;
+    return result;
+}
+
++ (instancetype) configurationWithTextStyle: (NSFontTextStyle) style
+                                      scale: (NSImageSymbolScale) scale
+{
+    NSImageSymbolConfiguration *result = [[[self alloc] init] autorelease];
+    // Kept but not used to size the placeholder: the point size of each text
+    // style is not part of the public contract.
+    result->_textStyle = [style copy];
+    result->_scale = scale;
+    return result;
+}
+
++ (instancetype) configurationWithTextStyle: (NSFontTextStyle) style {
+    return [self configurationWithTextStyle: style scale: 0];
 }
 
 + (instancetype) configurationWithPaletteColors: (NSArray<NSColor *> *) colors {
@@ -2507,16 +2574,23 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
             [[[[self class] alloc] init] autorelease];
     NSArray<NSColor *> *paletteColors = _paletteColors;
     NSColor *hierarchicalColor = _hierarchicalColor;
+    NSFontTextStyle textStyle = _textStyle;
 
     result->_pointSize = _pointSize;
     result->_weight = _weight;
     result->_scale = _scale;
     result->_prefersMulticolor = _prefersMulticolor;
+    result->_prefersMonochrome = _prefersMonochrome;
+    result->_prefersHierarchical = _prefersHierarchical;
 
     if (configuration != nil) {
+        // GUESS: a point size and a text style are two ways to give the size,
+        // so the one in the argument replaces the other in the receiver. The
+        // reference says only that the argument's values take priority.
         if (configuration->_pointSize > 0) {
             result->_pointSize = configuration->_pointSize;
             result->_weight = configuration->_weight;
+            textStyle = nil;
         }
         if (configuration->_scale != 0)
             result->_scale = configuration->_scale;
@@ -2524,17 +2598,53 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
             paletteColors = configuration->_paletteColors;
         if (configuration->_hierarchicalColor != nil)
             hierarchicalColor = configuration->_hierarchicalColor;
-        if (configuration->_prefersMulticolor)
+        if (configuration->_textStyle != nil) {
+            textStyle = configuration->_textStyle;
+            result->_pointSize = 0;
+            result->_weight = 0;
+        }
+        // The argument's values take priority, with one exception observed by black-box test on macOS 26.7.3
+        // (rendered output of the receiver/argument pairs): a monochrome or hierarchical preference in the
+        // argument replaces the receiver's preference, but a multicolor preference in the argument applies only
+        // when the receiver has no monochrome, hierarchical or multicolor preference of its own to keep.
+        // Test: appkit-symbol-configuration-factories.m, test_preferences
+        if (configuration->_prefersMonochrome || configuration->_prefersHierarchical) {
+            result->_prefersMulticolor = NO;
+            result->_prefersMonochrome = configuration->_prefersMonochrome;
+            result->_prefersHierarchical = configuration->_prefersHierarchical;
+        } else if (configuration->_prefersMulticolor && !_prefersMonochrome && !_prefersHierarchical) {
             result->_prefersMulticolor = YES;
+        }
     }
 
     result->_paletteColors = [paletteColors copy];
     result->_hierarchicalColor = [hierarchicalColor retain];
+    result->_textStyle = [textStyle copy];
     return result;
 }
 
 - copyWithZone: (NSZone *) zone {
     return [self retain];
+}
+
+// Keys as written by ibtool and by AppKit's own archiving of a configuration.
++ (BOOL) supportsSecureCoding {
+    return YES;
+}
+
+- (instancetype) initWithCoder: (NSCoder *) coder {
+    if ((self = [super init]) == nil)
+        return nil;
+    _pointSize = [coder decodeDoubleForKey: @"NSPointSize"];
+    _weight = [coder decodeDoubleForKey: @"NSFontWeight"];
+    _scale = (NSImageSymbolScale) [coder decodeIntegerForKey: @"NSSymbolScale"];
+    return self;
+}
+
+- (void) encodeWithCoder: (NSCoder *) coder {
+    [coder encodeDouble: _pointSize forKey: @"NSPointSize"];
+    [coder encodeDouble: _weight forKey: @"NSFontWeight"];
+    [coder encodeInteger: _scale forKey: @"NSSymbolScale"];
 }
 
 - (BOOL) isEqual: (id) other {
@@ -2546,6 +2656,9 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
     return o->_pointSize == _pointSize && o->_weight == _weight &&
            o->_scale == _scale &&
            o->_prefersMulticolor == _prefersMulticolor &&
+           o->_prefersMonochrome == _prefersMonochrome &&
+           o->_prefersHierarchical == _prefersHierarchical &&
+           (o->_textStyle == _textStyle || [o->_textStyle isEqual: _textStyle]) &&
            (o->_paletteColors == _paletteColors ||
             [o->_paletteColors isEqual: _paletteColors]) &&
            (o->_hierarchicalColor == _hierarchicalColor ||
@@ -2569,18 +2682,36 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
     return ceil(pointSize * factor + 3.0);
 }
 
-+ (void) _drawSymbolPlaceholder: (NSCustomImageRep *) rep {
-    NSSize size = [rep size];
-    CGFloat line = MAX(1.0, floor(size.width / 12.0));
-    NSRect box = NSInsetRect(NSMakeRect(0, 0, size.width, size.height),
-                             line * 1.5, line * 1.5);
-    CGFloat radius = box.size.width / 5.0;
-    NSBezierPath *path = [NSBezierPath bezierPathWithRoundedRect: box
-                                                         xRadius: radius
-                                                         yRadius: radius];
-    [path setLineWidth: line];
-    [[NSColor blackColor] setStroke];
-    [path stroke];
+@end
+
+@implementation NSImage (NSTemplateDrawing)
+
+// The image is drawn into a transparency layer and the colour is put where it left coverage
+// (source-in), so that only the shape of the image is kept, not its colours.
+- (void) _drawTemplateInRect: (NSRect) rect color: (NSColor *) color fraction: (CGFloat) fraction {
+    CGContextRef context = [[NSGraphicsContext currentContext] graphicsPort];
+
+    CGContextSaveGState(context);
+    CGContextSetAlpha(context, fraction);
+    CGContextBeginTransparencyLayerWithRect(context, rect, NULL);
+    [self drawInRect: rect fromRect: NSZeroRect operation: NSCompositeSourceOver fraction: 1.0];
+    [color setFill];
+    NSRectFillUsingOperation(rect, NSCompositeSourceIn);
+    CGContextEndTransparencyLayer(context);
+    CGContextRestoreGState(context);
+}
+
+- (NSImage *) _imageTintedWithColor: (NSColor *) color {
+    NSImage *original = [[self retain] autorelease];
+    NSSize size = [self size];
+    NSImage *tinted = [NSImage imageWithSize: size
+                                     flipped: NO
+                              drawingHandler: ^BOOL(NSRect rect) {
+        [original _drawTemplateInRect: NSMakeRect(0, 0, size.width, size.height) color: color fraction: 1.0];
+        return YES;
+    }];
+
+    return tinted;
 }
 
 @end
@@ -2619,10 +2750,11 @@ static NSUInteger scaledRepCacheBytes(NSArray *cache) {
     return [NSURL fileURLWithPath: path];
 }
 
+// An image file of the bundle, else an image set of its asset catalog.
 - (NSImage *) imageForResource: (NSString *) name {
     NSString *path = [self pathForImageResource: name];
     if (path == nil)
-        return nil;
+        return [[NSAssetCatalog catalogForBundle: self] imageNamed: name];
     return [[[NSImage alloc] initWithContentsOfFile: path] autorelease];
 }
 

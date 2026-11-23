@@ -203,6 +203,13 @@ O2ColorSpaceRef O2ColorSpaceCreateWithName(CFStringRef name) {
             return cs;
         }
     }
+
+    if (CFEqual(name, kO2ColorSpaceGenericCMYK)) {
+        O2ColorSpaceRef cs = [[O2ColorSpace alloc] initWithDeviceCMYK];
+        CFRetain(name);
+        cs->_name = name;
+        return cs;
+    }
     return NULL;
 }
 
@@ -351,6 +358,13 @@ size_t O2ColorSpaceGetNumberOfComponents(O2ColorSpaceRef self) {
     case kO2ColorSpaceModelDeviceN:
         return ((O2ColorSpace_DeviceN *) self)->_numberOfComponents;
 
+    case kO2ColorSpaceModelPattern:
+        // A pattern space has the components of its base space, which colour
+        // the pattern when it is an uncoloured one.
+        return self->_patternBase != nil
+                       ? O2ColorSpaceGetNumberOfComponents(self->_patternBase)
+                       : 0;
+
     default:
         return 0;
     }
@@ -380,6 +394,33 @@ void O2ColorSpaceGetColorTable(O2ColorSpaceRef self, unsigned char *table) {
 
 O2ColorSpaceModel O2ColorSpaceGetModel(O2ColorSpaceRef self) {
     return self->_type;
+}
+
+// Value equality, so that CFEqual and CGColorSpace users can tell the same space from another one: the model, the
+// name, the ICC data and the pattern base must match. Subclasses compare by identity.
+- (BOOL) isEqual: (id) other {
+    if (other == self)
+        return YES;
+    if ([self class] != [O2ColorSpace class] || [other class] != [O2ColorSpace class])
+        return NO;
+
+    O2ColorSpace *space = other;
+    if (_type != space->_type || _isPlatformRGB != space->_isPlatformRGB)
+        return NO;
+    if ((_name == NULL) != (space->_name == NULL) || (_name != NULL && !CFEqual(_name, space->_name)))
+        return NO;
+    if ((_iccData == NULL) != (space->_iccData == NULL) || (_iccData != NULL && !CFEqual(_iccData, space->_iccData)))
+        return NO;
+    if ((_patternBase == nil) != (space->_patternBase == nil) ||
+        (_patternBase != nil && ![_patternBase isEqual: space->_patternBase]))
+        return NO;
+    return YES;
+}
+
+- (NSUInteger) hash {
+    if ([self class] != [O2ColorSpace class])
+        return [super hash];
+    return (NSUInteger) _type * 31 + (_name != NULL ? (NSUInteger) CFHash(_name) : 0);
 }
 
 - (BOOL) isEqualToColorSpace: (O2ColorSpaceRef) other {

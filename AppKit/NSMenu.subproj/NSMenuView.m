@@ -18,6 +18,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
 #import <AppKit/NSMainMenuView.h>
+#import <AppKit/NSMenu+Private.h>
 #import <AppKit/NSMenuView.h>
 #import <AppKit/NSMenuWindow.h>
 #import <AppKit/NSRaise.h>
@@ -30,6 +31,87 @@ enum {
     kNSMenuKeyboardNavigationRight,
     kNSMenuKeyboardNavigationLetter
 };
+
+// The tracking sessions that are running, for -[NSMenu cancelTracking]. Each
+// is identified by the menu it tracks (the menu that was popped up, or the menu
+// bar); cancelling is a request that the session's event loop looks at after
+// every event, and a private event wakes the loop up when it is waiting.
+enum { _NSMenuTrackingCancelSubtype = 0x4d43 };
+
+@interface _NSMenuTrackingSession : NSObject {
+@public
+    NSMenu *menu; // not retained: the session ends before the menu can go
+    volatile BOOL cancelRequested;
+}
+@end
+
+@implementation _NSMenuTrackingSession
+@end
+
+static NSLock *trackingSessionsLock;
+static NSMutableArray *trackingSessions;
+
+static void _NSMenuTrackingInit(void) {
+    static dispatch_once_t once;
+
+    dispatch_once(&once, ^{
+        trackingSessionsLock = [[NSLock alloc] init];
+        trackingSessions = [[NSMutableArray alloc] init];
+    });
+}
+
+// Also used by -[NSMenu popUpMenuPositioningItem:atLocation:inView:], which begins its session before
+// the menu is updated and shown.
+_NSMenuTrackingSession *_NSMenuTrackingBegin(NSMenu *menu) {
+    _NSMenuTrackingSession *session = [[_NSMenuTrackingSession alloc] init];
+
+    _NSMenuTrackingInit();
+    session->menu = menu;
+    [trackingSessionsLock lock];
+    [trackingSessions addObject: session];
+    [trackingSessionsLock unlock];
+    return session;
+}
+
+void _NSMenuTrackingEnd(_NSMenuTrackingSession *session) {
+    [trackingSessionsLock lock];
+    [trackingSessions removeObjectIdenticalTo: session];
+    [trackingSessionsLock unlock];
+    [session release];
+}
+
+BOOL _NSMenuTrackingCancelRequested(_NSMenuTrackingSession *session) {
+    return session->cancelRequested;
+}
+
+// Ends the tracking of `menu`, if it is being tracked; callable from any
+// thread. Nothing happens for a menu that is not being tracked.
+void _NSMenuCancelTracking(NSMenu *menu) {
+    BOOL found = NO;
+
+    _NSMenuTrackingInit();
+    [trackingSessionsLock lock];
+    for (_NSMenuTrackingSession *session in trackingSessions) {
+        if (session->menu == menu) {
+            session->cancelRequested = YES;
+            found = YES;
+        }
+    }
+    [trackingSessionsLock unlock];
+    if (!found)
+        return;
+
+    NSEvent *wake = [NSEvent otherEventWithType: NSAppKitDefined
+                                       location: NSZeroPoint
+                                  modifierFlags: 0
+                                      timestamp: [[NSProcessInfo processInfo] systemUptime]
+                                   windowNumber: 0
+                                        context: nil
+                                        subtype: _NSMenuTrackingCancelSubtype
+                                          data1: 0
+                                          data2: 0];
+    [NSApp postEvent: wake atStart: YES];
+}
 
 @implementation NSMenuView
 
@@ -52,34 +134,43 @@ enum {
     return _selectedItemIndex;
 }
 
+// Tells the menu's delegate which item is about to be highlighted, nil for none. The index counts the items
+// shown. The method is optional.
+// https://developer.apple.com/documentation/appkit/nsmenudelegate/menu(_:willhighlight:)
+// Shape of the call (delegate lookup, item or nil by index) taken after the SiliconForest cocoa patches, MIT,
+// see THIRD-PARTY-NOTICES.md.
+- (void) _delegateWillHighlightItemAtIndex: (NSUInteger) itemIndex {
+    id delegate = [[self menu] delegate];
+
+    if ([delegate respondsToSelector: @selector(menu:willHighlightItem:)]) {
+        NSArray *items = [self visibleItemArray];
+        [delegate menu: [self menu]
+                willHighlightItem: itemIndex < [items count] ? [items objectAtIndex: itemIndex] : nil];
+    }
+}
+
 - (void) setSelectedItemIndex: (NSUInteger) itemIndex {
     if (_selectedItemIndex != itemIndex) {
+        // The delegate hears of the change before it happens, for the menu bar as for any menu.
+        [self _delegateWillHighlightItemAtIndex: itemIndex];
         _selectedItemIndex = itemIndex;
         [self setNeedsDisplay: YES];
         [self displayIfNeeded];
     }
 }
 
+// The items as shown, in the order of the selected item index.
 - (NSArray *) itemArray {
-    return [[self menu] itemArray];
+    return [NSArray arrayWithArray: [self visibleItemArray]];
 }
 
+// The items shown: not hidden, and of an item and its alternates only the one
+// for the modifier keys held now.
 - (NSArray *) visibleItemArray {
-    NSArray *items = [[self menu] itemArray];
-
-    // Construct a new array of just the visible items
     if (_visibleArray == NULL)
         _visibleArray = [[NSMutableArray alloc] init];
 
-    [_visibleArray removeAllObjects];
-
-    int i;
-    for (i = 0; i < [items count]; i++) {
-        NSMenuItem *item = [items objectAtIndex: i];
-        if (![item isHidden])
-            [_visibleArray addObject: item];
-    }
-
+    [_visibleArray setArray: [[self menu] _shownItemsWithModifierFlags: [NSEvent modifierFlags]]];
     return _visibleArray;
 }
 
@@ -131,7 +222,79 @@ enum {
 const NSTimeInterval kMenuInitialClickThreshold = .3f;
 const NSTimeInterval kMouseMovementThreshold = .001f;
 
+// The index of the item of this view under the point of a mouse event, or
+// NSNotFound if the event is not over this view.
+- (NSUInteger) _itemIndexAtEvent: (NSEvent *) event {
+    NSPoint point = [[event window] convertBaseToScreen: [event locationInWindow]];
+    point = [self convertPoint: [[self window] convertScreenToBase: point]
+                      fromView: nil];
+
+    NSRect rect;
+
+    if (!NSMouseInRect(point, [self bounds], [self isFlipped]))
+        return NSNotFound;
+    return [self itemIndexAtPoint: point rect: &rect];
+}
+
+// The menu delegate and notification calls of a tracking session: the menu
+// tracking started in this view gets NSMenuDidBeginTrackingNotification and
+// NSMenuDidEndTrackingNotification; each menu shown, other than the menu bar
+// itself, gets -menuWillOpen: and -menuDidClose: on its delegate.
+- (BOOL) _isMenuBar {
+    return [self isKindOfClass: [NSMainMenuView class]];
+}
+
+// The calls that start a tracking session, in the order macOS makes them:
+// the begin notification, then -menuNeedsUpdate: (only for the menu itself:
+// a submenu is updated when it opens), then -menuWillOpen:.
+- (void) _willBeginTracking {
+    NSMenu *menu = [self menu];
+
+    [[NSNotificationCenter defaultCenter]
+            postNotificationName: NSMenuDidBeginTrackingNotification
+                          object: menu];
+    [menu _updateWithoutSubmenus];
+    if (![self _isMenuBar] &&
+        [[menu delegate] respondsToSelector: @selector(menuWillOpen:)])
+        [[menu delegate] menuWillOpen: menu];
+}
+
+- (void) _didEndTracking {
+    NSMenu *menu = [self menu];
+
+    if (![self _isMenuBar] &&
+        [[menu delegate] respondsToSelector: @selector(menuDidClose:)])
+        [[menu delegate] menuDidClose: menu];
+    [[NSNotificationCenter defaultCenter]
+            postNotificationName: NSMenuDidEndTrackingNotification
+                          object: menu];
+}
+
+- (void) _pushBranch: (NSMenuView *) branch onto: (NSMutableArray *) stack {
+    NSMenu *menu = [branch menu];
+
+    [stack addObject: branch];
+    if ([[menu delegate] respondsToSelector: @selector(menuWillOpen:)])
+        [[menu delegate] menuWillOpen: menu];
+}
+
+- (void) _popBranch: (NSMutableArray *) stack {
+    NSMenuView *branch = [stack lastObject];
+    NSMenu *menu = [branch menu];
+
+    [[branch window] close];
+    [stack removeLastObject];
+    if ([[menu delegate] respondsToSelector: @selector(menuDidClose:)])
+        [[menu delegate] menuDidClose: menu];
+}
+
 - (NSMenuItem *) trackForEvent: (NSEvent *) event {
+    return [self _trackForEvent: event session: nil];
+}
+
+// With a session, the caller has already begun tracking (begin notification,
+// update, -menuWillOpen:) and made it cancellable; this ends it.
+- (NSMenuItem *) _trackForEvent: (NSEvent *) event session: (_NSMenuTrackingSession *) session {
     NSMenuItem *item = nil;
 
     enum {
@@ -155,8 +318,10 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
     // But while we're dealing with menus we want to track the mouse...
     [[self window] setAcceptsMouseMovedEvents: YES];
 
-    // Make sure the menu contents are up to date
-    [[self menu] update];
+    if (session == nil) {
+        session = _NSMenuTrackingBegin([self menu]);
+        [self _willBeginTracking];
+    }
 
     // And we, of course, are first on the stack
     [viewStack addObject: self];
@@ -166,6 +331,10 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
     int keyboardNavigationAction = kNSMenuKeyboardNavigationNone;
 
     BOOL cancelled = NO;
+    // Set when a press lands on the title of the item whose menu is open
+    // while the menu is sticky; the release over the same title closes the
+    // menu.
+    NSUInteger titlePressedIndex = NSNotFound;
     NSTimer* delaySubmenu = nil;
     NSRect lastRect = NSMakeRect(0,0,0,0);
     // The view whose coordinate space lastRect is expressed in.
@@ -226,7 +395,9 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
                     // Which item is the cursor on top of?
                     NSUInteger itemIndex =
                             [checkView itemIndexAtPoint: checkPoint rect: &lastRect];
-                    lastRectView = checkView;
+                    // A miss can leave lastRect unchanged. Only cache a view
+                    // when its hit test actually supplied an item's rectangle.
+                    lastRectView = itemIndex == NSNotFound ? nil : checkView;
 
                     MENUDEBUG(@"found an item index: %u", itemIndex);
 
@@ -239,8 +410,7 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
                         while (count + 1 < [viewStack count]) {
                             NSView *view = [viewStack lastObject];
                             MENUDEBUG(@"popping cascading view: %@", view);
-                            [[view window] close];
-                            [viewStack removeLastObject];
+                            [self _popBranch: viewStack];
                         }
 
                         // And now select the new item
@@ -265,7 +435,7 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
                                                 screen]) != nil) {
                                 MENUDEBUG(@"adding a new cascading view: %@",
                                         branch);
-                                [viewStack addObject: branch];
+                                [self _pushBranch: branch onto: viewStack];
                             }
                         }] retain];
                         [[NSRunLoop currentRunLoop] addTimer: delaySubmenu
@@ -311,8 +481,26 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
         event = [[self window]
                 nextEventMatchingMask: NSLeftMouseUpMask | NSMouseMovedMask |
                                        NSLeftMouseDraggedMask | NSKeyDownMask |
-                                       NSLeftMouseDownMask | NSAppKitDefinedMask];
+                                       NSLeftMouseDownMask | NSAppKitDefinedMask |
+                                       NSFlagsChangedMask];
         [event retain];
+
+        // -[NSMenu cancelTracking] was called; it also posted an event, so
+        // this is reached even while the loop was waiting.
+        if (session->cancelRequested) {
+            cancelled = YES;
+            [pool release];
+            break;
+        }
+
+        // The modifier keys held choose which of an item and its alternates
+        // is shown. The pointer stays where it was: keep the hit test working
+        // from its position in the event's window.
+        if ([event type] == NSFlagsChanged) {
+            point = [event locationInWindow];
+            for (NSMenuView *view in viewStack)
+                [view setNeedsDisplay: YES];
+        }
 
         if (keyboardNavigationAction != kNSMenuKeyboardNavigationNone) {
             // We didn't enter the mouse handling loop that predecrements count
@@ -355,8 +543,7 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
                 if ([viewStack count] > 1) {
                     NSView *view = [viewStack lastObject];
                     MENUDEBUG(@"popping cascading view: %@", view);
-                    [[view window] close];
-                    [viewStack removeLastObject];
+                    [self _popBranch: viewStack];
                 } else {
                     MENUDEBUG(@"Cancelling");
                     cancelled = YES;
@@ -473,8 +660,7 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
                 if ([viewStack count] > 1) {
                     NSView *view = [viewStack lastObject];
                     MENUDEBUG(@"popping cascading view: %@", view);
-                    [[view window] close];
-                    [viewStack removeLastObject];
+                    [self _popBranch: viewStack];
                 }
                 break;
             case kNSMenuKeyboardNavigationRight: {
@@ -485,15 +671,14 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
                              viewAtSelectedIndexPositionOnScreen: screen]) !=
                     nil) {
                     MENUDEBUG(@"adding a new cascading view: %@", branch);
-                    [viewStack addObject: branch];
+                    [self _pushBranch: branch onto: viewStack];
                 } else {
                     // We'll pop it - they're trying to navigate to the next
                     // menu most likely
                     if ([viewStack count] > 1) {
                         NSView *view = [viewStack lastObject];
                         MENUDEBUG(@"popping cascading view: %@", view);
-                        [[view window] close];
-                        [viewStack removeLastObject];
+                        [self _popBranch: viewStack];
                     }
                 }
             } break;
@@ -554,7 +739,7 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
         }
 
         if (cancelled == NO && [event type] != NSAppKitDefined &&
-            [event type] != NSKeyDown) {
+            [event type] != NSKeyDown && [event type] != NSFlagsChanged) {
 
             // looks like we can keep rolling
 
@@ -604,6 +789,30 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
 
             default:
                 item = [activeView itemAtSelectedIndex];
+                if ([event type] == NSLeftMouseDown) {
+                    // Pressing the title of the open menu again, once the menu
+                    // is sticky, closes the menu when the button is released
+                    // over that title. A press on another title, or inside
+                    // the menu, behaves as before.
+                    NSUInteger pressed = [self _itemIndexAtEvent: event];
+                    titlePressedIndex = NSNotFound;
+                    if (state == STATE_MOUSEUP && pressed != NSNotFound &&
+                        pressed == [self selectedItemIndex] &&
+                        [viewStack count] > 1 &&
+                        [[self itemAtSelectedIndex] hasSubmenu])
+                        titlePressedIndex = pressed;
+                } else if ([event type] == NSLeftMouseUp &&
+                           titlePressedIndex != NSNotFound) {
+                    NSUInteger released = [self _itemIndexAtEvent: event];
+                    BOOL closes = (released == titlePressedIndex);
+
+                    titlePressedIndex = NSNotFound;
+                    if (closes) {
+                        MENUDEBUG(@"title of the open menu clicked - closing");
+                        cancelled = YES;
+                        break;
+                    }
+                }
                 if ([event type] == NSLeftMouseUp) {
                     MENUDEBUG(@"mouseUp on item: %@", item);
                     if (item == nil) {
@@ -654,10 +863,18 @@ const NSTimeInterval kMouseMovementThreshold = .001f;
 
     MENUDEBUG(@"removing the visible menu views");
     while ([viewStack count] > 1) {
-        [[(NSView *) [viewStack lastObject] window] close];
-        [viewStack removeLastObject];
+        [self _popBranch: viewStack];
     }
     [viewStack removeLastObject];
+    _NSMenuTrackingEnd(session);
+    // QUIRK: when tracking ends with an item highlighted, the delegate is sent -menu:willHighlightItem: with nil
+    // after the submenus have closed and before -menuDidClose:. Not documented. Evidence: black-box observation
+    // on macOS 26.7.3 (tier 2), a pop-up menu positioned on an item, with and without an open submenu. Whether a
+    // call is made when nothing was highlighted was not observed, so none is.
+    // Test: appkit-menu-will-highlight-item (test_quirk_highlight_cleared_before_did_close)
+    if (_selectedItemIndex != NSNotFound)
+        [self _delegateWillHighlightItemAtIndex: NSNotFound];
+    [self _didEndTracking];
 
     _selectedItemIndex = NSNotFound;
     [[self window] setAcceptsMouseMovedEvents: oldAcceptsMouseMovedEvents];
