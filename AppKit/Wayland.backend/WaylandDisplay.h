@@ -185,11 +185,16 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     NSPoint _lastMouseLocation;
     uint32_t _pointerEnterSerial;
     NSUInteger _pressedButtons;
-    CGFloat _pendingScrollX, _pendingScrollY;
+    CGFloat _pendingScrollX, _pendingScrollY; // Sums of -value over the frame, in axis units.
     WaylandWindow *_pendingScrollWindow;
     CGPoint _pendingScrollSurfacePoint;
     NSUInteger _pendingScrollModifiers;
     BOOL _pendingScrollActive;
+    BOOL _pendingScrollFinger, _pendingScrollSourceNamed;
+    uint32_t _pendingScrollStoppedAxes; // Bit per wl_pointer axis, set by axis_stop.
+    BOOL _fingerScrollActive;
+    WaylandWindow *_fingerScrollWindow; // Nonretained; the window that got the began phase.
+    CGPoint _fingerScrollSurfacePoint;
     uint32_t _wlLastClickTime; // Compositor milliseconds, wraps modulo 2^32.
     uint32_t _wlLastClickButton;
     WaylandWindow *_wlLastClickWindow; // Nonretained; cleared on unmap/device loss.
@@ -271,12 +276,16 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 // handlers queue application-facing calls this way, so application code never
 // runs (and exceptions never unwind) inside native libwayland frames.
 - (void) performAfterDispatch: (void (^)(void)) block;
+// Runs a block at the end of the current pass of the main run loop, whether or not events are dispatched
+// before then.
+- (void) performAfterRunLoopPass: (void (^)(void)) block;
 
 - (void) windowCreated: (WaylandWindow *) window;
 - (void) windowActivated: (WaylandWindow *) window;
 - (void) windowUnmapped: (WaylandWindow *) window;
 - (void) applicationFocusMayHaveLeft;
 - (BOOL) mappingForActivation;
+- (BOOL) requestActivationOfWindow: (WaylandWindow *) window;
 - (void) mapDeferredWindows;
 - (void) windowDestroyed: (WaylandWindow *) window;
 

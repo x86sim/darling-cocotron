@@ -334,6 +334,7 @@ const CGFloat NSTableViewDefaultRowHeight = 17.0f;
     [_backgroundColor release];
     [_gridColor release];
     [NS_EXTRA(NSTableView, self)->_selectedRowIndexes release];
+    [NS_EXTRA(NSTableView, self)->_draggedRows release];
     [NS_EXTRA(NSTableView, self)->_selectedColumns release];
     [NS_EXTRA(NSTableView, self)->_sortDescriptors release];
     [NS_EXTRA(NSTableView, self)->_registeredNibs release];
@@ -645,8 +646,16 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     }
 
     rect.origin.x = 0.;
-    for (i = 0; i < column; i++)
-        rect.origin.x += [self _spaceTakenByColumn: [_tableColumns objectAtIndex: i]];
+    // QUIRK: the rectangle of a hidden column is an empty one at x 0, wherever the column is in the table; the
+    // documentation of isHidden does not say. Observed on macOS 26.7.3 and Mac OS X 10.14.4 (tier 2, the PR's test passes on both) and on 26.1 (arm64), probe 657.1: with 5 columns of
+    // widths 50, 60, 70, 80 and 90 "hidden=1 ... rectOfColumn x+w=[10+65 0+0 75+87 162+97 259+74]" and
+    // "hidden=4 ... [10+65 75+77 152+87 239+94 0+0]"; the probe printed x and width only, so y and height of
+    // that rectangle are unchanged here. The header rect and the cell frame of a hidden column agree
+    // (headerRect in 657.1, frameOfCellAtColumn:row: in probe 657.3).
+    // Test: tests/appkit-table-hidden-columns.m (test_rects_close_the_gap)
+    if (![[_tableColumns objectAtIndex: column] isHidden])
+        for (i = 0; i < column; i++)
+            rect.origin.x += [self _spaceTakenByColumn: [_tableColumns objectAtIndex: i]];
     rect.origin.y = 0.;
 
     rect.size.width = [self _spaceTakenByColumn: [_tableColumns objectAtIndex: column]];
@@ -693,6 +702,12 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 
 // The columns that the rect touches, as one range: it starts at the first column that is not hidden and ends
 // beyond the rect's right edge, and so may hold hidden columns between its ends.
+// QUIRK: a rect that reaches past the last shown column gets a range that runs to the last column, hidden
+// columns after the last shown one included; the documentation does not mention hidden columns. Observed on
+// macOS 26.1 (arm64) with 5 columns, column 4 hidden and the rect covering the table: the range was 0..4
+// (probe 657.1 "hidden=4 ... columnsInRect(full)=0..4"; "hidden=0,4 ... =1..4"; "hidden=all but 2 ... =2..4"),
+// while a rect ending inside a shown column stopped at it (probe 657.2 "hidden=4 ... x120+150:1..3").
+// Test: tests/appkit-table-hidden-columns.m (test_ranges_over_whole_rects)
 - (NSRange) columnsInRect: (NSRect) rect {
     NSInteger numberOfColumns = [self numberOfColumns];
     NSInteger i, first = -1, last = -1;
@@ -716,6 +731,8 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 
     if (first < 0)
         return NSMakeRange(0, 0); // returns 0,0 if not found, not NSNotFound
+    if (i == numberOfColumns)
+        last = numberOfColumns - 1;
     return NSMakeRange(first, last - first + 1);
 }
 
@@ -750,9 +767,12 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
         row >= [self numberOfRows])
         return NSZeroRect;
 
+    // QUIRK: x 0 for a hidden column, as in -rectOfColumn: (probe 657.3 "hidden=1 ... frameOfCellAtColumn:row:1
+    // -> 16+50 0+0 83+70 170+80 267+60").
     frame.origin.x = 0.;
-    for (i = 0; i < column; i++)
-        frame.origin.x += [self _spaceTakenByColumn: [_tableColumns objectAtIndex: i]];
+    if (![[_tableColumns objectAtIndex: column] isHidden])
+        for (i = 0; i < column; i++)
+            frame.origin.x += [self _spaceTakenByColumn: [_tableColumns objectAtIndex: i]];
 
     frame.origin.y = 0.;
     for (i = 0; i < row; i++)
@@ -1403,8 +1423,17 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     [_headerView setNeedsDisplay: YES];
 }
 
+// Hidden columns are left out of the set: https://developer.apple.com/documentation/appkit/nstableview/columnindexes(in:)
+// says columns that are hidden are not included, unlike the range columnsInRect: gives.
 - (NSIndexSet *) columnIndexesInRect: (NSRect) rect {
-    return [NSIndexSet indexSetWithIndexesInRange: [self columnsInRect: rect]];
+    NSRange range = [self columnsInRect: rect];
+    NSMutableIndexSet *result = [NSMutableIndexSet indexSet];
+    NSUInteger i;
+
+    for (i = range.location; i < NSMaxRange(range); i++)
+        if (![[_tableColumns objectAtIndex: i] isHidden])
+            [result addIndex: i];
+    return result;
 }
 
 - (void) deselectRow: (NSInteger) row {
@@ -1682,8 +1711,12 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     return [super becomeFirstResponder];
 }
 
+// A table gives way to the field editor of the cell it edits. NSControl checks its selected cell while it has an
+// editor; a table's editor belongs to the cell being edited (test: appkit-tableview-edit-column.m).
 - (BOOL) resignFirstResponder {
     [self setNeedsDisplay: YES];
+    if (NS_EXTRA(NSControl, self)->_currentEditor != nil)
+        return _editingCell == nil || [_editingCell hasValidObjectValue];
     return [super resignFirstResponder];
 }
 
@@ -2247,13 +2280,14 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     if ([self drawsGrid])
         [self drawGridInClipRect: clipRect];
 
-    if (NS_EXTRA(NSTableView, self)->_draggingTargetShown && NS_EXTRA(NSTableView, self)->_draggingOperation == NSTableViewDropOn) {
+    NSInteger dropRow = [self _dropIndicatorRow];
+    if (NS_EXTRA(NSTableView, self)->_draggingTargetShown && [self _dropIndicatorIsOn]) {
         // GUESS: the highlight of a drop on a row, or on the whole table (row -1), is an outline
-        NSRect target = NS_EXTRA(NSTableView, self)->_draggingRow < 0 ? [self visibleRect]
-                      : NSIntersectionRect([self rectOfRow: NS_EXTRA(NSTableView, self)->_draggingRow], [self visibleRect]);
+        NSRect target = dropRow < 0 ? [self visibleRect]
+                      : NSIntersectionRect([self rectOfRow: dropRow], [self visibleRect]);
         [[NSColor blackColor] setStroke];
         [NSBezierPath strokeRect: NSInsetRect(target, 1.0, 1.0)];
-    } else if (NS_EXTRA(NSTableView, self)->_draggingTargetShown && NS_EXTRA(NSTableView, self)->_draggingRow >= 0) {
+    } else if (NS_EXTRA(NSTableView, self)->_draggingTargetShown && dropRow >= 0) {
         NSRect rowRect;
         [[NSColor blackColor] setStroke];
         if ([self numberOfRows] == 0)
@@ -2262,8 +2296,8 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
                                 toPoint: NSMakePoint([self bounds].size.width,
                                                      0)];
         else {
-            if (NS_EXTRA(NSTableView, self)->_draggingRow == [self numberOfRows]) {
-                rowRect = NSIntersectionRect([self rectOfRow: NS_EXTRA(NSTableView, self)->_draggingRow - 1],
+            if (dropRow == [self numberOfRows]) {
+                rowRect = NSIntersectionRect([self rectOfRow: dropRow - 1],
                                              [self visibleRect]);
                 [NSBezierPath
                         strokeLineFromPoint: NSMakePoint(
@@ -2276,7 +2310,7 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
                                                              rowRect.size
                                                                      .height)];
             } else {
-                rowRect = NSIntersectionRect([self rectOfRow: NS_EXTRA(NSTableView, self)->_draggingRow],
+                rowRect = NSIntersectionRect([self rectOfRow: dropRow],
                                              [self visibleRect]);
                 [NSBezierPath
                         strokeLineFromPoint: NSMakePoint(0, rowRect.origin.y)
@@ -2499,8 +2533,8 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
                         byExtendingSelection: NO];
         } else { // normal selection, allow for dragging
             BOOL dragging = NO;
-            if ([_dataSource respondsToSelector: @selector
-                             (tableView:writeRowsWithIndexes:toPasteboard:)]) {
+            NSEvent *down = event;
+            if ([self _dataSourceWritesRows]) {
                 NSPoint currentPoint;
                 do {
                     event = [_window
@@ -2531,7 +2565,28 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 
                 NSPasteboard *pasteboard =
                         [NSPasteboard pasteboardWithName: NSDragPboard];
-                if ([_dataSource tableView: self
+                if ([self _dataSourceHasPasteboardWriters]) {
+                    // The rows' writers are the dragging session's items; a row without one stays out
+                    NSMutableArray *items = [NSMutableArray array];
+                    NSMutableIndexSet *dragged = [NSMutableIndexSet indexSet];
+                    NSUInteger row = [rowIndexes firstIndex];
+                    for (; row != NSNotFound; row = [rowIndexes indexGreaterThanIndex: row]) {
+                        id<NSPasteboardWriting> writer = [self _pasteboardWriterForRow: row];
+                        if (writer == nil)
+                            continue;
+                        NSDraggingItem *item = [[[NSDraggingItem alloc] initWithPasteboardWriter: writer] autorelease];
+                        [item setDraggingFrame: [self rectOfRow: row] contents: nil];
+                        [items addObject: item];
+                        [dragged addIndex: row];
+                    }
+                    if ([items count] == 0)
+                        dragging = NO;
+                    else {
+                        [NS_EXTRA(NSTableView, self)->_draggedRows release];
+                        NS_EXTRA(NSTableView, self)->_draggedRows = [dragged copy];
+                        [self beginDraggingSessionWithItems: items event: down source: self];
+                    }
+                } else if ([_dataSource tableView: self
                             writeRowsWithIndexes: rowIndexes
                                     toPasteboard: pasteboard] == NO)
                     dragging = NO;
@@ -2685,6 +2740,46 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     return isLocal ? NS_EXTRA(NSTableView, self)->_draggingSourceMaskLocal : NS_EXTRA(NSTableView, self)->_draggingSourceMaskNonLocal;
 }
 
+#pragma mark Dragging source
+
+// The data source can give the rows to drag: as pasteboard writers, which come first, or onto a pasteboard
+- (BOOL) _dataSourceHasPasteboardWriters {
+    return [_dataSource respondsToSelector: @selector(tableView:pasteboardWriterForRow:)];
+}
+
+- (BOOL) _dataSourceWritesRows {
+    return [self _dataSourceHasPasteboardWriters] ||
+           [_dataSource respondsToSelector: @selector(tableView:writeRowsWithIndexes:toPasteboard:)];
+}
+
+- (id<NSPasteboardWriting>) _pasteboardWriterForRow: (NSInteger) row {
+    return [_dataSource tableView: self pasteboardWriterForRow: row];
+}
+
+- (NSDragOperation) draggingSession: (NSDraggingSession *) session
+    sourceOperationMaskForDraggingContext: (NSDraggingContext) context
+{
+    return [self draggingSourceOperationMaskForLocal: context == NSDraggingContextWithinApplication];
+}
+
+- (void) draggingSession: (NSDraggingSession *) session willBeginAtPoint: (NSPoint) screenPoint {
+    NSIndexSet *rows = NS_EXTRA(NSTableView, self)->_draggedRows ?: [NSIndexSet indexSet];
+    if ([_dataSource respondsToSelector: @selector(tableView:draggingSession:willBeginAtPoint:forRowIndexes:)])
+        [_dataSource tableView: self draggingSession: session willBeginAtPoint: screenPoint forRowIndexes: rows];
+}
+
+- (void) draggingSession: (NSDraggingSession *) session
+            endedAtPoint: (NSPoint) screenPoint
+               operation: (NSDragOperation) operation
+{
+    if ([_dataSource respondsToSelector: @selector(tableView:draggingSession:endedAtPoint:operation:)])
+        [_dataSource tableView: self draggingSession: session endedAtPoint: screenPoint operation: operation];
+    [NS_EXTRA(NSTableView, self)->_draggedRows release];
+    NS_EXTRA(NSTableView, self)->_draggedRows = nil;
+}
+
+#pragma mark Drop target
+
 - (NSInteger) _getDraggedRowForPoint: (NSPoint) dragPoint {
     NSInteger draggedRow = [self rowAtPoint: dragPoint];
     if (-1 == draggedRow) {
@@ -2712,7 +2807,7 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 // Observed by black-box test on macOS 26.7.3 and 10.14.4 (pointer at 2%, 10%, 25%, 40%..75%, 90% and 98% of a
 // row's height: above, above, on, on, on, next row above, next row above); the edge zones are of a fifth of the
 // row's height here, the observed boundaries lie between 10% and 25% and between 75% and 90%.
-// Test: appkit-table-set-drop-row.m
+// Test: appkit-table-set-drop-row.m, appkit-tableview-drag.m
 - (void) _proposeDropForPoint: (NSPoint) point {
     NSInteger row = [self rowAtPoint: point];
     NSTableViewDropOperation operation = NSTableViewDropAbove;
@@ -2733,89 +2828,119 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     [self setDropRow: row dropOperation: operation];
 }
 
+// The data source's side of a drop. NSOutlineView overrides these to ask its data source about items.
+- (BOOL) _dataSourceValidatesDrops {
+    return [_dataSource respondsToSelector: @selector(tableView:validateDrop:proposedRow:proposedDropOperation:)];
+}
+
+- (NSDragOperation) _dataSourceValidateDrop: (id<NSDraggingInfo>) info {
+    return [_dataSource tableView: self
+                     validateDrop: info
+                      proposedRow: NS_EXTRA(NSTableView, self)->_draggingRow
+            proposedDropOperation: NS_EXTRA(NSTableView, self)->_draggingOperation];
+}
+
+- (BOOL) _dataSourceAcceptDrop: (id<NSDraggingInfo>) info {
+    if (![_dataSource respondsToSelector: @selector(tableView:acceptDrop:row:dropOperation:)])
+        return NO;
+    return [_dataSource tableView: self
+                       acceptDrop: info
+                              row: NS_EXTRA(NSTableView, self)->_draggingRow
+                    dropOperation: NS_EXTRA(NSTableView, self)->_draggingOperation];
+}
+
+// A drop forced on a table whose data source validates no drops
+- (BOOL) _dataSourceAcceptUnvalidatedDrop: (id<NSDraggingInfo>) info {
+    // QUIRK: a drop that reaches a table whose data source implements no validateDrop (the drag itself
+    // was refused, so this is only a drop forced on the table) still goes to acceptDrop, with the
+    // target row -2 and NSTableViewDropOn; a data source without acceptDrop is not asked.
+    // Evidence: black-box observation on macOS 26.7.3 and 10.14.4 (tier 2), identical on both.
+    // Test: appkit-table-set-drop-row.m, test_quirk_drop_without_validate_drop
+    if (![_dataSource respondsToSelector: @selector(tableView:acceptDrop:row:dropOperation:)])
+        return NO;
+    return [_dataSource tableView: self acceptDrop: info row: -2 dropOperation: NSTableViewDropOn];
+}
+
+// The row the drop feedback goes with (-1: the whole table), and whether the drop is on it rather than above it
+- (NSInteger) _dropIndicatorRow {
+    return NS_EXTRA(NSTableView, self)->_draggingRow;
+}
+
+- (BOOL) _dropIndicatorIsOn {
+    return NS_EXTRA(NSTableView, self)->_draggingOperation == NSTableViewDropOn;
+}
+
+- (void) _showDropTarget: (BOOL) shown {
+    NS_EXTRA(NSTableView, self)->_draggingTargetShown = shown;
+    [self display];
+}
+
 - (NSDragOperation) _validateDraggedRow: (id<NSDraggingInfo>) info {
     NSDragOperation result = NSDragOperationNone;
 
     [self _proposeDropForPoint: [self convertPoint: [info draggingLocation] fromView: nil]];
 
     // A data source without validateDrop refuses the drag (nothing is proposed to it).
-    if ([_dataSource
-                respondsToSelector: @selector
-                (tableView:validateDrop:proposedRow:proposedDropOperation:)]) {
-        result = [_dataSource tableView: self
-                           validateDrop: info
-                            proposedRow: NS_EXTRA(NSTableView, self)->_draggingRow
-                  proposedDropOperation: NS_EXTRA(NSTableView, self)->_draggingOperation];
-    }
+    if ([self _dataSourceValidatesDrops])
+        result = [self _dataSourceValidateDrop: info];
 
     NS_EXTRA(NSTableView, self)->_draggingTargetKnown = result != NSDragOperationNone;
-    NS_EXTRA(NSTableView, self)->_draggingTargetShown = result != NSDragOperationNone;
-    [self display];
-
+    [self _showDropTarget: result != NSDragOperationNone];
     return result;
 }
 
+- (BOOL) _draggingPasteboardHasDraggedType: (id<NSDraggingInfo>) sender {
+    for (NSString *type in [self _draggedTypes])
+        if ([[[sender draggingPasteboard] types] containsObject: type])
+            return YES;
+    return NO;
+}
+
 - (NSDragOperation) draggingEntered: (id<NSDraggingInfo>) sender {
-    for (NSInteger i = 0; i < [[self _draggedTypes] count]; i++) {
-        if ([[[sender draggingPasteboard] types]
-                    containsObject: [[self _draggedTypes] objectAtIndex: i]])
-            return [self _validateDraggedRow: sender];
-    }
+    if ([self _draggingPasteboardHasDraggedType: sender])
+        return [self _validateDraggedRow: sender];
     return NSDragOperationNone;
 }
 
 - (NSDragOperation) draggingUpdated: (id<NSDraggingInfo>) sender {
-    for (NSInteger i = 0; i < [[self _draggedTypes] count]; i++) {
-        if ([[[sender draggingPasteboard] types]
-                    containsObject: [[self _draggedTypes] objectAtIndex: i]])
-            return [self _validateDraggedRow: sender];
-    }
+    if ([self _draggingPasteboardHasDraggedType: sender])
+        return [self _validateDraggedRow: sender];
     return NSDragOperationNone;
 }
 
 - (void) draggingExited: (id<NSDraggingInfo>) sender {
     NS_EXTRA(NSTableView, self)->_draggingTargetKnown = NO;
-    NS_EXTRA(NSTableView, self)->_draggingTargetShown = NO;
-    [self display];
+    [self _showDropTarget: NO];
 }
 
 - (BOOL) prepareForDragOperation: (id<NSDraggingInfo>) sender {
-    NS_EXTRA(NSTableView, self)->_draggingTargetShown = NO;
-    [self display];
+    [self _showDropTarget: NO];
     return YES;
 }
 
 - (BOOL) performDragOperation: (id<NSDraggingInfo>) sender {
-    BOOL validates = [_dataSource respondsToSelector: @selector
-                                  (tableView:validateDrop:proposedRow:proposedDropOperation:)];
-
-    if (!validates) {
-        // QUIRK: a drop that reaches a table whose data source implements no validateDrop (the drag itself
-        // was refused, so this is only a drop forced on the table) still goes to acceptDrop, with the
-        // target row -2 and NSTableViewDropOn; a data source without acceptDrop is not asked.
-        // Evidence: black-box observation on macOS 26.7.3 and 10.14.4 (tier 2), identical on both.
-        // Test: appkit-table-set-drop-row.m, test_quirk_drop_without_validate_drop
-        if (![_dataSource respondsToSelector: @selector(tableView:acceptDrop:row:dropOperation:)])
-            return NO;
+    if (![self _dataSourceValidatesDrops]) {
         NS_EXTRA(NSTableView, self)->_draggingTargetKnown = NO;
-        return [_dataSource tableView: self acceptDrop: sender row: -2 dropOperation: NSTableViewDropOn];
+        return [self _dataSourceAcceptUnvalidatedDrop: sender];
     }
 
     if (!NS_EXTRA(NSTableView, self)->_draggingTargetKnown) {
         // Dropped without a preceding validation: validate now; the outline this draws is cleared again at once
         BOOL refused = [self _validateDraggedRow: sender] == NSDragOperationNone;
 
-        NS_EXTRA(NSTableView, self)->_draggingTargetShown = NO;
-        [self display];
+        [self _showDropTarget: NO];
         if (refused)
             return NO;
     }
 
     NS_EXTRA(NSTableView, self)->_draggingTargetKnown = NO;
-    return [_dataSource tableView: self
-                       acceptDrop: sender
-                              row: NS_EXTRA(NSTableView, self)->_draggingRow
-                    dropOperation: NS_EXTRA(NSTableView, self)->_draggingOperation];
+    return [self _dataSourceAcceptDrop: sender];
+}
+
+- (void) draggingEnded: (id<NSDraggingInfo>) sender {
+    NS_EXTRA(NSTableView, self)->_draggingTargetKnown = NO;
+    if (NS_EXTRA(NSTableView, self)->_draggingTargetShown)
+        [self _showDropTarget: NO];
 }
 
 - (NSString *) description {

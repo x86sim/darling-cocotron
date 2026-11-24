@@ -44,7 +44,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSScreen.h>
 #import <AppKit/NSSheetContext.h>
 #import <AppKit/NSSpellChecker.h>
+#import <AppKit/NSStatusBar_(Private).h>
 #import <AppKit/NSStoryboard-Private.h>
+#import <AppKit/NSToolTipWindow.h>
 #import <AppKit/NSSystemInfoPanel.h>
 #import <AppKit/NSWindow-Private.h>
 #import <AppKit/NSWorkspace.h>
@@ -450,11 +452,13 @@ static NSArray *pathsOfDocumentsEvent(NSAppleEventDescriptor *event) {
     for (NSInteger i = 1; i <= count; i++) {
         NSAppleEventDescriptor *item =
                 [object descriptorType] == typeAEList ? [object descriptorAtIndex: i] : object;
-        NSData *data = [item data];
         NSString *string = nil;
 
-        if ([item descriptorType] == typeFileURL || [item descriptorType] == typeUTF8Text)
-            string = [[[NSString alloc] initWithData: data encoding: NSUTF8StringEncoding] autorelease];
+        // Items are file URLs, text, or anything that coerces to a file URL (such as bookmark data).
+        if ([item descriptorType] != typeUTF8Text)
+            item = [item coerceToDescriptorType: typeFileURL];
+        if (item != nil)
+            string = [[[NSString alloc] initWithData: [item data] encoding: NSUTF8StringEncoding] autorelease];
 
         NSURL *url = string != nil ? [NSURL URLWithString: string] : nil;
         if ([url isFileURL] && [[url path] length] > 0)
@@ -511,13 +515,28 @@ static NSMutableArray *pendingOpenURLs = nil;
     [self _handleInitialEvent: kind paths: paths];
 }
 
+// The documents of an open-documents event go to application:openURLs:, as file URLs, when the
+// delegate implements it; application:openFile: and application:openFiles: are then not called
+// (NSApplicationDelegate documentation). Documents named in argv are not an event: they go to
+// openFile(s): (observed on macOS 26.7.3; tests/src/launch_documents_delivery.m in darling).
+- (void) _openDocumentsOfEvent: (NSArray *) paths {
+    if ([paths count] == 0)
+        return;
+    if ([_delegate respondsToSelector: @selector(application:openURLs:)]) {
+        NSMutableArray *urls = [NSMutableArray arrayWithCapacity: [paths count]];
+        for (NSString *path in paths)
+            [urls addObject: [NSURL fileURLWithPath: path]];
+        [self _openURLs: urls];
+    } else
+        [self _openFileNames: paths];
+}
+
 - (void) _handleOpenDocumentsEvent: (NSAppleEventDescriptor *) event
                     withReplyEvent: (NSAppleEventDescriptor *) reply {
     NSArray *paths = pathsOfDocumentsEvent(event);
 
     if (launchComplete) {
-        if ([paths count] > 0)
-            [self _openFileNames: paths];
+        [self _openDocumentsOfEvent: paths];
         return;
     }
     [self _launchEvent: InitialEventOpenDocuments paths: paths];
@@ -632,6 +651,17 @@ static NSMutableArray *pendingOpenURLs = nil;
         !([window styleMask] & NSAppKitPrivateWindow))
         return nil;
     return window;
+}
+
+// Private. The argument is an NSInteger (type encoding q on 64-bit, i on i386, observed on
+// macOS 26.7.3 and 10.14.4). AppKit-hosting frameworks (Mac Catalyst) ask the application which
+// window owns a rendering context id. Cocotron has no per-window context ids:
+// -contextID is the process's one CGS connection id, a counter apart from window
+// numbers, so no id can be mapped to a window honestly. Answering with the window
+// of the same number would return a wrong window for a caller's context id, so
+// no window is ever found.
+- (NSWindow *) _findWindowUsingContextID: (NSInteger) contextID {
+    return nil;
 }
 
 - (NSMenu *) mainMenu {
@@ -945,6 +975,20 @@ static void _propagateAppearanceChangeToView(NSView *view) {
         [[_windows objectAtIndex: count] miniaturize: sender];
 }
 
+// Private, required by Mac Catalyst frameworks and not documented. It restores one minimized
+// window, as a click on the application's Dock tile does: the first miniaturized window in
+// -orderedWindows order, and none when no window is miniaturized. It returns nothing (type
+// encoding v on macOS 10.14.4 and 26.7.3, where a probe with real windows restored the first
+// miniaturized one in -orderedWindows order on each call). Test: appkit-application-catalyst-methods.
+- (void) _restoreMiniaturizedWindow {
+    for (NSWindow *window in [self orderedWindows]) {
+        if ([window isMiniaturized]) {
+            [window deminiaturize: nil];
+            return;
+        }
+    }
+}
+
 - (NSArray *) orderedDocuments {
     NSMutableArray *result = [NSMutableArray array];
     NSArray *orderedWindows = [self orderedWindows];
@@ -1238,6 +1282,17 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
         if ([_delegate respondsToSelector: @selector(application:openFiles:)]) {
             [_delegate application: self openFiles: one];
             opened = YES;
+        } else if ([_delegate respondsToSelector: @selector(application:openFile:)]) {
+            BOOL taken = [_delegate application: self openFile: document];
+
+            // QUIRK: a document named in the process arguments that the delegate's -application:openFile: does
+            // not take (answers NO) is then tried by the document controller, which presents an error when it
+            // cannot open it. Not documented. Evidence: black-box observation on macOS 26.7.3 (tier 2), a
+            // document-based application started from its executable with words that are no documents.
+            // Test: appkit-argument-documents (-delegate openFile)
+            if (!taken)
+                taken = [[NSDocumentController sharedDocumentController] application: self openFile: document];
+            opened |= taken;
         } else {
             opened |= [self _openFileNames: one];
         }
@@ -1353,7 +1408,7 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
         if (!argumentDocumentsOpened)
             [self _openUntitledFileIfNeeded];
     } else if (kind == InitialEventOpenDocuments) {
-        [self _openFileNames: paths];
+        [self _openDocumentsOfEvent: paths];
     } else if (kind == InitialEventOpenURLs) {
         [self _openURLs: paths];
     } else {
@@ -1396,7 +1451,7 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
         NSArray *paths = [pendingOpenFiles autorelease];
 
         pendingOpenFiles = nil;
-        [self _openFileNames: paths];
+        [self _openDocumentsOfEvent: paths];
     }
     if ([pendingOpenURLs count] > 0) {
         NSArray *urls = [pendingOpenURLs autorelease];
@@ -1430,34 +1485,127 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
     }
 }
 
+// Windows that never count as one of the application's windows when deciding
+// whether the last one is gone: panels, which include the menu, pop-up and
+// alert windows, sheets, and the application's internal helper windows.
+//
+// QUIRK: a panel or sheet that is left does not keep the application from being
+// asked, but a borderless or floating ordinary window, one that is minimized, or
+// one without a close button does. Not documented. Evidence: black-box
+// observation on macOS 26.7.3 (tier 2), delegate answering YES.
+// Test: tests/appkit-terminate-after-last-window.sh, the "panel left over",
+// "borderless window left over" and "miniaturized window" cases.
+static BOOL windowCountsAsApplicationWindow(NSWindow *window) {
+    if ([window isKindOfClass: [NSPanel class]] || [window isSheet] ||
+        [window isKindOfClass: [NSToolTipWindow class]] ||
+        [window isKindOfClass: NSClassFromString(@"NSMenuBarWindow")] ||
+        [window isKindOfClass: NSClassFromString(@"NSWindowDragImageWindow")])
+        return NO;
+    return YES;
+}
+
+- (void) _scheduleTerminateCheck {
+    // After the close or order-out has completed, on the next run-loop pass.
+    [self performSelector: @selector(_checkForTerminate)
+               withObject: nil
+               afterDelay: 0.0];
+}
+
 - (void) _windowWillClose: (NSNotification *) note {
-    if (![[note object] isKindOfClass: [NSPanel class]])
-        NS_EXTRA(NSApplication, self)->_windowClosedSinceTerminateCheck = YES;
+    NSWindow *window = [note object];
+
+    if (!windowCountsAsApplicationWindow(window))
+        return;
+    NS_EXTRA(NSApplication, self)->_windowClosedSinceTerminateCheck = YES;
+    // A window without a title bar or close button is not one that the user
+    // closes to leave the application.
+    if ([window _isClosingByUser] &&
+        ([window styleMask] & NSTitledWindowMask) &&
+        ([window styleMask] & NSClosableWindowMask))
+        NS_EXTRA(NSApplication, self)->_windowClosedByUserSinceTerminateCheck = YES;
+    [self _scheduleTerminateCheck];
+}
+
+// QUIRK: ordering the last window out, not only closing it, makes the delegate
+// be asked -applicationShouldTerminateAfterLastWindowClosed:. This is not
+// documented; the documentation speaks of closing. Evidence: black-box
+// observation on macOS 26.7.3 (tier 2): with a delegate answering YES, an
+// application whose only window was ordered out called
+// -applicationShouldTerminate: (and quit) just as when the window was closed,
+// also for the last of several windows ordered out one by one.
+// Test: tests/appkit-terminate-after-last-window.sh, "delegate YES: quits when
+// the last window is ordered out". It only concerns the delegate; the
+// TerminateAfterLastWindowClosed setting acts on closes by the user.
+- (void) _windowWasOrderedOut: (NSWindow *) window {
+    if (!windowCountsAsApplicationWindow(window))
+        return;
+    NS_EXTRA(NSApplication, self)->_windowClosedSinceTerminateCheck = YES;
+    [self _scheduleTerminateCheck];
+}
+
+// The Darling setting TerminateAfterLastWindowClosed (boolean, off by default).
+// The application's own value wins; otherwise the user's org.darlinghq.AppKit
+// domain decides, so that it can be set for all applications.
+static BOOL terminateAfterLastWindowClosedSetting(void) {
+    CFStringRef key = CFSTR("TerminateAfterLastWindowClosed");
+    Boolean valid = false;
+    Boolean flag = CFPreferencesGetAppBooleanValue(
+            key, kCFPreferencesCurrentApplication, &valid);
+
+    if (!valid)
+        flag = CFPreferencesGetAppBooleanValue(
+                key, CFSTR("org.darlinghq.AppKit"), &valid);
+    return valid && flag;
 }
 
 // Terminates the application once its last window has been closed, if the
 // delegate asks for that. Hiding or never opening windows does not count.
+//
+// Mirrors macOS: when no window of the application is left on screen, after
+// a window was closed or ordered out, the delegate is asked
+// -applicationShouldTerminateAfterLastWindowClosed: and a YES makes the
+// application call -terminate:. Minimized windows, windows hidden by
+// deactivation and ordinary windows of any style still count as open.
+//
+// Darling has no Dock, so an application that stays running without a window
+// looks stuck on Linux desktops. With TerminateAfterLastWindowClosed set, a
+// regular application that does not implement the delegate method also calls
+// -terminate: when the user closes its last window. An application that
+// implements the method keeps its own decision, whichever way it answers.
 - (void) _checkForTerminate {
-    if (!NS_EXTRA(NSApplication, self)->_windowClosedSinceTerminateCheck)
+    BOOL closed = NS_EXTRA(NSApplication, self)->_windowClosedSinceTerminateCheck;
+    BOOL closedByUser = NS_EXTRA(NSApplication, self)->_windowClosedByUserSinceTerminateCheck;
+
+    if (!closed && !closedByUser)
         return;
     NS_EXTRA(NSApplication, self)->_windowClosedSinceTerminateCheck = NO;
+    NS_EXTRA(NSApplication, self)->_windowClosedByUserSinceTerminateCheck = NO;
+    // Documents closing as part of -terminate: are not the user leaving.
+    if (NS_EXTRA(NSApplication, self)->_terminateInProgress)
+        return;
 
     int count = [_windows count];
 
     while (--count >= 0) {
         NSWindow *check = [_windows objectAtIndex: count];
 
-        if ([check isKindOfClass: [NSPanel class]])
+        if (!windowCountsAsApplicationWindow(check))
             continue;
         if ([check isVisible] || [check _isHiddenForDeactivation])
             return;
     }
 
     if ([_delegate respondsToSelector: @selector
-                   (applicationShouldTerminateAfterLastWindowClosed:)] &&
-        [_delegate applicationShouldTerminateAfterLastWindowClosed: self]) {
-        [self terminate: self];
+                   (applicationShouldTerminateAfterLastWindowClosed:)]) {
+        if ([_delegate applicationShouldTerminateAfterLastWindowClosed: self])
+            [self terminate: self];
+        return;
     }
+
+    if (closedByUser && terminateAfterLastWindowClosedSetting() &&
+        [self activationPolicy] == NSApplicationActivationPolicyRegular &&
+        ![NSStatusBar _hasStatusItems])
+        [self terminate: self];
 }
 
 - (void) _checkForAppActivation {
@@ -1567,13 +1715,8 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
     // Constraint/layout callbacks may close windows or open new ones.
     NSArray *windows = [[NSApp windows] copy];
     @try {
-        for (NSWindow *window in windows) {
-            if ([window isVisible] && ![window isMiniaturized]) {
-                [window _fitContentSizeToConstraints];
-                [[window _backgroundView] layoutSubtreeIfNeeded];
-            }
-            [window displayIfNeeded];
-        }
+        for (NSWindow *window in windows)
+            [window _layoutAndDisplayIfNeeded];
     } @finally {
         [windows release];
     }
@@ -1649,7 +1792,7 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
 }
 
 - (void) postEvent: (NSEvent *) event atStart: (BOOL) atStart {
-    [NS_EXTRA(NSApplication, self)->_display postEvent: event atStart: atStart];
+    [NS_EXTRA(NSApplication, self)->_display _postEventWithoutCoalescing: event atStart: atStart];
 }
 
 - _searchForAction: (SEL) action responder: target {
@@ -1776,10 +1919,13 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
     NSUnimplementedMethod();
 }
 
-// The windows are updated between the two notifications.
+// The windows are updated between the two notifications; only the windows on screen are updated (and their
+// toolbars validated), as documented. Test: tests/appkit-toolbar-closed-window-validation.m
 - (void) updateWindows {
     [[NSNotificationCenter defaultCenter] postNotificationName: NSApplicationWillUpdateNotification object: self];
-    [_windows makeObjectsPerformSelector: @selector(update)];
+    for (NSWindow *window in [[_windows copy] autorelease])
+        if ([window isVisible])
+            [window update];
     [[NSNotificationCenter defaultCenter] postNotificationName: NSApplicationDidUpdateNotification object: self];
 }
 
@@ -2195,6 +2341,7 @@ static BOOL isModalWindowOrItsSheet(NSWindow *window, NSWindow *modalWindow) {
 }
 
 - (void) terminate: sender {
+    NS_EXTRA(NSApplication, self)->_terminateInProgress = YES;
     // The windows are saved before the documents close them.
     NS_DURING [self _saveRestorableStateForTermination];
     NS_HANDLER [self reportException: localException];
@@ -2212,6 +2359,8 @@ static BOOL isModalWindowOrItsSheet(NSWindow *window, NSWindow *modalWindow) {
                  contextInfo: (void *) info
 {
     // callback method for terminate:
+    if (!didCloseAll)
+        NS_EXTRA(NSApplication, self)->_terminateInProgress = NO;
     if (didCloseAll) {
         if ([_delegate
                     respondsToSelector: @selector(applicationShouldTerminate:)])
@@ -2224,6 +2373,8 @@ static BOOL isModalWindowOrItsSheet(NSWindow *window, NSWindow *modalWindow) {
 }
 
 - (void) replyToApplicationShouldTerminate: (BOOL) terminate {
+    // A cancelled termination ends here, and the application runs on.
+    NS_EXTRA(NSApplication, self)->_terminateInProgress = NO;
     if (terminate == YES) {
         [[NSNotificationCenter defaultCenter]
                 postNotificationName: NSApplicationWillTerminateNotification

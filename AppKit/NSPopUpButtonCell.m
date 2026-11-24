@@ -303,7 +303,12 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
 
 - (void) _addItemWithTitle: (NSString *) title {
 
-    NSMenuItem *duplicate = [_menu itemWithTitle: title];
+    // QUIRK: an item with an empty title never replaces an earlier one: only titled items are
+    // de-duplicated, so adding @"" to a pop-up that holds a separator or an empty-titled item
+    // keeps both. Not documented. Evidence: black-box observation of NSPopUpButtonCell on
+    // macOS 26.7.3 and 10.14.4 (tier 2): [A]+A has 1 item, []+@"" 2, [A,@"",B]+@"" 4.
+    // Test: appkit-nsmenuitem-title-never-nil (quirk: empty titles are not de-duplicated)
+    NSMenuItem *duplicate = [title length] > 0 ? [_menu itemWithTitle: title] : nil;
     if (duplicate != nil) {
         // don't allow items with duplicate titles by default
         [_menu removeItem: duplicate];
@@ -385,8 +390,16 @@ NSNotificationName NSPopUpButtonCellWillPopUpNotification =
     [self selectItem: item];
 }
 
+// QUIRK: a title that only matches a separator item (an empty title) selects nothing: the index
+// of the selected item becomes -1. Not documented. Evidence: black-box observation of
+// NSPopUpButtonCell on macOS 26.7.3 and 10.14.4 (tier 2), [A, separator] with @"".
+// Test: appkit-nsmenuitem-title-never-nil (quirk: selecting the title of a separator)
 - (void) selectItemWithTitle: (NSString *) title {
-    [self selectItemAtIndex: [self indexOfItemWithTitle: title]];
+    NSInteger index = [self indexOfItemWithTitle: title];
+
+    if (index >= 0 && [[self itemAtIndex: index] isSeparatorItem])
+        index = -1;
+    [self selectItemAtIndex: index];
 }
 
 - (BOOL) selectItemWithTag: (NSInteger) tag {
@@ -589,6 +602,24 @@ static void texturedPopUpTitleInsets(BOOL pullsDown, NSControlSize size, CGFloat
     return [super drawTitle: title withFrame: titleRect inView: controlView];
 }
 
+// The border and background of a pop-up button cell is its bezel (with the arrows of the styles that have them), and
+// the whole cell is that and then the interior, so a subclass overriding the step is called once, before the bezel.
+// Observed on macOS 26.7.3 and 10.14.4 (x86_64 and i386), probe p767.m of batch 12a in mac-probes/cristim: for a
+// bordered pop-up button cell the step draws the pixels of the bezel and calls it once.
+- (void) drawBorderAndBackgroundWithFrame: (NSRect) cellFrame inView: (NSView *) controlView {
+    [self drawBezelWithFrame: cellFrame inView: controlView];
+}
+
+- (void) drawWithFrame: (NSRect) cellFrame inView: (NSView *) controlView {
+    _controlView = controlView;
+
+    if ([self isTransparent])
+        return;
+
+    [self drawBorderAndBackgroundWithFrame: cellFrame inView: controlView];
+    [self drawInteriorWithFrame: cellFrame inView: controlView];
+}
+
 - (void) drawBezelWithFrame: (NSRect) frame inView: (NSView *) controlView {
 
     [super drawBezelWithFrame: frame inView: controlView];
@@ -646,7 +677,7 @@ static void texturedPopUpTitleInsets(BOOL pullsDown, NSControlSize size, CGFloat
     for (NSMenuItem *item in [self itemArray]) {
         NSString *title = [item title];
 
-        if (title != nil)
+        if (![item isSeparatorItem])
             widest = MAX(widest, [title sizeWithAttributes: attributes].width);
     }
     return widest;

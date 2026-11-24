@@ -290,6 +290,9 @@ NSInteger NSBitsPerPixelFromDepth(NSWindowDepth depth) {
     NSWindow *_destinationWindow;
     NSPoint _screenPoint;
     NSDragOperation _sourceMask;
+    NSInteger _validItems; // -1 until a destination sets numberOfValidItemsForDrop
+    NSDraggingFormation _formation;
+    BOOL _animatesToDestination;
 }
 @end
 
@@ -305,7 +308,7 @@ NSInteger NSBitsPerPixelFromDepth(NSWindowDepth depth) {
 }
 
 - (NSDragOperation) draggingSourceOperationMask {
-    return _sourceMask;
+    return [NSDraggingSession _operationMask: _sourceMask narrowedForSource: _source];
 }
 
 - (NSPoint) draggingLocation {
@@ -327,7 +330,52 @@ NSInteger NSBitsPerPixelFromDepth(NSWindowDepth depth) {
 }
 
 - (id) draggingSource {
-    return _source;
+    return [NSDraggingSession _sourceForDestination: _source];
+}
+
+- (NSDraggingFormation) draggingFormation {
+    return _formation;
+}
+
+- (void) setDraggingFormation: (NSDraggingFormation) formation {
+    _formation = formation;
+}
+
+- (BOOL) animatesToDestination {
+    return _animatesToDestination;
+}
+
+- (void) setAnimatesToDestination: (BOOL) animates {
+    _animatesToDestination = animates;
+}
+
+- (NSInteger) numberOfValidItemsForDrop {
+    return _validItems >= 0 ? _validItems : (NSInteger) [[_pasteboard pasteboardItems] count];
+}
+
+- (void) setNumberOfValidItemsForDrop: (NSInteger) count {
+    _validItems = count;
+}
+
+- (void) enumerateDraggingItemsWithOptions: (NSDraggingItemEnumerationOptions) enumOpts
+                                   forView: (NSView *) view
+                                   classes: (NSArray<Class> *) classArray
+                             searchOptions: (NSDictionary *) searchOptions
+                                usingBlock: (void (^)(NSDraggingItem *, NSInteger, BOOL *)) block
+{
+    [NSDraggingSession _enumerateItemsOfDraggingInfo: self
+                                              source: _source
+                                             forView: view
+                                             classes: classArray
+                                       searchOptions: searchOptions
+                                          usingBlock: block];
+}
+
+- (NSSpringLoadingHighlight) springLoadingHighlight {
+    return NSSpringLoadingHighlightNone;
+}
+
+- (void) resetSpringLoading {
 }
 
 - (void) slideDraggedImageTo: (NSPoint) point {
@@ -419,6 +467,10 @@ static void runPendingSourcesDuringDrag(NSTimeInterval budget) {
     return [NSStandardWindowButtonCell class];
 }
 
+@end
+
+@interface NSApplication (DarlingTerminateCheck)
+- (void) _windowWasOrderedOut: (NSWindow *) window;
 @end
 
 @implementation NSWindow
@@ -722,9 +774,10 @@ static BOOL _allowsAutomaticWindowTabbing;
     NS_EXTRA(NSWindow, self)->_savedFrame = _frame;
 
     _level = NSNormalWindowLevel;
-    NS_EXTRA(NSWindow, self)->_minSize = NSZeroSize;
-    // "The default maximum size of a window is {FLT_MAX, FLT_MAX}"
-    NS_EXTRA(NSWindow, self)->_maxSize = NSMakeSize(FLT_MAX, FLT_MAX);
+    // "The default maximum size of a window is {FLT_MAX, FLT_MAX}". The limits are kept as content
+    // sizes (see -minSize), so that is the maximum of the content too.
+    NS_EXTRA(NSWindow, self)->_contentMinSize = NSZeroSize;
+    NS_EXTRA(NSWindow, self)->_contentMaxSize = NSMakeSize(FLT_MAX, FLT_MAX);
     NS_EXTRA(NSWindow, self)->_title = @"";
     NS_EXTRA(NSWindow, self)->_miniwindowTitle = @"";
     _backgroundColor = [[NSColor windowBackgroundColor] copy];
@@ -899,6 +952,8 @@ static BOOL _allowsAutomaticWindowTabbing;
 - (void) setStyleMask: (NSWindowStyleMask) mask {
     NS_EXTRA(NSWindow, self)->_styleMask = mask;
     [_platformWindow setStyleMask: NS_EXTRA(NSWindow, self)->_styleMask];
+    // What the frame adds around the content, and so the frame size limits, depend on the style.
+    [self _sizeLimitsChanged];
 
     [self _hideMenuViewIfNeeded];
 
@@ -1002,12 +1057,24 @@ static BOOL _allowsAutomaticWindowTabbing;
     return 0;
 }
 
+// minSize and contentMinSize (and maxSize and contentMaxSize) are two views of one limit: the
+// content size is kept, and the frame size is that plus what the frame adds around the content
+// (title bar, toolbar) in the current style. The last setter called wins. The _minSize and
+// _maxSize ivars are unused.
+- (NSSize) _frameChrome {
+    return [self frameRectForContentRect: NSZeroRect].size;
+}
+
 - (NSSize) minSize {
-    return NS_EXTRA(NSWindow, self)->_minSize;
+    NSSize content = NS_EXTRA(NSWindow, self)->_contentMinSize;
+    NSSize chrome = [self _frameChrome];
+    return NSMakeSize(content.width + chrome.width, content.height + chrome.height);
 }
 
 - (NSSize) maxSize {
-    return NS_EXTRA(NSWindow, self)->_maxSize;
+    NSSize content = NS_EXTRA(NSWindow, self)->_contentMaxSize;
+    NSSize chrome = [self _frameChrome];
+    return NSMakeSize(content.width + chrome.width, content.height + chrome.height);
 }
 
 - (NSSize) contentMinSize {
@@ -1494,22 +1561,58 @@ static BOOL _allowsAutomaticWindowTabbing;
     [self setFrame: frame display: NO];
 }
 
+// The window system limits user resizing to the sizes below, which a platform window reads when
+// it is told they changed.
+- (void) _sizeLimitsChanged {
+    id platform = _platformWindow;
+    if ([platform respondsToSelector: @selector(sizeLimitsChanged)])
+        [platform sizeLimitsChanged];
+}
+
+// QUIRK: the minimum and maximum of the frame and of the content are two views of one limit: setting
+// either changes what the other returns and the last call wins (the documentation lists them as
+// separate properties). A minimum below what the frame adds around the content is zero as a content
+// size, a maximum below it goes negative, and a titled window with no minimum reports a minSize one
+// title bar high. Evidence: black-box observation on macOS 26.7.3 (tier 2): after setMinSize 300x200
+// contentMinSize is 300x168, a later setContentMinSize 100x100 makes minSize 100x132, and setMaxSize
+// 0x0 gives contentMaxSize 0x-32.
+// Test: tests/appkit-window-frame-size-limits.m (the quirk_ checks).
+- (NSSize) _minFrameSize {
+    NSSize content = NS_EXTRA(NSWindow, self)->_contentMinSize;
+    NSSize chrome = [self _frameChrome];
+    return NSMakeSize(content.width > 0 ? content.width + chrome.width : 0,
+                      content.height > 0 ? content.height + chrome.height : 0);
+}
+
+- (NSSize) _maxFrameSize {
+    NSSize content = NS_EXTRA(NSWindow, self)->_contentMaxSize;
+    NSSize chrome = [self _frameChrome];
+    return NSMakeSize(content.width > 0 && content.width < FLT_MAX ? content.width + chrome.width : FLT_MAX,
+                      content.height > 0 && content.height < FLT_MAX ? content.height + chrome.height : FLT_MAX);
+}
+
 - (void) setMinSize: (NSSize) size {
-    NS_EXTRA(NSWindow, self)->_minSize = size;
+    NSSize chrome = [self _frameChrome];
+    NS_EXTRA(NSWindow, self)->_contentMinSize =
+            NSMakeSize(MAX(0, size.width - chrome.width), MAX(0, size.height - chrome.height));
+    [self _sizeLimitsChanged];
 }
 
 - (void) setMaxSize: (NSSize) size {
-    NS_EXTRA(NSWindow, self)->_maxSize = size;
+    NSSize chrome = [self _frameChrome];
+    NS_EXTRA(NSWindow, self)->_contentMaxSize =
+            NSMakeSize(size.width - chrome.width, size.height - chrome.height);
+    [self _sizeLimitsChanged];
 }
 
 - (void) setContentMinSize: (NSSize) value {
-    // The value was already being stored; the unimplemented marker made every
-    // caller raise instead.
     NS_EXTRA(NSWindow, self)->_contentMinSize = value;
+    [self _sizeLimitsChanged];
 }
 
 - (void) setContentMaxSize: (NSSize) value {
     NS_EXTRA(NSWindow, self)->_contentMaxSize = value;
+    [self _sizeLimitsChanged];
 }
 
 - (void) setContentBorderThickness: (CGFloat) thickness
@@ -2902,6 +3005,19 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
     DarlingLayoutSetLastGeneration(_contentView, DarlingLayoutKindWindowFit, DarlingLayoutGeneration());
 }
 
+// A display cycle of the window: the constraints and the layout of a window on screen are brought up to date before
+// it draws, so the views it draws have their frames. Ordering a window in draws it at once, and with the same cycle:
+// a view whose needsLayout was set before then is laid out without another event or display request.
+// Test: tests/appkit-collection-view-scroll-position-none.m (a collection view set up before the window is ordered
+// front gets its content size).
+- (void) _layoutAndDisplayIfNeeded {
+    if ([self isVisible] && ![self isMiniaturized]) {
+        [self _fitContentSizeToConstraints];
+        [_backgroundView layoutSubtreeIfNeeded];
+    }
+    [self displayIfNeeded];
+}
+
 - (void) layoutIfNeeded {
     [self _fitContentSizeToConstraints];
     [self updateConstraintsIfNeeded];
@@ -3125,7 +3241,7 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
            incomplete). This may be the right place to do this, maybe not,
            further investigation is required.
         */
-        [self displayIfNeeded];
+        [self _layoutAndDisplayIfNeeded];
         // This is here since it would seem that doing this any earlier will not
         // work.
         if (![self isKindOfClass: [NSPanel class]] &&
@@ -3151,7 +3267,7 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
            incomplete). This may be the right place to do this, maybe not,
            further investigation is required.
         */
-        [self displayIfNeeded];
+        [self _layoutAndDisplayIfNeeded];
         // This is here since it would seem that doing this any earlier will not
         // work.
         if (![self isKindOfClass: [NSPanel class]] &&
@@ -3174,6 +3290,10 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
         appearance = [self _willChangeViewAppearanceForVisible: NO];
         NS_EXTRA(NSWindow, self)->_isVisible = NO;
         [[self platformWindow] hideWindow];
+        // A window that the application closes reports through its close
+        // notification instead.
+        if (wasVisible && !NS_EXTRA(NSWindow, self)->_isClosed)
+            [NSApp _windowWasOrderedOut: self];
         if (![self isKindOfClass: [NSPanel class]]) {
             [NSApp removeWindowsItem: self];
         }
@@ -3560,14 +3680,21 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
         [recognizer _resetIfFinished];
 
     if (shouldValidateToolbarItems && [self toolbar]) {
-        [NSObject cancelPreviousPerformRequestsWithTarget: [self toolbar]
-                                                 selector: @selector
-                                                 (validateVisibleItems)
+        [NSObject cancelPreviousPerformRequestsWithTarget: self
+                                                 selector: @selector(_validateToolbarIfShown)
                                                    object: nil];
-        [[self toolbar] performSelector: @selector(validateVisibleItems)
-                             withObject: nil
-                             afterDelay: .5];
+        [self performSelector: @selector(_validateToolbarIfShown)
+                   withObject: nil
+                   afterDelay: .5];
     }
+}
+
+// The toolbar is validated after events only while the window is shown: an event can close the window, and its
+// toolbar items' targets may be gone by the time the validation would run.
+// Test: tests/appkit-toolbar-closed-window-validation.m
+- (void) _validateToolbarIfShown {
+    if ([self isVisible])
+        [[self toolbar] validateVisibleItems];
 }
 
 - (void) postEvent: (NSEvent *) event atStart: (BOOL) atStart {
@@ -3685,6 +3812,7 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
                       source: (id) source
 {
     NSWindowLocalDraggingInfo *info = [[NSWindowLocalDraggingInfo alloc] init];
+    info->_validItems = -1;
     info->_pasteboard = pasteboard;
     info->_image = image;
     info->_source = source;
@@ -3931,7 +4059,7 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
         if ([NSApp modalWindow] == self) {
             [NSApp abortModal];
         } else {
-            [self close];
+            [self _closeOnBehalfOfUser];
         }
     }
 }
@@ -3942,8 +4070,22 @@ static NSRect constrainRectToScreen(NSRect rect, NSScreen *screen) {
 {
     // Callback used by performClose:
     if (shouldClose) {
-        [self close];
+        [self _closeOnBehalfOfUser];
     }
+}
+
+// Closes the window as a result of the user asking for it (the close button,
+// the window manager's close request, the Close menu item), as opposed to the
+// application closing it by itself. NSApplication tells the two apart when it
+// decides whether closing the last window should end the application.
+- (void) _closeOnBehalfOfUser {
+    NS_EXTRA(NSWindow, self)->_closingByUser = YES;
+    [self close];
+    NS_EXTRA(NSWindow, self)->_closingByUser = NO;
+}
+
+- (BOOL) _isClosingByUser {
+    return NS_EXTRA(NSWindow, self)->_closingByUser;
 }
 
 - (void) performMiniaturize: (id) sender {
@@ -4181,12 +4323,9 @@ static const NSTimeInterval FullScreenConfirmationTimeout = 3.0;
     }
 }
 
+// The sender's title is the application's to set (macOS leaves it as it is)
 - (void) toggleToolbarShown: (id) sender {
     [_toolbar setVisible: ![_toolbar isVisible]];
-    [sender setTitle: [NSString stringWithFormat: @"%@ Toolbar",
-                                                  [_toolbar isVisible]
-                                                          ? @"Hide"
-                                                          : @"Show"]];
 }
 
 - (void) runToolbarCustomizationPalette: (id) sender {
@@ -4626,14 +4765,16 @@ static const NSTimeInterval FullScreenConfirmationTimeout = 3.0;
     // Don't allow the platform window changes to violate our window size limits
     // (if we have them). Windows (for example) likes to make the platform
     // window very small so it fits in the task bar...
-    if (!NSEqualSizes([self minSize], NSMakeSize(0, 0))) {
-        frame.size.width = MAX(NSWidth(frame), [self minSize].width);
-        frame.size.height = MAX(NSHeight(frame), [self minSize].height);
-    }
-
-    if (!NSEqualSizes([self maxSize], NSMakeSize(FLT_MAX, FLT_MAX))) {
-        frame.size.width = MIN(NSWidth(frame), [self maxSize].width);
-        frame.size.height = MIN(NSHeight(frame), [self maxSize].height);
+    // The same limits the platform window is given (see -_minFrameSize), and the minimum wins over a
+    // maximum below it, as in what is sent to the window system. Only a resize is limited: a move
+    // reports the size the window has and must not change it (nothing would resize the views).
+    if (didSize) {
+        NSSize maxSize = [self _maxFrameSize];
+        frame.size.width = MIN(NSWidth(frame), maxSize.width);
+        frame.size.height = MIN(NSHeight(frame), maxSize.height);
+        NSSize minSize = [self _minFrameSize];
+        frame.size.width = MAX(NSWidth(frame), minSize.width);
+        frame.size.height = MAX(NSHeight(frame), minSize.height);
     }
 
     // We don't want the miniaturized frame.
@@ -5074,6 +5215,8 @@ static const NSTimeInterval FullScreenConfirmationTimeout = 3.0;
         return [[self undoManager] canUndo];
     if ([item action] == @selector(redo:))
         return [[self undoManager] canRedo];
+    if ([item action] == @selector(toggleToolbarShown:))
+        return _toolbar != nil;
 
     return YES;
 }

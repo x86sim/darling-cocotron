@@ -110,6 +110,30 @@ typedef NS_OPTIONS(unsigned int, NSCellAppleFlags2) {
 
 NSNotificationName NSControlTintDidChangeNotification = @"NSControlTintDidChangeNotification";
 
+/* Nib cell flags keep the x86_64 alignment numbering (right 1, center 2) on
+ * every architecture, because one compiled nib serves both slices of a
+ * universal app. NSTextAlignment swaps the two where TARGET_ABI_USES_IOS_VALUES
+ * is set, so convert at that boundary in both directions. */
+static NSTextAlignment NSCellAlignmentFromArchive(unsigned value) {
+#if TARGET_ABI_USES_IOS_VALUES
+    if (value == 1)
+        return NSTextAlignmentRight;
+    if (value == 2)
+        return NSTextAlignmentCenter;
+#endif
+    return (NSTextAlignment) value;
+}
+
+static unsigned NSCellAlignmentToArchive(NSTextAlignment alignment) {
+#if TARGET_ABI_USES_IOS_VALUES
+    if (alignment == NSTextAlignmentRight)
+        return 1;
+    if (alignment == NSTextAlignmentCenter)
+        return 2;
+#endif
+    return (unsigned) alignment;
+}
+
 @implementation NSCell
 
 NS_EXTRA_SYNTHESIZE_COPY(NSCell, identifier, _identifier, NSUserInterfaceItemIdentifier, identifier, setIdentifier:)
@@ -189,7 +213,7 @@ NS_EXTRA_SYNTHESIZE_ASSIGN(NSCell, controlTint, _controlTint, NSControlTint, con
 
     // importsGraph  = (flags2 & 0x10000000)
 
-    NS_EXTRA(NSCell, self)->_textAlignment = (flags2 & NSCellAppleFlag2TextAlignmentMask) >> NSCellAppleFlag2TextAlignmentShift;
+    NS_EXTRA(NSCell, self)->_textAlignment = NSCellAlignmentFromArchive((flags2 & NSCellAppleFlag2TextAlignmentMask) >> NSCellAppleFlag2TextAlignmentShift);
 
     // layoutDirRTL  = (flags2 & 0x01000000)
     NS_EXTRA(NSCell, self)->_writingDirection = NSWritingDirectionNatural;
@@ -262,7 +286,7 @@ NS_EXTRA_SYNTHESIZE_ASSIGN(NSCell, controlTint, _controlTint, NSControlTint, con
     if (NS_EXTRA(NSCell, self)->_isRichText)
         *flags2 |= NSCellAppleFlag2RichText;
 
-    *flags2 |= (NS_EXTRA(NSCell, self)->_textAlignment << NSCellAppleFlag2TextAlignmentShift) & NSCellAppleFlag2TextAlignmentMask;
+    *flags2 |= (NSCellAlignmentToArchive(NS_EXTRA(NSCell, self)->_textAlignment) << NSCellAppleFlag2TextAlignmentShift) & NSCellAppleFlag2TextAlignmentMask;
 
     if (NS_EXTRA(NSCell, self)->_refusesFirstResponder)
         *flags2 |= NSCellAppleFlag2RefusesFirstResponder;
@@ -972,20 +996,26 @@ static BOOL bindingValueIsTrue(id value) {
     }
 }
 
+// An editable cell is selectable, and one that isn't selectable isn't editable, as the NSCell reference says
+// (also observed on macOS 10.14.4 and 26.7.3; test: appkit-cell-editable-selectable.m)
 - (void) setEditable: (BOOL) flag {
-    if (NS_EXTRA(NSCell, self)->_isEditable != flag) {
-        NS_EXTRA(NSCell, self)->_isEditable = flag;
+    BOOL changed = NS_EXTRA(NSCell, self)->_isEditable != flag || (flag && !NS_EXTRA(NSCell, self)->_isSelectable);
+    NS_EXTRA(NSCell, self)->_isEditable = flag;
+    if (flag)
+        NS_EXTRA(NSCell, self)->_isSelectable = YES;
+    if (changed)
         [[[self controlView] window]
                 invalidateCursorRectsForView: [self controlView]];
-    }
 }
 
 - (void) setSelectable: (BOOL) flag {
-    if (NS_EXTRA(NSCell, self)->_isSelectable != flag) {
-        NS_EXTRA(NSCell, self)->_isSelectable = flag;
+    BOOL changed = NS_EXTRA(NSCell, self)->_isSelectable != flag || (!flag && NS_EXTRA(NSCell, self)->_isEditable);
+    NS_EXTRA(NSCell, self)->_isSelectable = flag;
+    if (!flag)
+        NS_EXTRA(NSCell, self)->_isEditable = NO;
+    if (changed)
         [[[self controlView] window]
                 invalidateCursorRectsForView: [self controlView]];
-    }
 }
 
 - (void) setScrollable: (BOOL) flag {

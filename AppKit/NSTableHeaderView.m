@@ -104,9 +104,17 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
                             (long) column, 0, (unsigned long) [tableColumns count]];
     }
 
-    headerRect.size.width = [_tableView _spaceTakenByColumn: [tableColumns objectAtIndex: column--]];
-    while (column >= 0)
-        headerRect.origin.x += [_tableView _spaceTakenByColumn: [tableColumns objectAtIndex: column--]];
+    NSTableColumn *tableColumn = [tableColumns objectAtIndex: column];
+
+    headerRect.size.width = [_tableView _spaceTakenByColumn: tableColumn];
+    // QUIRK: the rectangle of a hidden column is an empty one at x 0, wherever the column is in the table; see
+    // -[NSTableView rectOfColumn:].
+    if ([tableColumn isHidden]) {
+        headerRect.origin.x = 0.;
+        return headerRect;
+    }
+    while (--column >= 0)
+        headerRect.origin.x += [_tableView _spaceTakenByColumn: [tableColumns objectAtIndex: column]];
 
     return headerRect;
 }
@@ -120,7 +128,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
             return i;
     }
 
-    return NSNotFound;
+    return -1;
 }
 
 // The column the table is sorted by: the one whose sort descriptor prototype has the key of the table's first
@@ -197,10 +205,12 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
     }
 }
 
+// The grab zone on the edge between a column and the one after it, taken from the right edge of the column before
+// (the rectangle of a hidden column is at x 0, so it does not say where the edge is).
 - (NSRect) _resizeRectBeforeColumn: (int) column {
-    NSRect rect = [self headerRectOfColumn: column];
+    NSRect rect = [self headerRectOfColumn: column - 1];
 
-    rect.origin.x -= 2;
+    rect.origin.x = NSMaxX(rect) - 2;
     rect.size.width = 6;
 
     return rect;
@@ -211,7 +221,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
                                  fromView: nil];
     NSInteger clickedColumn = [self columnAtPoint: location];
 
-    if (clickedColumn != NSNotFound &&
+    if (clickedColumn >= 0 &&
         [[_tableView delegate] respondsToSelector: @selector
                                (tableView:mouseDownInHeaderOfTableColumn:)])
         [[_tableView delegate] tableView: _tableView
@@ -288,14 +298,14 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
         }
     }
 
-    if (clickedColumn == NSNotFound)
+    if (clickedColumn < 0)
         return;
 
     // Dragging a header cell moves its column when the table allows reordering
     if ([_tableView allowsColumnReordering]) {
         id delegate = [_tableView delegate];
         BOOL dragged = NO, mayMove = YES;
-        NSInteger current = clickedColumn;
+        NSInteger target = clickedColumn;
         NSPoint start = location;
 
         do {
@@ -313,20 +323,24 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
                     mayMove = [delegate tableView: _tableView shouldReorderColumn: clickedColumn toColumn: -1];
             }
             if (mayMove) {
-                NSInteger target = [self columnAtPoint: point];
+                NSInteger column = [self columnAtPoint: point];
 
-                if (target != NSNotFound && target != current &&
-                    (![delegate respondsToSelector: @selector(tableView:shouldReorderColumn:toColumn:)] ||
-                     [delegate tableView: _tableView shouldReorderColumn: current toColumn: target])) {
-                    [_tableView _moveColumn: current toColumn: target notify: NO];
-                    current = target;
-                }
+                if (column >= 0)
+                    target = column;
             }
         } while ([theEvent type] != NSLeftMouseUp);
 
         if (dragged) {
-            if (current != clickedColumn)
-                [_tableView _noteColumnDidMoveFrom: clickedColumn to: current];
+            // The column goes where the mouse went up, the delegate being asked once more, with the column's original
+            // index and that position; a column dragged back to its place is not asked about. Observed on macOS 26.7.3
+            // (a drag across two columns asks only about the last one; out and back asks nothing more).
+            // Test: tests/appkit-table-header-delegate.m
+            if (mayMove && target != clickedColumn &&
+                (![delegate respondsToSelector: @selector(tableView:shouldReorderColumn:toColumn:)] ||
+                 [delegate tableView: _tableView shouldReorderColumn: clickedColumn toColumn: target])) {
+                [_tableView _moveColumn: clickedColumn toColumn: target notify: NO];
+                [_tableView _noteColumnDidMoveFrom: clickedColumn to: target];
+            }
             return;
         }
     }
@@ -371,9 +385,13 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (void) resetCursorRects {
     NSInteger i;
 
-    for (i = 1; i < [[_tableView tableColumns] count]; ++i)
+    for (i = 1; i < [[_tableView tableColumns] count]; ++i) {
+        // A hidden column has no edge to grab (see -mouseDown:)
+        if ([[[_tableView tableColumns] objectAtIndex: i - 1] isHidden])
+            continue;
         [self addCursorRect: [self _resizeRectBeforeColumn: i]
                      cursor: [NSCursor resizeLeftRightCursor]];
+    }
 }
 
 - (void) resizeWithOldSuperviewSize: (NSSize) size {

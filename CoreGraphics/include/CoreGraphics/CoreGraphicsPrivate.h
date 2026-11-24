@@ -70,7 +70,9 @@ extern void CGRegionRelease(CGRegionRef region);
 // CGSEventRecord whose data.compound.subType is kCGSHotKeyPressedSubtype or
 // kCGSHotKeyReleasedSubtype, whose data.compound.misc.L[0] is the uid, and whose flags,
 // location and time are those of the key event. AppKit turns it into an NSEvent of type
-// NSSystemDefined, which NSApplication hands to HIToolbox.
+// NSSystemDefined, which NSApplication hands to HIToolbox. A process with no such proc (a
+// Carbon application without AppKit) gets the same event, made with CGEventCreateWithEventRecord(),
+// in its event stream (_CGSEventStreamPost), through the event taps, where HIToolbox reads it.
 // QUIRK: system-defined subtype 6 is a hot key press, 9 a release, and the event's data1 names
 // the hot key (the uid given when it was set). Not documented. Evidence: public write-ups of
 // the observed event (The Register, 2009, https://www.theregister.co.uk/2009/02/24/hotkeys_framework2/;
@@ -297,6 +299,24 @@ extern CGEventRef CGEventCreateWithEventRecord(const CGSEventRecordPtr event, ui
 extern CGError CGEventGetEventRecord(CGEventRef event, CGSEventRecordPtr eventRecord, uint32_t eventRecordSize);
 extern CGError CGEventSetEventRecord(CGEventRef event, CGSEventRecordPtr eventRecord, uint32_t eventRecordSize);
 extern uint32_t CGEventGetEventRecordSize(CGEventRef event);
+
+// The event stream of the process: the events that are for this process once they have been
+// through the event taps (CGEventPost() and friends deliver here), in the order they came, for
+// the frameworks above CoreGraphics to read. Thread safe. There is no Mach message, port or
+// thread behind it.
+//
+// The stream keeps events only while a reader is registered with _CGSEventStreamSetReadySource().
+// _CGSEventStreamPost() is for the window system: it enters the event at the first tap, as an
+// event of the hardware, and retains it until it has been delivered.
+extern void _CGSEventStreamPost(CGEventRef event);
+// The oldest event, which the caller releases, or NULL once the stream is empty. A reader that was
+// woken has to call this until it returns NULL: the source is signalled again only after that.
+extern CGEventRef _CGSEventStreamCopyNextEvent(void);
+// Registers the run loop source that is signalled, and its run loop woken, when an event arrives
+// at an empty stream. For the thread that waits for events: it reads the stream from where it
+// waits (before each wait, and after each wake up). A new registration replaces the old one;
+// NULL for both stops the stream and drops what is waiting.
+extern void _CGSEventStreamSetReadySource(CFRunLoopSourceRef _Nullable source, CFRunLoopRef _Nullable runLoop);
 
 // Registers the 'uchr' keyboard layout (a UCKeyboardLayout blob of `length` bytes, copied) of the
 // window system's current keymap, for a backend that cannot read the keymap itself. The Text Input
