@@ -40,6 +40,9 @@ typedef struct {
 
 static const FieldRange commonFields[] = {
 	{39, 45}, {50, 55}, {58, 59}, {85, 85}, {87, 87}, {101, 107}, {141, 141}, {146, 146}, {166, 166}, {169, 169},
+	// Our own: what the window system backends attach to the input events they post (see
+	// kCGSKeyboardEventUnmodifiedUnicode in CoreGraphicsPrivate.h).
+	{180, 201},
 };
 static const FieldRange mouseFields[] = { {0, 7}, {89, 92}, {108, 108}, {170, 171} };
 static const FieldRange keyFields[] = { {8, 10}, {76, 81}, {127, 128} };
@@ -317,6 +320,7 @@ static inline BOOL isScrollFixedDelta(CGEventField f) { return f >= kCGScrollWhe
 	free(_unicodeString);
 	_unicodeString = copy;
 	_unicodeLength = (uint16_t) stringLength;
+	_unicodeDerived = NO;
 }
 
 -(void) _fillFromEventRecord
@@ -430,7 +434,24 @@ static inline BOOL isScrollFixedDelta(CGEventField f) { return f >= kCGScrollWhe
 {
 	free(_eventRecord);
 	free(_unicodeString);
+	[_clientData release];
 	[super dealloc];
+}
+
+-(BOOL) hasSameContentAs:(CGEvent*) other
+{
+	if (other == self)
+		return YES;
+	if (other == nil || _type != other->_type || _timestamp != other->_timestamp || _flags != other->_flags)
+		return NO;
+	if (_locationValid != other->_locationValid
+		|| (_locationValid && (_location.x != other->_location.x || _location.y != other->_location.y)))
+		return NO;
+	if (memcmp(_fields, other->_fields, sizeof(_fields)) != 0)
+		return NO;
+	if (_unicodeLength != other->_unicodeLength || (_unicodeString == NULL) != (other->_unicodeString == NULL))
+		return NO;
+	return _unicodeLength == 0 || memcmp(_unicodeString, other->_unicodeString, _unicodeLength * sizeof(UniChar)) == 0;
 }
 
 -(id) copy
@@ -443,6 +464,7 @@ static inline BOOL isScrollFixedDelta(CGEventField f) { return f >= kCGScrollWhe
 	rv->_locationValid = _locationValid;
 	memcpy(rv->_fields, _fields, sizeof(_fields));
 	[rv setUnicodeString: _unicodeString length: _unicodeLength];
+	rv->_unicodeDerived = _unicodeDerived;
 
 	if (_eventRecord)
 	{

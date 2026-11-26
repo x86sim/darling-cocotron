@@ -8,7 +8,6 @@
 
 #import "../private-include/AppKit/DarlingDisplay.h"
 #import "../../CoreGraphics/X11.backend/X11Monitors.h"
-#import "X11RelativeMouseGrab.h"
 #import <X11/Xlib.h>
 #import <X11/Xresource.h>
 #import <X11/Xlocale.h>
@@ -18,52 +17,20 @@
 #import <CoreFoundation/CFSocket.h>
 #endif
 
+#import <CoreGraphics/CGSNativeConnection.h>
+
 @class X11Cursor, X11AppMenu, X11Window;
 
-@interface X11Display : DarlingDisplay {
+@interface X11Display : DarlingDisplay <CGSNativeConnectionObserver> {
     Display *_display;
-    int _fileDescriptor;
-#ifndef DARLING
-    NSSelectInputSource *_inputSource;
-#else
-    // We use CFRunLoop directly, without going through any Foundation wrapper,
-    // because Apple's Cocoa has none. Unlike Apple's Cocoa, we need to watch
-    // over a Unix domain socket, not a Mach port.
-    CFSocketRef _cfSocket;
-    CFRunLoopSourceRef _source;
-    CFRunLoopObserverRef _beforeWaitingObserver;
-#endif
     NSMutableDictionary *_windowsByID;
     // Shows the main menu outside the windows (see X11AppMenu), nil until the
     // application has one or when the menu is drawn inside the windows.
     X11AppMenu *_appMenu;
+    BOOL _desktopMenuProbed, _desktopMenuPresent;
 
     id lastFocusedWindow;
-    // The click counts per button are in DarlingDisplay.
-    Time _lastClickTime;       // X server milliseconds, wraps modulo 2^32.
-    unsigned int _lastClickButton;
-    XID _lastClickWindow;
-    NSPoint _lastClickPoint;   // Logical points, so the radius is scale-independent.
     X11Cursor *_blankCursor, *_defaultCursor;
-    // Relative mouse mode (CGAssociateMouseAndMouseCursorPosition(false)).
-    // _relativeRequested stays set while the application wants it;
-    // _relativeMouse.active only while the pointer grab on _relativeWindow is
-    // held, which losing the focus releases and regaining it retakes.
-    BOOL _relativeRequested;
-    int _relativeRetriesLeft;
-    // Where the frozen cursor was when the grab was released for a reason other
-    // than the application asking (focus loss, reconfiguration), so the next
-    // grab puts it back instead of restarting it at the pointer.
-    BOOL _relativeResumeValid;
-    double _relativeResumeX, _relativeResumeY;
-    Window _relativeWindow;
-    // A pinch gesture in progress (see X11Gesture.h): its window, the scale it last
-    // reported, and where and with which modifiers its last event was.
-    Window _pinchWindow;
-    CGFloat _pinchScale;
-    NSPoint _pinchLocation;
-    NSEventModifierFlags _pinchModifiers;
-    X11RelativeMouse _relativeMouse;
     // ConfinePointerToFullscreenWindows (org.darlinghq.AppKit): keep the
     // pointer inside the focused fullscreen window, through a pointer grab on
     // _confinedWindow while one is held.
@@ -72,14 +39,6 @@
     // arrive as their Command shortcuts.
     BOOL _controlActsAsCommand;
     Window _confinedWindow;
-    // Display overlay windows (CGLSetFullScreen) belong to no NSWindow; their
-    // key and pointer input is taken up here and reaches the application as
-    // events with no window and screen coordinates. _overlayWindow is the one
-    // that holds the keyboard focus and the relative mouse grab.
-    NSMutableSet *_overlayWindows;
-    Window _overlayWindow;
-    BOOL _overlayPointerKnown;
-    int _overlayPointerX, _overlayPointerY;
     // The menu and pop-up windows that are on the screen, oldest first, while
     // the pointer is held for them (see -menuWindowMapped:).
     NSMutableArray *_openMenuWindows;
@@ -87,23 +46,6 @@
     // cursor is hidden, so warps are not honoured with a visible cursor there.
     BOOL _isXwayland;
     BOOL _cursorHidden;
-    // The pointer as the last MotionNotify reported it, root coordinates.
-    // Valid until an event that may have moved the pointer without one
-    // (crossing, button, key or focus events, a warp, a screen change).
-    BOOL _pointerKnown;
-    int _pointerRootX, _pointerRootY;
-    unsigned int _pointerState;
-    KeySym _lastKeySym;
-    // The aggregate modifier mask as of the last key event, so a change that
-    // no modifier key reported (a modifier released while another app had the
-    // focus) is still noticed and corrected with a keycode-less flagsChanged.
-    NSEventModifierFlags _modifierFlags;
-    // The modifier keys currently held, one bit per X keycode. Both Shift keys
-    // (or both Control keys) drive the same mask, so releasing one of them only
-    // clears it if the other is up too.
-    unsigned char _heldModifierKeys[32];
-    int _rrEventBase;
-    NSArray* _lastScreens;
     // See -primaryRootFrame. Device pixels, root coordinates.
     NSRect _primaryRootFrame;
     BOOL _primaryRootFrameValid;
@@ -130,6 +72,9 @@
 
 @public
     XIM _xim;
+    // YES when a real input method (XMODIFIERS names one) does the composing; NO for Xlib's built-in one, which
+    // only composes dead keys and Compose sequences, and which CoreGraphics replaces.
+    BOOL _inputMethodComposes;
 }
 
 - (Display *) display;
@@ -178,11 +123,6 @@
 #ifdef DARLING
 - (void) processPendingEvents;
 #endif
-// The pointer's position on the default root window and the button and
-// modifier state, from the event stream when it is known, else from the
-// server. Returns NO when the pointer is on another screen (the position is
-// then on that screen's root window).
-- (BOOL) queryPointerRootX: (int *) x y: (int *) y state: (unsigned int *) state;
 
 - (CGFloat) doubleClickInterval;
 - (int) handleError: (XErrorEvent *) errorEvent;

@@ -928,6 +928,10 @@ static void loadItemIntoMapTables(NSOutlineView *self, id item,
     if (row < 0 || row >= [self numberOfRows] || ![self isExpandable: [self itemAtRow: row]])
         return NSZeroRect;
 
+    // The outline column's cell frame is NSZeroRect while that column is hidden (see -[NSTableView rectOfColumn:]); so is this.
+    if ([_outlineTableColumn isHidden])
+        return NSZeroRect;
+
     NSInteger column = [_tableColumns indexOfObjectIdenticalTo: _outlineTableColumn];
     NSRect cell = [super frameOfCellAtColumn: column row: row];
     NSRect result;
@@ -1294,6 +1298,9 @@ static void loadItemIntoMapTables(NSOutlineView *self, id item,
             else
                 [self collapseItem: NS_EXTRA(NSOutlineView, self)->_clickedItem];
 
+            // The click is over; see the QUIRK note above forgetClickedCell in NSTableView.m. It sent no action.
+            NS_EXTRA(NSTableView, self)->_clickedColumn = -1;
+            NS_EXTRA(NSTableView, self)->_clickedRow = -1;
             return;
         }
     }

@@ -55,6 +55,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <HIToolbox/CarbonEvents.h>
 #import <HIToolbox/CarbonEventsCore.h>
 #import <CoreGraphics/CGWindowPrivate.h>
+#import "NSEventQueue.h"
 #import <Foundation/NSAppleEventManager.h>
 #import "private-include/AppKit/NSEventTime.h"
 #import <Foundation/NSAppleEventDescriptor.h>
@@ -158,33 +159,6 @@ NSApplication *NSApp = nil;
 - initWithOwner: owner;
 @end
 
-// The window system reports a hot key press or release as a system-defined event record; it is
-// queued for the application like any event, and -[NSApplication sendEvent:] passes it on.
-static void hotKeyEventNotification(CGSNotificationType type, void *data, unsigned long length, void *client) {
-    const CGSEventRecord *record = data;
-
-    if (length < sizeof(*record) || record->type != NX_SYSDEFINED)
-        return;
-
-    int subtype = record->data.compound.subType;
-    if (subtype != kCGSHotKeyPressedSubtype && subtype != kCGSHotKeyReleasedSubtype)
-        return;
-
-    // CG global coordinates have y down from the main display's top; NSEvent's have y up
-    NSRect main = [[[NSScreen screens] firstObject] frame];
-    NSPoint location = NSMakePoint(record->location.x, NSMaxY(main) - record->location.y);
-    NSEvent *event = [NSEvent otherEventWithType: NSSystemDefined
-                                        location: location
-                                   modifierFlags: (NSUInteger) record->flags & NSDeviceIndependentModifierFlagsMask
-                                       timestamp: (NSTimeInterval) record->time / 1e9
-                                    windowNumber: 0
-                                         context: nil
-                                         subtype: subtype
-                                           data1: record->data.compound.misc.L[0]
-                                           data2: 0];
-    [NSApp postEvent: event atStart: NO];
-}
-
 // The documents a process argument list asks to open (arguments[0] is the
 // executable), by the rule the Cocoa application object follows: every
 // argument that is not a switch names a document, and "--" ends the list.
@@ -214,6 +188,10 @@ static NSArray *NSApplicationDocumentsInArguments(NSArray *arguments) {
 @interface NSDisplay (DarlingApplicationIcon)
 // Implemented by the backends (see DarlingDisplay.h).
 - (void) applicationIconImageChanged;
+@end
+
+@interface NSRunningApplication (NSApplicationBundleless)
+- (BOOL) _isOutsideApplicationBundle;
 @end
 
 @implementation NSApplication
@@ -270,6 +248,21 @@ static NSInteger cachedLayoutDirection = -1;
         cachedLayoutDirection = computeLayoutDirection();
     }
     return (NSUserInterfaceLayoutDirection) cachedLayoutDirection;
+}
+
+// SPI. Asks AppKit not to connect the process to the Dock; WebKit's web content process calls it,
+// before or after NSApp exists. On macOS 26.7.3 the process sees no difference (its activation
+// policy and setActivationPolicy: are unchanged). Darling's AppKit never connects to a Dock, so
+// there is nothing to prevent.
++ (void) _preventDockConnections {
+}
+
+// SPI. Prepares the process for accessibility; WebKit's web content process calls it when it
+// is asked to initialize accessibility. On macOS 26.7.3 the observable effect is that NSApp
+// exists afterwards, an instance of the receiving class, as +sharedApplication makes it, and a
+// second call is harmless. Test: tests/appkit-accessibility-initialize.m.
++ (void) _accessibilityInitialize {
+    [self sharedApplication];
 }
 
 + (NSApplication *) sharedApplication {
@@ -349,6 +342,77 @@ static void observeProcessCommands(NSApplication *application) {
     }
 }
 
+// An application that owns the menu bar while an application that is not regular (see
+// -_publishActivation) has the focus is made active again when that application ends with the focus
+// still on it, as macOS gives the activation back to the previous application when the front one quits.
+// Without it the focus would stay on no application of ours, and the menu bar would be gone.
+static pid_t yieldedTo;
+static BOOL yieldedHasFocus;
+static dispatch_source_t yieldedSource;
+
+static void stopWatchingYielded(void) {
+    if (yieldedSource != NULL) {
+        dispatch_source_cancel(yieldedSource);
+        dispatch_release(yieldedSource);
+        yieldedSource = NULL;
+    }
+    yieldedTo = 0;
+    yieldedHasFocus = NO;
+}
+
+static void yieldedProcessExited(void) {
+    BOOL give = yieldedHasFocus && ![NSApp isActive];
+
+    stopWatchingYielded();
+    if (give)
+        [NSApp activateIgnoringOtherApps: YES];
+}
+
+// The front process or the menu bar owner changed.
+static void followMenuBarOwnership(void) {
+    pid_t owner = 0, front = 0;
+    BOOL ownsBar = _CGSGetMenuBarOwnerProcess(&owner) == kCGErrorSuccess && owner == getpid();
+    BOOL frontKnown = _CGSGetFrontProcess(&front) == kCGErrorSuccess;
+
+    if (frontKnown && front == getpid()) {
+        stopWatchingYielded();
+        return;
+    }
+    if (ownsBar && frontKnown) {
+        if (yieldedTo != front) {
+            stopWatchingYielded();
+            yieldedTo = front;
+            yieldedSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t) front,
+                                                   DISPATCH_PROC_EXIT, dispatch_get_main_queue());
+            if (yieldedSource == NULL) {
+                yieldedTo = 0;
+                return;
+            }
+            dispatch_source_set_event_handler(yieldedSource, ^{
+                yieldedProcessExited();
+            });
+            dispatch_resume(yieldedSource);
+        }
+        yieldedHasFocus = YES;
+    } else if (frontKnown) {
+        // Another application has the focus and owns the menu bar.
+        stopWatchingYielded();
+    } else {
+        // Nobody known has the focus: it may have gone to another client of the display server.
+        yieldedHasFocus = NO;
+    }
+}
+
+static void observeMenuBarOwnership(void) {
+    int token;
+
+    // The token stays registered for the life of the process.
+    notify_register_dispatch(kCGSFrontProcessNotificationName, &token, dispatch_get_main_queue(),
+                             ^(int ignored) {
+                                 followMenuBarOwnership();
+                             });
+}
+
 - (instancetype) init {
     if (NSApp)
         NSAssert(!NSApp, @"NSApplication is a singleton");
@@ -357,7 +421,9 @@ static void observeProcessCommands(NSApplication *application) {
     // An application connects to the window system as it starts, which is also what makes it
     // known as an application to other processes.
     (void) CGSMainConnectionID();
+    _CGSSetProcessActivationPolicy((int) [self activationPolicy]);
     observeProcessCommands(self);
+    observeMenuBarOwnership();
 
     _windows = [NSMutableArray new];
     _mainMenu = nil;
@@ -366,8 +432,6 @@ static void observeProcessCommands(NSApplication *application) {
 
     NS_EXTRA(NSApplication, self)->_dockTile = [[NSDockTile alloc] initWithOwner: self];
     NS_EXTRA(NSApplication, self)->_modalStack = [NSMutableArray new];
-
-    CGSRegisterNotifyProc(hotKeyEventNotification, CGSNotificationSingleEventType(NX_SYSDEFINED), NULL);
 
     NS_EXTRA(NSApplication, self)->_lock = NSZoneMalloc(NULL, sizeof(pthread_mutex_t));
 
@@ -717,6 +781,78 @@ static NSMutableArray *pendingOpenURLs = nil;
     return image != nil ? image : [self _bundleApplicationIconImage];
 }
 
+// Whether the main bundle declares an application without a Dock presence (LSUIElement or LSBackgroundOnly).
+static BOOL bundleIsFaceless(NSDictionary *info) {
+    for (NSString *key in @[ @"LSUIElement", @"LSBackgroundOnly" ]) {
+        id value = [info objectForKey: key];
+        if ([value respondsToSelector: @selector(boolValue)] && [value boolValue])
+            return YES;
+    }
+    return NO;
+}
+
+// Whether a directory is an application bundle, judged by its contents and not by its name: it has
+// Contents/Info.plist that declares package type APPL or, with no package type, an executable that is in
+// Contents/MacOS.
+static NSBundle *applicationBundleAtPath(NSString *path) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath: [path stringByAppendingPathComponent: @"Contents/Info.plist"]])
+        return nil;
+    NSBundle *bundle = [NSBundle bundleWithPath: path];
+    NSDictionary *info = [bundle infoDictionary];
+    id type = [info objectForKey: @"CFBundlePackageType"];
+    if ([type isKindOfClass: [NSString class]])
+        return [type isEqualToString: @"APPL"] ? bundle : nil;
+    id executable = [info objectForKey: @"CFBundleExecutable"];
+    if ([executable isKindOfClass: [NSString class]] && [executable length] > 0 &&
+        [fm fileExistsAtPath: [[path stringByAppendingPathComponent: @"Contents/MacOS"]
+                                  stringByAppendingPathComponent: executable]])
+        return bundle;
+    return nil;
+}
+
+// The icon file of an application bundle, from its CFBundleIconFile (the extension may be left out).
+static NSImage *iconOfApplicationBundle(NSBundle *bundle) {
+    NSString *name = [[bundle infoDictionary] objectForKey: @"CFBundleIconFile"];
+    if (![name isKindOfClass: [NSString class]] || [name length] == 0)
+        return nil;
+    if ([[name pathExtension] length] == 0)
+        name = [name stringByAppendingPathExtension: @"icns"];
+    NSString *path = [[bundle resourcePath] stringByAppendingPathComponent: name];
+    return [[[NSImage alloc] initWithContentsOfFile: path] autorelease];
+}
+
+// The image the window system gets for this application's windows (title bars, task managers): the
+// application icon, and for a faceless helper without an icon of its own, the icon of the application
+// bundle it is nested in (an application bundle is recognised by its contents, not by a .app name).
+//
+// This is a presentation mapping of the window-system backends, not a change of what the application
+// can observe: -applicationIconImage, NSRunningApplication and NSWorkspace give such a helper the
+// generic application icon, as macOS does. macOS windows carry no icon of their own; the user meets an
+// application in the Dock and the application switcher, where a faceless helper never shows and the
+// application that contains (and started) it does. Other window systems show a per-window icon, and the
+// helper window would be shown with a default one, so it takes the nearest enclosing application's
+// icon. An image set with -setApplicationIconImage: always wins.
+- (NSImage *) _windowApplicationIconImage {
+    NSImage *image = [self applicationIconImage];
+    if (image != nil)
+        return image;
+    NSBundle *main = [NSBundle mainBundle];
+    if (!bundleIsFaceless([main infoDictionary]))
+        return nil;
+    NSString *directory = [[main bundlePath] stringByDeletingLastPathComponent];
+    while ([directory length] > 1) {
+        NSBundle *enclosing = applicationBundleAtPath(directory);
+        if (enclosing != nil) {
+            image = iconOfApplicationBundle(enclosing);
+            if (image != nil)
+                return image;
+        }
+        directory = [directory stringByDeletingLastPathComponent];
+    }
+    return nil;
+}
+
 - (BOOL) isActiveExcludingWindow: (NSWindow *) exclude {
     int count = [_windows count];
 
@@ -739,11 +875,35 @@ static NSMutableArray *pendingOpenURLs = nil;
     return NS_EXTRA(NSApplication, self)->_isActive || [self isActiveExcludingWindow: nil];
 }
 
+// Tells the other processes that this application owns the menu bar from now on, if it is a
+// regular application.
+// QUIRK: an application that is not regular (LSUIElement, LSBackgroundOnly or set to the accessory
+// or prohibited policy) that becomes active does not take the menu bar over: the application that
+// had it keeps it, and its menu stays in the menu bar, although it is no longer the active one.
+// Evidence: black-box observation on macOS 10.14.4 and 26.7.3 (tier 2): after such a helper's
+// window became key and main (frontmostApplication was the helper, the regular application had
+// resigned), NSWorkspace.menuBarOwningApplication stayed the regular application until the helper
+// quit.
+// Test: tests/appkit-global-menu/run-*-menu-style.py ("owner" cases).
+- (void) _publishActivation {
+    if ([self activationPolicy] == NSApplicationActivationPolicyRegular)
+        _CGSSetMenuBarOwnerProcess(getpid());
+}
+
 // Becomes the active application, posting the notifications, unless it is
 // already active.
 - (void) _becomeActive {
     if ([self isActive])
         return;
+
+    // An application that activates is the front application, even if none of its windows can have
+    // the focus, and a regular one owns the menu bar then. A prohibited one (see -[NSRunningApplication
+    // activationPolicy]) is neither: its windows have the focus, but it is not what the system calls
+    // the front application.
+    if ([self activationPolicy] != NSApplicationActivationPolicyProhibited) {
+        _CGSSetFrontProcess(getpid());
+        [self _publishActivation];
+    }
 
     [[NSNotificationCenter defaultCenter]
             postNotificationName: NSApplicationWillBecomeActiveNotification
@@ -791,9 +951,29 @@ static NSMutableArray *pendingOpenURLs = nil;
     return _running;
 }
 
-// There is no system setting for full keyboard access to read.
+// Full keyboard access is on when the user lets the keyboard move the focus between all controls.
+// QUIRK: the AppleKeyboardUIMode global default holds it: 0 moves the focus between text boxes and
+// lists only, 2 and 3 between all controls (the Keyboard pane of System Preferences writes 3).
+// Evidence: independent public sources give `defaults write -g AppleKeyboardUIMode -int 3` as "full
+// keyboard access for all controls" (tier 4): https://eclecticlight.co/2019/08/15/global-defaults-in-macos-mojave
+// (lists it with 2 as the normal value), https://community.jamf.com/t5/jamf-pro/script-to-enable-keyboard-gt-shortcuts-gt-full-keyboard-access/td-p/165672
+// (reported working on Mojave). Apple's own page only describes the setting in the Keyboard pane
+// (https://support.apple.com/guide/mac-help/mchlc06d1059); the documented property only says whether
+// full keyboard access is on. Test: tests/appkit-full-keyboard-access.m (test_quirk_keyboard_ui_mode)
 - (BOOL) isFullKeyboardAccessEnabled {
-    return NO;
+    CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+    CFPropertyListRef value = CFPreferencesCopyAppValue(CFSTR("AppleKeyboardUIMode"), kCFPreferencesCurrentApplication);
+    BOOL enabled = NO;
+    int mode;
+
+    if (value != NULL) {
+        if (CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, kCFNumberIntType, &mode))
+            enabled = (mode & 2) != 0;
+        else if (CFGetTypeID(value) == CFStringGetTypeID())
+            enabled = (CFStringGetIntValue(value) & 2) != 0;
+        CFRelease(value);
+    }
+    return enabled;
 }
 
 - (NSAppearance *) appearance {
@@ -1132,6 +1312,13 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
         return NO;
     NS_EXTRA(NSApplication, self)->_activationPolicy = activationPolicy;
     NS_EXTRA(NSApplication, self)->_activationPolicySet = YES;
+    _CGSSetProcessActivationPolicy((int) activationPolicy);
+    // A program that was prohibited and is active takes up the part of the front application now.
+    if (activationPolicy != NSApplicationActivationPolicyProhibited &&
+        NS_EXTRA(NSApplication, self)->_isActive) {
+        _CGSSetFrontProcess(getpid());
+        [self _publishActivation];
+    }
     return YES;
 }
 
@@ -1269,12 +1456,29 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
     return opened;
 }
 
+// Whether the application declares documents it can open (CFBundleDocumentTypes), which is
+// what makes the document controller the one to open documents for it.
+- (BOOL) _declaresDocumentTypes {
+    id types = [[[NSBundle mainBundle] infoDictionary]
+            objectForKey: @"CFBundleDocumentTypes"];
+
+    return [types count] > 0;
+}
+
 // Hands launch documents to the delegate (or the document controller) one call
 // per file, in order, as macOS does for documents named in the process
 // arguments: -application:openFiles: with a one-element array when the
 // delegate implements it, otherwise -application:openFile:.
+//
+// An application that declares no document types (an executable without a
+// bundle, or a bundle without CFBundleDocumentTypes) has no document
+// controller to fall back to: the document controller is never offered a
+// document of such an application, whatever its delegate implements and
+// answers. Words that are not files are common arguments of such programs,
+// and the controller would fail on each and present an error.
 - (BOOL) _openArgumentDocuments: (NSArray *) documents {
     BOOL opened = NO;
+    BOOL documentTypes = [self _declaresDocumentTypes];
 
     for (NSString *document in documents) {
         NSArray *one = [NSArray arrayWithObject: document];
@@ -1287,17 +1491,25 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
 
             // QUIRK: a document named in the process arguments that the delegate's -application:openFile: does
             // not take (answers NO) is then tried by the document controller, which presents an error when it
-            // cannot open it. Not documented. Evidence: black-box observation on macOS 26.7.3 (tier 2), a
-            // document-based application started from its executable with words that are no documents.
-            // Test: appkit-argument-documents (-delegate openFile)
-            if (!taken)
+            // cannot open it, but only in an application that declares document types (CFBundleDocumentTypes):
+            // one that declares none never reaches the controller. Not documented. Evidence: black-box
+            // observation on macOS 26.7.3 and 10.14.4 (tier 2), a document-based application started from its
+            // executable with words that are no documents, and an application without document types with a
+            // delegate that answers NO.
+            // Test: appkit-argument-documents (-delegate openFile),
+            // appkit-argument-documents-non-document-apps
+            if (!taken && documentTypes)
                 taken = [[NSDocumentController sharedDocumentController] application: self openFile: document];
             opened |= taken;
-        } else {
+        } else if (documentTypes) {
             opened |= [self _openFileNames: one];
         }
     }
     return opened;
+}
+
+- (BOOL) _isFinishedLaunching {
+    return NS_EXTRA(NSApplication, self)->_finishedLaunching;
 }
 
 - (void) finishLaunching {
@@ -1371,9 +1583,7 @@ static void applicationDelegateNotifications(NSDelegateNotification notes[16]) {
 - (void) _openUntitledFileIfNeeded {
     BOOL needsUntitled = YES;
     NSDocumentController *controller = nil;
-    id types = [[[NSBundle mainBundle] infoDictionary]
-            objectForKey: @"CFBundleDocumentTypes"];
-    if ([types count] > 0)
+    if ([self _declaresDocumentTypes])
         controller = [NSDocumentController sharedDocumentController];
 
     if (needsUntitled && _delegate &&
@@ -1602,8 +1812,12 @@ static BOOL terminateAfterLastWindowClosedSetting(void) {
         return;
     }
 
+    // (A program outside an application bundle is prohibited until it sets a policy, but has always
+    // ended with its last window.)
     if (closedByUser && terminateAfterLastWindowClosedSetting() &&
-        [self activationPolicy] == NSApplicationActivationPolicyRegular &&
+        ([self activationPolicy] == NSApplicationActivationPolicyRegular ||
+         (!NS_EXTRA(NSApplication, self)->_activationPolicySet &&
+          [[NSRunningApplication currentApplication] _isOutsideApplicationBundle])) &&
         ![NSStatusBar _hasStatusItems])
         [self terminate: self];
 }
@@ -1675,7 +1889,7 @@ static BOOL terminateAfterLastWindowClosedSetting(void) {
 
     // QUIRK: a system-defined event of subtype 6 is a hot key press and one of subtype 9 a
     // release; data1 names the hot key. HIToolbox turns it into the Carbon hot key event (AppKit
-    // passes it on with CreateEventWithCGEvent and SendEventToEventTarget), so an
+    // passes the event's Carbon event on with SendEventToEventTarget), so an
     // application that overrides -sendEvent: without calling super gets no Carbon callback, as on
     // macOS. Not documented. Evidence: public write-ups (The Register, 2009,
     // https://www.theregister.co.uk/2009/02/24/hotkeys_framework2/; cocoa-dev 2011-10,
@@ -1686,15 +1900,13 @@ static BOOL terminateAfterLastWindowClosedSetting(void) {
     // Test: tests/src/carbon_hotkeys_appkit.m
     if ([event type] == NSSystemDefined &&
         ([event subtype] == kCGSHotKeyPressedSubtype || [event subtype] == kCGSHotKeyReleasedSubtype)) {
-        // Through the public Carbon Event Manager: a raw event made from the event's CGEvent goes to
-        // the event dispatcher target, whose standard handler (in HIToolbox) sends the hot key event.
-        CGEventRef cgEvent = [event CGEvent];
-        EventRef carbonEvent = NULL;
+        // Through the public Carbon Event Manager: the raw event (the one taken from HIToolbox's
+        // queue) goes to the event dispatcher target, whose standard handler (in HIToolbox) sends the
+        // hot key event.
+        EventRef carbonEvent = (EventRef) [event eventRef];
 
-        if (cgEvent != NULL && CreateEventWithCGEvent(NULL, cgEvent, kEventAttributeNone, &carbonEvent) == noErr) {
+        if (carbonEvent != NULL)
             SendEventToEventTarget(carbonEvent, GetEventDispatcherTarget());
-            ReleaseEvent(carbonEvent);
-        }
         return;
     }
 
@@ -1743,17 +1955,12 @@ static BOOL terminateAfterLastWindowClosedSetting(void) {
                 makeObjectsPerformSelector: @selector(_makeSureIsOnAScreen)];
 
         [self _checkForAppActivation];
+        [self _updateWindowsIfNeededInMode: mode];
         [self _displayAllWindowsIfNeeded];
 
-        nextEvent = [[NS_EXTRA(NSApplication, self)->_display nextEventMatchingMask: mask
-                                           untilDate: untilDate
-                                              inMode: mode
-                                             dequeue: dequeue] retain];
-
-        if ([nextEvent type] == NSAppKitSystem) {
-            [nextEvent release];
-            nextEvent = nil;
-        }
+        // One wait in HIToolbox's event queue, which holds AppKit's events
+        [NS_EXTRA(NSApplication, self)->_display willWaitForEvents];
+        nextEvent = [_NSEventQueueNextEvent(mask, untilDate, mode, dequeue) retain];
 
         NS_HANDLER [self reportException: localException];
         NS_ENDHANDLER
@@ -1788,11 +1995,14 @@ static BOOL terminateAfterLastWindowClosedSetting(void) {
 - (void) discardEventsMatchingMask: (NSUInteger) mask
                        beforeEvent: (NSEvent *) event
 {
-    [NS_EXTRA(NSApplication, self)->_display discardEventsMatchingMask: mask beforeEvent: event];
+    _NSEventQueueDiscard(mask, event);
 }
 
+// QUIRK: what an application posts with -[NSApplication postEvent:atStart:] is queued as it is: posted drags are
+// dequeued one by one, never coalesced. Not documented. Evidence: black-box observation on macOS 26.7.3 and 10.14.4 (tier 2; darling's tests/collection-view.md).
+// Test: appkit-posted-events-not-coalesced.m
 - (void) postEvent: (NSEvent *) event atStart: (BOOL) atStart {
-    [NS_EXTRA(NSApplication, self)->_display _postEventWithoutCoalescing: event atStart: atStart];
+    _NSEventQueuePost(event, atStart);
 }
 
 - _searchForAction: (SEL) action responder: target {
@@ -1914,9 +2124,31 @@ static BOOL terminateAfterLastWindowClosedSetting(void) {
     return NO;
 }
 
+// The next -nextEventMatchingMask:... in the default or modal panel run loop
+// mode updates the windows.
 - (void) setWindowsNeedUpdate: (BOOL) value {
     NS_EXTRA(NSApplication, self)->_windowsNeedUpdate = value;
-    NSUnimplementedMethod();
+}
+
+// SPI. An accent color the application chose for itself, nil unless set; it
+// doesn't change +[NSColor controlAccentColor]. The application object lives
+// for the whole process, so the color is never released.
+- (NSColor *) _accentColor {
+    return NS_EXTRA(NSApplication, self)->_accentColor;
+}
+
+- (void) _setAccentColor: (NSColor *) color {
+    color = [color copy];
+    [NS_EXTRA(NSApplication, self)->_accentColor release];
+    NS_EXTRA(NSApplication, self)->_accentColor = color;
+}
+
+// SPI. The accent color the application's interface uses when it has its own:
+// the one set with -_setAccentColor:. (Darling doesn't read the color that
+// NSAccentColorName names in the Info.plist, as it would come from an asset
+// catalog.)
+- (NSColor *) _effectiveAccentColor {
+    return [[NS_EXTRA(NSApplication, self)->_accentColor retain] autorelease];
 }
 
 // The windows are updated between the two notifications; only the windows on screen are updated (and their
@@ -1927,6 +2159,15 @@ static BOOL terminateAfterLastWindowClosedSetting(void) {
         if ([window isVisible])
             [window update];
     [[NSNotificationCenter defaultCenter] postNotificationName: NSApplicationDidUpdateNotification object: self];
+}
+
+- (void) _updateWindowsIfNeededInMode: (NSRunLoopMode) mode {
+    if (!NS_EXTRA(NSApplication, self)->_windowsNeedUpdate)
+        return;
+    if (![mode isEqualToString: NSDefaultRunLoopMode] && ![mode isEqualToString: NSModalPanelRunLoopMode])
+        return;
+    NS_EXTRA(NSApplication, self)->_windowsNeedUpdate = NO;
+    [self updateWindows];
 }
 
 // Whether a window of this application may ask the window system for the input focus now. Ordering a
@@ -2376,6 +2617,8 @@ static BOOL isModalWindowOrItsSheet(NSWindow *window, NSWindow *modalWindow) {
     // A cancelled termination ends here, and the application runs on.
     NS_EXTRA(NSApplication, self)->_terminateInProgress = NO;
     if (terminate == YES) {
+        // The process is really exiting now, so the next launch must not treat it as a crash.
+        [self _removeWindowSessionMarker];
         [[NSNotificationCenter defaultCenter]
                 postNotificationName: NSApplicationWillTerminateNotification
                               object: self];
@@ -2620,10 +2863,11 @@ static BOOL resignForced;
 
 - (void) _windowDidBecomeActive: (NSWindow *) window {
     resignPending = NO;
-    // A window of this process has the input focus, which is what makes it the front process.
-    // CoreGraphics keeps it for the display servers that cannot be asked who has the focus and
-    // tells the other processes (NSWorkspace's frontmostApplication follows it).
-    _CGSSetFrontProcess(getpid());
+    // A window of this process has the input focus, which makes the process the front process:
+    // CoreGraphics reports that itself from the window system's focus (and tells the other processes;
+    // NSWorkspace's frontmostApplication follows it).
+    if ([self activationPolicy] != NSApplicationActivationPolicyProhibited)
+        [self _publishActivation];
     if (!NS_EXTRA(NSApplication, self)->_isActive) {
         NS_EXTRA(NSApplication, self)->_isActive = YES;
         [[NSNotificationCenter defaultCenter]
@@ -2687,11 +2931,13 @@ static BOOL resignForced;
     if (!forced && ![self _hasOnScreenWindow])
         return;
 
+    // The system's front process is no longer this application when the notifications go out, as on
+    // macOS: the front process observers (HIToolbox's application events) run before them.
+    _CGSResignFrontProcess(getpid());
     [[NSNotificationCenter defaultCenter]
             postNotificationName: NSApplicationWillResignActiveNotification
                           object: self];
     NS_EXTRA(NSApplication, self)->_isActive = NO;
-    _CGSResignFrontProcess(getpid());
 
     // Exposed menus are running tight event tracking loops and would remain
     // visible when the app deactivates (making the UI less than community

@@ -85,6 +85,10 @@ const CFStringRef kCGWindowMemoryUsage = CFSTR("kCGWindowMemoryUsage");
     O2InvalidAbstractInvocation();
 }
 
+- (CGRect) frame {
+    return CGRectNull;
+}
+
 - (void) setOpaque: (BOOL) value {
     O2InvalidAbstractInvocation();
 }
@@ -180,6 +184,10 @@ static NSInteger nextWindowNumber = 1;
     return 0;
 }
 
+- (NSInteger) _assignedWindowNumber {
+    return 0;
+}
+
 - (NSInteger) windowNumber {
     NSInteger number;
 
@@ -190,13 +198,24 @@ static NSInteger nextWindowNumber = 1;
     }
     number = (NSInteger) CFDictionaryGetValue(numbersByWindow, self);
     if (number == 0) {
-        number = nextWindowNumber++;
+        number = [self _assignedWindowNumber];
+        if (number <= 0)
+            number = nextWindowNumber++;
         CFDictionarySetValue(numbersByWindow, self, (void *) number);
         CFDictionarySetValue(windowsByNumber, (void *) number, self);
     }
     pthread_mutex_unlock(&windowNumberLock);
 
     return number;
+}
+
+- (NSString *) ensureSessionToplevelName {
+    return nil;
+}
+
+- (void) setSessionToplevelName: (NSString *) name restoring: (BOOL) restoring {
+    (void) name;
+    (void) restoring;
 }
 
 - (void) dealloc {

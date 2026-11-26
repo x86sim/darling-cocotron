@@ -64,6 +64,9 @@ typedef enum {
 - (void) setStyleMask: (NSUInteger) mask;
 - (void) setTitle: (NSString *) title;
 - (void) setFrame: (CGRect) frame;
+// The window's frame in AppKit's global space (origin at the bottom left of the main
+// display), or CGRectNull for a window system that does not know it.
+- (CGRect) frame;
 - (void) setOpaque: (BOOL) value;
 - (void) setAlphaValue: (CGFloat) value;
 - (void) setHasShadow: (BOOL) value;
@@ -84,6 +87,9 @@ typedef enum {
 + (NSInteger) windowNumberForPlatformWindowID: (unsigned long) platformWindowID;
 
 - (NSInteger) windowNumber;
+// For the platform windows that are made on a CGS window (see CGSWindow.h): the window number is the
+// id of that window, which this returns. The default, 0, leaves the number to be assigned on first use.
+- (NSInteger) _assignedWindowNumber;
 // The window system's identifier of the window (an X11 Window, for example),
 // or 0 if it has none.
 - (unsigned long) platformWindowID;
@@ -119,6 +125,11 @@ typedef enum {
 - (void) flushCGLContext: (CGLContextObj) cglContext;
 
 - (CGSubWindow *) createSubWindowWithFrame: (CGRect) frame;
+
+// A window system that persists toplevel state across launches identifies a toplevel by a stable
+// name. The default is no session support: the methods do nothing and return nil.
+- (NSString *) ensureSessionToplevelName;
+- (void) setSessionToplevelName: (NSString *) name restoring: (BOOL) restoring;
 
 @end
 

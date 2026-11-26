@@ -20,8 +20,13 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/AppKitIvarLayout.h>
 #import <CoreGraphics/CGSubWindow.h>
 #import <Foundation/NSObject.h>
+// CGLInternal.h is Darling's private CGL, which brings in the window server
+// SPI; code built against the SDK gets the public OpenGL API instead.
+#ifdef DARLING
 #import <OpenGL/CGLInternal.h>
-#import <OpenGL/gl.h>
+#else
+#import <OpenGL/OpenGL.h>
+#endif
 
 @class NSOpenGLPixelFormat, NSOpenGLPixelBuffer, NSView;
 
@@ -59,7 +64,14 @@ enum {
     NS_EXTRA_IVARS_BEGIN(NSOpenGLContext)
         NSView *_view;
         CGSubWindow *_subwindow;
+#ifdef DARLING
         CGLWindowRef _cglWindow;
+#else
+        void *_cglWindow; // a CGLWindowRef
+#endif
+        // The id of the surface the drawable is registered as with CoreGraphics (see
+        // _CGSAddWindowSurface), 0 while there is no drawable.
+        int _surfaceID;
         BOOL _hasPrepared, _drawableAttachmentSucceeded, _presentObserved;
         int _viewportResetPending;
     NS_SIDE_IVARS_END(NSOpenGLContext)

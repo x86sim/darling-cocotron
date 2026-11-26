@@ -61,24 +61,44 @@ the session bus with the [`com.canonical.dbusmenu`](https://github.com/AyatanaIn
 (`AppKit/NSDBusMenu.m`, shared with the X11 backend) and every toplevel tells the compositor its address with
 `org_kde_kwin_appmenu.set_address`. Plasma owns the registrar name only while a global menu view is in use (the
 Global Menu applet or the application menu button of the title bars), so the name is the sign that the menu will
-be seen. Otherwise titled windows draw the menu in a strip of their own, as with the `DarlingInWindowMenuBar`
-preference: an xdg-shell client cannot put a menu bar window of its own along the top of the screen as the X11
-backend does. The choice is made once, before the first window frame is computed.
+be seen.
+
+Otherwise the windows that can carry it (titled, not panels or sheets, see `+[NSWindow
+hasMainMenuForStyleMask:]`) draw the menu in a strip of their own. A compositor with `zwlr_layer_shell_v1` also
+gets a menu bar surface along the top of the screen (an `NSMenuBarWindow`, see `NSMenuBarController`), shown only
+while the application is active, has a main menu and no visible window carries the strip: an application with
+only borderless or utility windows, or none. An xdg-shell client alone cannot place such a surface, so there the
+strips are all there is. The bar follows the application's activation: it goes away after a moment when another
+client takes the keyboard focus. Closing the last window does not end the activation, because nothing shows
+whether another client has the focus then.
+
+The `DarlingMenuBarStyle` preference (application domain, NSGlobalDomain or `org.darlinghq.AppKit`) changes the
+choice: `window` always uses the strips (the global menu is not used), `screen` never uses them while the menu
+can be shown outside the windows (global menu, or the menu bar surface), and `auto`, the default, is as
+described above. The older boolean `DarlingInWindowMenuBar` means `window` when `DarlingMenuBarStyle` is not set.
+The choice is made once, before the first window frame is computed.
 
 ## Clipboard and drag-and-drop
 
 The general pasteboard is the selection of `wl_data_device` (core protocol, `wl_data_device_manager`
-version 3 for drag actions). Text maps to `text/plain;charset=utf-8`, `text/plain` and `UTF8_STRING`, PNG and
+version 3 for drag actions). CoreGraphics owns that: its connection has a data device of its own and keeps the
+pasteboard in step with the compositor's clipboard (`CoreGraphics/Wayland.backend/CGSWaylandClipboard.m`), so a
+process without windows gets the clipboard too; this backend's data device only handles drag and drop. Text maps to `text/plain;charset=utf-8`, `text/plain` and `UTF8_STRING`, PNG and
 TIFF images to `image/png` and `image/tiff`, file lists (`NSFilenamesPboardType`) to `text/uri-list`; other
 types travel under their own names. Other named pasteboards are process-local. Publishing needs keyboard
-focus and an input serial, so writes made earlier stay local until input arrives. Transfers are limited to
-16 MiB and five seconds, a reader that stalls or an oversized transfer yields nil rather than truncated data.
+focus and an input serial, so writes made earlier stay local until input arrives. A write made while a key or
+click is handled takes that input's serial and is offered at once, even when the focus left in the meantime (a
+virtual keyboard removed right after its key, say; `tests/clipboard-keyboard-removed.sh`). This is verified on
+sway (wlroots) only: a compositor that also requires keyboard focus for `set_selection` may ignore a copy that
+was handled after the window lost the focus. Transfers are
+limited to 16 MiB and five seconds, a reader that stalls or an oversized transfer yields nil rather than truncated
+data.
 
 Incoming drops use AppKit's drag hit testing and the same enter, update, exit and perform sequence as the
 other backends; copy and move are negotiated, the drag pasteboard is separate from the clipboard, and
 callbacks run after native dispatch. Outgoing drags start from a mouse press and show a drag icon at the
 output scale. A drag whose source and target are the same process stays in the process and keeps the
-original Cocoa data. File lists are converted by `AppKit/DarlingFileURIList.m`, shared with the X11 backend:
+original Cocoa data. File lists are converted by `CoreGraphics/DarlingFileURIList.m`, shared with the X11 backend:
 only paths below `/Volumes/SystemRoot` (host paths) are offered to other processes.
 
 ## OpenGL, layers and scale
