@@ -29,17 +29,19 @@
 //   given) and turns the Carbon event it takes into an NSEvent that keeps the CGEvent and the
 //   Carbon event (-CGEvent, -eventRef).
 //
-// Interim (darlinghq/darling#937): until the window system backends decode input into CGEvents
-// themselves, the NSEvent a backend built travels with the CGEvent (_CGSEventSetClientData), as it
-// carries what a CGEvent cannot (input method text, gesture phases, tablet data, tracking areas).
-// It is used when no event tap changed the event; otherwise the NSEvent is made from the
-// CGEvent's fields. Events the application posts travel the same way, so that it gets back the
-// object it posted.
+// Identity of NSEvents: the window system's input reaches AppKit only as CGEvents, from which the
+// NSEvent is made (input method text and the like are added by the display's keyEventCreated: and
+// pointerEventCreated: hooks). An NSEvent that AppKit or the application itself made and queued
+// (-[NSApplication postEvent:atStart:], the events AppKit synthesises from touches) travels with
+// its CGEvent as the object attached to it (_CGSEventSetClientData), so that whoever dequeues it
+// gets back the object that was posted. The attached object is used while no event tap has changed
+// the event; otherwise the NSEvent is made from the CGEvent's fields.
 
 #import "NSEventQueue.h"
 #import <AppKit/NSApplication.h>
 #import <AppKit/NSDisplay.h>
 #import <AppKit/NSEvent_mouse.h>
+#import "NSEvent.subproj/NSEvent_tablet.h"
 #import "NSEvent_gesture.h"
 #import <AppKit/NSEvent_keyboard.h>
 #import <AppKit/NSEvent_other.h>
@@ -357,6 +359,43 @@ CGEventRef _NSEventCreateCGEvent(NSEvent *event, CGFloat mainScreenMaxY) {
                                     [event windowNumber]);
         break;
     }
+    case NSEventTypeTabletPoint:
+    case NSEventTypeTabletProximity: {
+        cgEvent = CGEventCreate(NULL);
+        if (cgEvent == NULL)
+            break;
+        CGEventSetType(cgEvent, (CGEventType) type);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletEventPointX, [event absoluteX]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletEventPointY, [event absoluteY]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletEventPointZ, [event absoluteZ]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletEventPointButtons, [event buttonMask]);
+        CGEventSetDoubleValueField(cgEvent, kCGTabletEventPointPressure, [event pressure]);
+        CGEventSetDoubleValueField(cgEvent, kCGTabletEventTiltX, [event tilt].x);
+        CGEventSetDoubleValueField(cgEvent, kCGTabletEventTiltY, [event tilt].y);
+        CGEventSetDoubleValueField(cgEvent, kCGTabletEventRotation, [event rotation]);
+        CGEventSetDoubleValueField(cgEvent, kCGTabletEventTangentialPressure, [event tangentialPressure]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventVendorID, [event vendorID]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventTabletID, [event tabletID]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventPointerID, [event pointingDeviceID]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventDeviceID, [event deviceID]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventSystemTabletID, [event systemTabletID]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventVendorPointerType, [event vendorPointingDeviceType]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventVendorPointerSerialNumber,
+                                    [event pointingDeviceSerialNumber]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventVendorUniqueID, [event uniqueID]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventCapabilityMask, [event capabilityMask]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventPointerType, [event pointingDeviceType]);
+        CGEventSetIntegerValueField(cgEvent, kCGTabletProximityEventEnterProximity, [event isEnteringProximity]);
+        CGEventSetIntegerValueField(cgEvent, kCGSTabletPointerID, [event pointingDeviceID]);
+        CGEventSetIntegerValueField(cgEvent, kCGSTabletSystemTabletID, [event systemTabletID]);
+        CGEventSetIntegerValueField(cgEvent, kCGSTabletCapabilityMask, [event capabilityMask]);
+        CGEventSetIntegerValueField(cgEvent, kCGSTabletVendorPointerType, [event vendorPointingDeviceType]);
+        CGEventSetIntegerValueField(cgEvent, kCGSTabletPointerType, [event pointingDeviceType]);
+        CGEventSetIntegerValueField(cgEvent, kCGSTabletVendorPointerSerialNumber, [event pointingDeviceSerialNumber]);
+        CGEventSetIntegerValueField(cgEvent, kCGSTabletWindowNumber, [event windowNumber]);
+        CGEventSetIntegerValueField(cgEvent, kCGSTabletWindowNumberThatCanHandleThisEvent, [event windowNumber]);
+        break;
+    }
     case NSScrollWheel: {
         CGFloat deltaY = [event deltaY], deltaX = [event deltaX];
         cgEvent = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitLine, 2, (int32_t) deltaY, (int32_t) deltaX);
@@ -522,6 +561,39 @@ NSEvent *_NSEventCreateFromCGEvent(CGEventRef cgEvent) {
         result = mouse;
         break;
     }
+    case kCGEventTabletPointer:
+    case kCGEventTabletProximity: {
+        // A tablet belongs to the window under the tool like the pointer does. The backend posts
+        // the fields; AppKit only reads them, so the same protocol works for Wayland and X11.
+        NSInteger windowNumber = (NSInteger) CGEventGetIntegerValueField(cgEvent, kCGSTabletWindowNumberThatCanHandleThisEvent);
+        if (windowNumber == 0)
+            windowNumber = (NSInteger) CGEventGetIntegerValueField(cgEvent, kCGSTabletWindowNumber);
+        NSPoint windowLocation = NSZeroPoint;
+        BOOL hasWindowLocation = NO;
+        if (CGEventGetIntegerValueField(cgEvent, kCGSEventNativeWindow) != 0) {
+            NSInteger nativeNumber = 0;
+            if ([[NSDisplay currentDisplay] windowNumber: &nativeNumber
+                                                location: &windowLocation
+                                             hasLocation: &hasWindowLocation
+                                         forPointerEvent: cgEvent])
+                windowNumber = nativeNumber;
+        }
+        NSWindow *window = windowNumber != 0 ? [NSApp windowWithWindowNumber: windowNumber] : nil;
+        NSPoint location = screenLocation(cgEvent);
+        if (window != nil)
+            location = hasWindowLocation ? windowLocation : [window convertScreenToBase: location];
+        else
+            windowNumber = 0;
+        result = [[NSEvent_tablet alloc]
+                initWithType: type == kCGEventTabletPointer ? NSEventTypeTabletPoint : NSEventTypeTabletProximity
+                    location: location
+               modifierFlags: flags
+                   timestamp: timestamp
+                windowNumber: windowNumber
+                     context: nil
+                     cgEvent: cgEvent];
+        break;
+    }
     case 18: // NSEventTypeRotate
     case 30: { // NSEventTypeMagnify
         // A gesture of the window system's pointer (a touchpad pinch): the window and the location in it as
@@ -670,14 +742,6 @@ NSEvent *_NSEventCreateFromCGEvent(CGEventRef cgEvent) {
 void _NSEventQueueBeginReading(void) {
     _HISetEventStreamFilter(streamFilter);
     _HIBeginEventStreamReading();
-}
-
-void _NSEventQueuePostWindowSystemEvent(NSEvent *event, CGFloat mainScreenMaxY) {
-    CGEventRef cgEvent = _NSEventCreateCGEvent(event, mainScreenMaxY);
-
-    _CGSEventSetClientData(cgEvent, (CFTypeRef) event);
-    _CGSEventStreamPost(cgEvent);
-    CFRelease(cgEvent);
 }
 
 void _NSEventQueuePost(NSEvent *event, BOOL atStart) {

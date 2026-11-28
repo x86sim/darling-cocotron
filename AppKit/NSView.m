@@ -60,6 +60,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSLayoutConstraint.h>
 #import <AppKit/NSLayoutGuide.h>
 #import "NSLayoutConstraintInternal.h"
+
+// Private to the print operation: whether a page of its PrintCore session is open
+@interface NSPrintOperation (NSViewPrinting)
+- (BOOL) _printCorePageIsOpen;
+@end
 #import "NSViewLayoutInternal.h"
 #import <AppKit/NSTextInput.h>
 #import <AppKit/NSTextInputClient.h>
@@ -1214,7 +1219,9 @@ static void drawViewTreeInContext(NSView *view, CGContextRef port, NSRect rect) 
     [NSGraphicsContext setCurrentContext: context];
     CGContextSaveGState(port);
     CGContextClipToRect(port, rect);
-    [view drawRect: rect];
+    [[view effectiveAppearance] performAsCurrentDrawingAppearance: ^{
+        [view drawRect: rect];
+    }];
     CGContextRestoreGState(port);
     [NSGraphicsContext restoreGraphicsState];
 
@@ -1502,24 +1509,33 @@ static void sendHiddenStateChange(NSView *view, BOOL hidden) {
             CGPointApplyAffineTransform(point, toWindow), fromWindow);
 }
 
+static NSSize convertSizeAcrossViews(NSView *source, NSView *target, NSSize size) {
+    // AppKit treats NSSize as a magnitude across flipped/unflipped coordinate systems;
+    // cancel source's isFlipped before rotating/scaling to window and target's after.
+    if (source != nil && [source isFlipped])
+        size.height = -size.height;
+    CGAffineTransform toWindow =
+            (source != nil) ? [source transformToWindow] : CGAffineTransformIdentity;
+    CGAffineTransform fromWindow =
+            (target != nil) ? [target transformFromWindow] : CGAffineTransformIdentity;
+    NSSize result = CGSizeApplyAffineTransform(
+            CGSizeApplyAffineTransform(size, toWindow), fromWindow);
+
+    if (target != nil && [target isFlipped])
+        result.height = -result.height;
+    return result;
+}
+
 - (NSSize) convertSize: (NSSize) size fromView: (NSView *) viewOrNil {
     NSView *fromView =
             (viewOrNil != nil) ? viewOrNil : [[self window] _backgroundView];
-    CGAffineTransform toWindow = [fromView transformToWindow];
-    CGAffineTransform fromWindow = [self transformFromWindow];
-
-    return CGSizeApplyAffineTransform(
-            CGSizeApplyAffineTransform(size, toWindow), fromWindow);
+    return convertSizeAcrossViews(fromView, self, size);
 }
 
 - (NSSize) convertSize: (NSSize) size toView: (NSView *) viewOrNil {
     NSView *toView =
             (viewOrNil != nil) ? viewOrNil : [[self window] _backgroundView];
-    CGAffineTransform toWindow = [self transformToWindow];
-    CGAffineTransform fromWindow = [toView transformFromWindow];
-
-    return CGSizeApplyAffineTransform(
-            CGSizeApplyAffineTransform(size, toWindow), fromWindow);
+    return convertSizeAcrossViews(self, toView, size);
 }
 
 - (NSRect) convertRect: (NSRect) rect fromView: (NSView *) viewOrNil {
@@ -3075,6 +3091,31 @@ static void removeRectFromInvalidInVisibleRect(NSView *self, NSRect rect,
     }
 }
 
+- (BOOL) _hasOnlyPartialInvalidRects {
+    return NS_EXTRA(NSView, self)->_needsDisplay &&
+           NS_EXTRA(NSView, self)->_invalidRectCount > 0;
+}
+
+- (void) _clipInvalidRectsToRect: (NSRect) clipRect {
+    int count = NS_EXTRA(NSView, self)->_invalidRectCount;
+    NSRect *rects = NS_EXTRA(NSView, self)->_invalidRects;
+    int out = 0;
+
+    for (int i = 0; i < count; i++) {
+        NSRect r = NSIntersectionRect(rects[i], clipRect);
+        if (!NSIsEmptyRect(r))
+            rects[out++] = r;
+    }
+    NS_EXTRA(NSView, self)->_invalidRectCount = out;
+    if (out == 0) {
+        if (rects != NULL) {
+            NSZoneFree(NULL, rects);
+            NS_EXTRA(NSView, self)->_invalidRects = NULL;
+        }
+        NS_EXTRA(NSView, self)->_needsDisplay = NO;
+    }
+}
+
 static void clearRectsBeingRedrawn(NSView *self) {
     if (NS_EXTRA(NSView, self)->_rectsBeingRedrawn) {
         NSZoneFree(NULL, NS_EXTRA(NSView, self)->_rectsBeingRedrawn);
@@ -3483,9 +3524,46 @@ static void releaseSubviewSnapshot(SubviewSnapshot *snapshot) {
 
 - (void) _displayIfNeededWithoutViewWillDraw {
     if ([self needsDisplay]) {
+        int count = NS_EXTRA(NSView, self)->_invalidRectCount;
+        if (count > 1 && count <= 16) {
+            NSRect rects[16];
+            memcpy(rects, NS_EXTRA(NSView, self)->_invalidRects, sizeof(NSRect) * count);
+            BOOL merged;
+            do {
+                merged = NO;
+                for (int i = 0; i < count; i++) {
+                    for (int j = i + 1; j < count; j++) {
+                        if (NSIntersectsRect(rects[i], rects[j])) {
+                            rects[i] = NSUnionRect(rects[i], rects[j]);
+                            rects[j] = rects[--count];
+                            j = i;
+                            merged = YES;
+                        }
+                    }
+                }
+            } while (merged);
+            if (count > 1) {
+                NSRect uni = rects[0];
+                CGFloat sumArea = rects[0].size.width * rects[0].size.height;
+                for (int i = 1; i < count; i++) {
+                    uni = NSUnionRect(uni, rects[i]);
+                    sumArea += rects[i].size.width * rects[i].size.height;
+                }
+                CGFloat uniArea = uni.size.width * uni.size.height;
+                if (uniArea > sumArea * 1.5) {
+                    for (int i = 0; i < count; i++)
+                        [self displayRect: rects[i]];
+                    clearNeedsDisplay(self);
+                    goto display_subviews;
+                }
+            }
+        }
         [self displayRect: unionOfInvalidRects(self)];
         clearNeedsDisplay(self);
     }
+
+display_subviews:
+    ;
 
     SubviewSnapshot snapshot;
     takeSubviewSnapshot(self, &snapshot);
@@ -3604,14 +3682,16 @@ static void releaseSubviewSnapshot(SubviewSnapshot *snapshot) {
             [[NSColor yellowColor] set];
             NSRectFill(rect);
         } else {
-            if (_layer != nil && [self wantsUpdateLayer]) {
-                [self updateLayer];
-                // A custom backing layer may implement -display (e.g. a Metal
-                // blit layer). View invalidation must also invalidate that layer.
-                [_layer setNeedsDisplay];
-            }
-            else
-                [self drawRect: rect];
+            [[self effectiveAppearance] performAsCurrentDrawingAppearance: ^{
+                if (_layer != nil && [self wantsUpdateLayer]) {
+                    [self updateLayer];
+                    // A custom backing layer may implement -display (e.g. a Metal
+                    // blit layer). View invalidation must also invalidate that layer.
+                    [_layer setNeedsDisplay];
+                }
+                else
+                    [self drawRect: rect];
+            }];
             if (NSShowAllViews) {
                 [[self _borderColorForNSShowAllViews] set];
                 NSFrameRect(rect);
@@ -3719,7 +3799,10 @@ static void releaseSubviewSnapshot(SubviewSnapshot *snapshot) {
 
     [NSCurrentFocusStack() addObject: self];
 
-    CGContextBeginPage(graphicsPort, &mediaBox);
+    // A page of a PrintCore job is begun by the operation, in the session that owns the context; a second begin
+    // would leave that page open
+    if (![[NSPrintOperation currentOperation] _printCorePageIsOpen])
+        CGContextBeginPage(graphicsPort, &mediaBox);
     CGContextSaveGState(graphicsPort);
 
     transform = CGAffineTransformIdentity;
@@ -3740,7 +3823,8 @@ static void releaseSubviewSnapshot(SubviewSnapshot *snapshot) {
     CGContextRef graphicsPort = NSCurrentGraphicsPort();
 
     CGContextRestoreGState(graphicsPort);
-    CGContextEndPage(graphicsPort);
+    if (![[NSPrintOperation currentOperation] _printCorePageIsOpen])
+        CGContextEndPage(graphicsPort);
     [NSCurrentFocusStack() removeLastObject];
 }
 
@@ -4712,6 +4796,8 @@ static id anchorForView(NSView *view, Class anchorClass, NSLayoutAttribute attri
         return NS_EXTRA(NSView, self)->_appearance;
     if (_superview != nil)
         return [_superview effectiveAppearance];
+    if (_window != nil)
+        return [_window effectiveAppearance];
     return [NSAppearance currentAppearance];
 }
 

@@ -24,6 +24,10 @@
 #import <Foundation/NSArray.h>
 #import <Foundation/NSDictionary.h>
 #import <Foundation/NSValue.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
 
 const CFStringRef kCGSWindowTitle = CFSTR("WindowTitle");
 
@@ -38,13 +42,102 @@ const CFStringRef kCGSWindowTitle = CFSTR("WindowTitle");
     _nextSurfaceId = 1;
     _surfaces = [[NSMutableDictionary alloc] initWithCapacity: 1];
     _windowId = windowID;
+    _inputMethodCursorRect = CGRectNull;
     return self;
 }
 
 - (void) dealloc {
     CGContextRelease(_contents);
     [_surfaces release];
+    [_dragDestination release];
+    [_inputMethodSurroundingText release];
     [super dealloc];
+}
+
+- (void) setDragDestination: (id<CGSDragDestination>) destination {
+    if (destination == _dragDestination)
+        return;
+    id<CGSDragDestination> old = _dragDestination;
+    _dragDestination = [destination retain];
+    [old release];
+    [self dragDestinationChanged];
+}
+
+- (id<CGSDragDestination>) dragDestination {
+    return _dragDestination;
+}
+
+- (void) dragDestinationChanged {
+}
+
+- (void) setInputMethodEnabled: (BOOL) enabled {
+    if (enabled == _inputMethodEnabled)
+        return;
+    _inputMethodEnabled = enabled;
+    [self inputMethodEnabledChanged];
+}
+
+- (BOOL) inputMethodEnabled {
+    return _inputMethodEnabled;
+}
+
+- (void) setInputMethodCursorRect: (CGRect) rect {
+    if (CGRectEqualToRect(rect, _inputMethodCursorRect))
+        return;
+    _inputMethodCursorRect = rect;
+    [self inputMethodCursorRectChanged];
+}
+
+- (CGRect) inputMethodCursorRect {
+    return _inputMethodCursorRect;
+}
+
+- (void) inputMethodEnabledChanged {
+}
+
+- (void) inputMethodCursorRectChanged {
+}
+
+- (void) setInputMethodSurroundingText: (NSString *) text selection: (CFRange) selection {
+    if ((text == _inputMethodSurroundingText || [text isEqualToString: _inputMethodSurroundingText]) &&
+        selection.location == _inputMethodSurroundingSelection.location &&
+        selection.length == _inputMethodSurroundingSelection.length)
+        return;
+    NSString *old = _inputMethodSurroundingText;
+    _inputMethodSurroundingText = [text copy];
+    [old release];
+    _inputMethodSurroundingSelection = selection;
+    [self inputMethodSurroundingTextChanged];
+}
+
+- (NSString *) inputMethodSurroundingText {
+    return _inputMethodSurroundingText;
+}
+
+- (CFRange) inputMethodSurroundingSelection {
+    return _inputMethodSurroundingSelection;
+}
+
+- (void) setInputMethodContentHint: (uint32_t) hint purpose: (uint32_t) purpose {
+    if (hint == _inputMethodContentHint && purpose == _inputMethodContentPurpose)
+        return;
+    _inputMethodContentHint = hint;
+    _inputMethodContentPurpose = purpose;
+    [self inputMethodContentTypeChanged];
+}
+
+- (uint32_t) inputMethodContentHint {
+    return _inputMethodContentHint;
+}
+
+- (uint32_t) inputMethodContentPurpose {
+    return _inputMethodContentPurpose;
+}
+
+- (void) inputMethodSurroundingTextChanged {
+}
+
+- (void) inputMethodContentTypeChanged {
 }
 
 - (CGSSurface *) surfaceForId: (CGSSurfaceID) surfaceId {
@@ -62,6 +155,7 @@ const CFStringRef kCGSWindowTitle = CFSTR("WindowTitle");
 }
 
 - (void) invalidate {
+    [self setToplevelEventProc: NULL info: NULL];
     [_connection _windowInvalidated: _windowId];
 }
 
@@ -109,6 +203,195 @@ const CFStringRef kCGSWindowTitle = CFSTR("WindowTitle");
 
 - (CGError) setToplevelAlpha: (CGFloat) alpha {
     return kCGErrorNotImplemented;
+}
+
+- (void) setToplevelEventProc: (CGSToplevelEventProc) proc info: (void *) info {
+    @synchronized(self) {
+        _toplevelEventProc = proc;
+        _toplevelEventInfo = info;
+    }
+}
+
+- (void) postToplevelEvent: (const CGSToplevelEvent *) event {
+    CGSToplevelEventProc proc;
+    void *info;
+    @synchronized(self) {
+        proc = _toplevelEventProc;
+        info = _toplevelEventInfo;
+    }
+    if (proc != NULL)
+        proc(self, event, info);
+}
+
+- (CGRect) toplevelFrame {
+    return CGRectNull;
+}
+
+- (CGFloat) toplevelBackingScaleFactor {
+    return 1;
+}
+
+- (CGRect) toplevelDeviceRectForFrame: (CGRect) frame {
+    return frame;
+}
+
+- (CGSize) toplevelDeviceSizeForSize: (CGSize) size {
+    return size;
+}
+
+- (CGRect) toplevelDeviceRectForRect: (CGRect) rect {
+    return rect;
+}
+
+- (CGError) setToplevelHasShadow: (BOOL) hasShadow {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelContentsOpaque: (BOOL) opaque {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelCornerRadius: (CGFloat) radius {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelShapeEmpty: (BOOL) empty {
+    return kCGErrorNotImplemented;
+}
+
+- (BOOL) toplevelWindowSystemComposites {
+    return NO;
+}
+
+- (CGError) setToplevelIgnoresMouseEvents: (BOOL) ignores {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelDecorated: (BOOL) decorated {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelTitlebarKind: (CGSToplevelTitlebarKind) kind {
+    return kCGErrorNotImplemented;
+}
+
+- (CGSToplevelTitlebarKind) toplevelTitlebarKind {
+    return kCGSToplevelTitlebarNone;
+}
+
+- (CGError) setToplevelPrefersClientDecoration: (BOOL) prefers {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelClientDecorationLayout: (const CGSToplevelDecorationLayout *) layout {
+    return kCGErrorNotImplemented;
+}
+
+- (BOOL) toplevelClientDecorationContainsPoint: (CGPoint) point {
+    return NO;
+}
+
+- (CGError) beginToplevelMoveByWindowSystem {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelIcons: (NSArray<NSData *> *) icons {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelHints: (const CGSToplevelHints *) hints {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) reserveToplevelDockStrip {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelLevel: (int) level {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelStacksByLevel: (BOOL) stacks {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelApplicationMenuServiceName: (NSString *) service objectPath: (NSString *) path {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) setToplevelHoldsInputForMenu: (BOOL) holds {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) orderToplevelAbove: (CGSWindow *) sibling {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) orderToplevelBelow: (CGSWindow *) sibling {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) restackToplevelForLevels {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) requestToplevelKeyboardFocus {
+    return kCGErrorNotImplemented;
+}
+
+- (BOOL) toplevelHoldsKeyboardFocus {
+    return NO;
+}
+
+- (CGError) miniaturizeToplevel {
+    return kCGErrorNotImplemented;
+}
+
+- (CGError) deminiaturizeToplevel {
+    return kCGErrorNotImplemented;
+}
+
+- (BOOL) toplevelIsMiniaturized {
+    return NO;
+}
+
+- (BOOL) toplevelFrameCoversDisplay: (CGRect) frame {
+    return NO;
+}
+
+- (CGError) setToplevelFullscreen: (BOOL) fullscreen force: (BOOL) force {
+    return kCGErrorNotImplemented;
+}
+
+- (BOOL) toplevelFullscreenRequested {
+    return NO;
+}
+
+- (BOOL) toplevelIsFullscreen {
+    return NO;
+}
+
+- (BOOL) toplevelIsOccluded {
+    return NO;
+}
+
+- (void) cancelToplevelKeyboardFocusRequest {
+}
+
+- (CGError) setToplevelParent: (CGSWindow *) parent {
+    return kCGErrorNotImplemented;
+}
+
+- (CGSWindow *) toplevelParent {
+    return nil;
+}
+
+- (CGError) setToplevelHeldBack: (BOOL) heldBack {
+    return kCGErrorNotImplemented;
+}
+
+- (BOOL) toplevelFullscreenSettling {
+    return NO;
 }
 
 - (CGSSurface *) createSurface {
@@ -360,25 +643,192 @@ CFArrayRef __nullable CGWindowListCreateDescriptionFromArray(CFArrayRef windowAr
     return (CFArrayRef) descriptions;
 }
 
+#if defined(HAVE_PIPEWIRE) && HAVE_PIPEWIRE
+#include <screen_capture_backend.h>
+
+struct darling_cg_window_capture_state {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool done;
+    bool gotFrame;
+    uint8_t *bytes;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+};
+
+static void darlingCGWindowCaptureFrame(const struct darling_screen_capture_frame *frame, void *userData)
+{
+    struct darling_cg_window_capture_state *state = userData;
+    pthread_mutex_lock(&state->mutex);
+    if (!state->done && frame && frame->width && frame->height) {
+        state->bytes = calloc((size_t) state->height * state->stride, 1);
+        if (state->bytes && darling_screen_capture_convert_bgra(frame, state->bytes, state->stride, state->width, state->height) == 0)
+            state->gotFrame = true;
+        else {
+            free(state->bytes);
+            state->bytes = NULL;
+        }
+    }
+    state->done = true;
+    pthread_cond_broadcast(&state->cond);
+    pthread_mutex_unlock(&state->mutex);
+}
+
+static void darlingCGWindowCaptureError(int error, void *userData)
+{
+    struct darling_cg_window_capture_state *state = userData;
+    (void) error;
+    pthread_mutex_lock(&state->mutex);
+    state->done = true;
+    pthread_cond_broadcast(&state->cond);
+    pthread_mutex_unlock(&state->mutex);
+}
+#endif
+
+static CGRect darlingWindowBoundsFromDescription(NSDictionary *description)
+{
+    NSDictionary *bounds = [description objectForKey: (NSString *) kCGWindowBounds];
+    CGRect rect = CGRectZero;
+    if ([bounds isKindOfClass: [NSDictionary class]])
+        CGRectMakeWithDictionaryRepresentation((CFDictionaryRef) bounds, &rect);
+    return rect;
+}
+
 CGImageRef __nullable CGWindowListCreateImageFromArray(CGRect screenBounds,
                                                        CFArrayRef windowArray,
                                                        CGWindowImageOption imageOption)
 {
-    // The image holds the listed windows composited over a transparent
-    // background, in a bitmap of the bounds' size. Window contents cannot be
-    // read back (there is no screen capture backend), so a list with windows
-    // gives no image, as when screen recording is not permitted. An empty
-    // list has nothing to composite and gives the transparent image.
-    if (windowArray == NULL || CFArrayGetCount(windowArray) != 0 ||
-        CGRectIsNull(screenBounds) || CGRectIsInfinite(screenBounds) ||
-        CGRectIsEmpty(screenBounds))
+    if (windowArray == NULL || CGRectIsNull(screenBounds) || CGRectIsEmpty(screenBounds))
         return NULL;
 
-    size_t width = (size_t) ceil(screenBounds.size.width);
-    size_t height = (size_t) ceil(screenBounds.size.height);
+    bool shouldBeOpaque = (imageOption & kCGWindowImageShouldBeOpaque) != 0;
+    bool onlyShadows = (imageOption & kCGWindowImageOnlyShadows) != 0;
+
+    CGRect captureBounds = screenBounds;
+    if (CGRectIsInfinite(captureBounds)) {
+        CFArrayRef desc = CGWindowListCreateDescriptionFromArray(windowArray);
+        CGRect unionRect = CGRectNull;
+        if (desc) {
+            for (CFIndex i = 0; i < CFArrayGetCount(desc); i++) {
+                NSDictionary *d = (NSDictionary *) CFArrayGetValueAtIndex(desc, i);
+                CGRect r = darlingWindowBoundsFromDescription(d);
+                if (!CGRectIsEmpty(r))
+                    unionRect = CGRectIsNull(unionRect) ? r : CGRectUnion(unionRect, r);
+            }
+            CFRelease(desc);
+        }
+        if (CGRectIsNull(unionRect) || CGRectIsEmpty(unionRect))
+            captureBounds = CGDisplayBounds(CGMainDisplayID());
+        else
+            captureBounds = unionRect;
+    }
+
+    size_t width = (size_t) ceil(captureBounds.size.width);
+    size_t height = (size_t) ceil(captureBounds.size.height);
+    if (width == 0 || height == 0)
+        return NULL;
+
+#if defined(HAVE_PIPEWIRE) && HAVE_PIPEWIRE
+    if (CFArrayGetCount(windowArray) != 0 && !onlyShadows) {
+        struct darling_cg_window_capture_state state;
+        struct darling_screen_capture_callbacks callbacks = {
+            .frame = darlingCGWindowCaptureFrame,
+            .error = darlingCGWindowCaptureError,
+        };
+        struct darling_screen_capture_stream *stream = NULL;
+        CGImageRef image = NULL;
+
+        pthread_mutex_init(&state.mutex, NULL);
+        pthread_cond_init(&state.cond, NULL);
+        state.done = false;
+        state.gotFrame = false;
+        state.width = (uint32_t) width;
+        state.height = (uint32_t) height;
+        state.stride = ((state.width * 4 + 15u) & ~15u);
+        state.bytes = NULL;
+
+        if (darling_screen_capture_open((int32_t) captureBounds.origin.x, (int32_t) captureBounds.origin.y,
+                (uint32_t) width, (uint32_t) height, 0, darling_screen_capture_supports_hdr() ? 1 : 0,
+                &callbacks, &state, &stream) == 0) {
+            darling_screen_capture_start(stream, 1);
+            pthread_mutex_lock(&state.mutex);
+            for (int i = 0; i < 100 && !state.done; i++) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 20 * 1000 * 1000;
+                if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+                pthread_cond_timedwait(&state.cond, &state.mutex, &ts);
+                pthread_mutex_unlock(&state.mutex);
+                darling_screen_capture_wait(stream, 20);
+                pthread_mutex_lock(&state.mutex);
+            }
+            pthread_mutex_unlock(&state.mutex);
+            darling_screen_capture_close(stream);
+        }
+
+        if (state.gotFrame && state.bytes) {
+            /* True per-window isolated content is unavailable through the
+             * ScreenCast portal; we composite visible screen pixels for the
+             * selected windows' bounds in back-to-front order. Occluded regions
+             * therefore reflect what was visible on screen at capture time. */
+            CFArrayRef desc = CGWindowListCreateDescriptionFromArray(windowArray);
+            size_t canvasStride = ((width * 4 + 15u) & ~15u);
+            uint8_t *canvas = calloc(canvasStride * height, 1);
+            if (canvas) {
+                if (shouldBeOpaque)
+                    memset(canvas, 0xff, canvasStride * height);
+                if (desc) {
+                    for (CFIndex i = CFArrayGetCount(desc) - 1; i >= 0; i--) {
+                        NSDictionary *d = (NSDictionary *) CFArrayGetValueAtIndex(desc, i);
+                        CGRect r = darlingWindowBoundsFromDescription(d);
+                        CGRect inter = CGRectIntersection(r, captureBounds);
+                        if (CGRectIsEmpty(inter))
+                            continue;
+                        int x0 = (int) floor(inter.origin.x - captureBounds.origin.x);
+                        int y0 = (int) floor(inter.origin.y - captureBounds.origin.y);
+                        int x1 = (int) ceil(inter.origin.x + inter.size.width - captureBounds.origin.x);
+                        int y1 = (int) ceil(inter.origin.y + inter.size.height - captureBounds.origin.y);
+                        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+                        if (x1 > (int) width) x1 = (int) width;
+                        if (y1 > (int) height) y1 = (int) height;
+                        for (int y = y0; y < y1; y++) {
+                            uint8_t *dst = canvas + (size_t) y * canvasStride + (size_t) x0 * 4;
+                            uint8_t *src = state.bytes + (size_t) y * state.stride + (size_t) x0 * 4;
+                            memcpy(dst, src, (size_t) (x1 - x0) * 4);
+                            if (shouldBeOpaque)
+                                for (int x = x0; x < x1; x++) canvas[(size_t) y * canvasStride + (size_t) x * 4 + 3] = 0xff;
+                        }
+                    }
+                    CFRelease(desc);
+                }
+                CFDataRef data = CFDataCreate(NULL, canvas, (CFIndex)(canvasStride * height));
+                CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
+                CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+                CGBitmapInfo info = shouldBeOpaque ? (kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst)
+                    : (kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+                image = CGImageCreate(width, height, 8, 32, canvasStride, space, info, provider, NULL, false, kCGRenderingIntentDefault);
+                CGColorSpaceRelease(space);
+                CGDataProviderRelease(provider);
+                CFRelease(data);
+                free(canvas);
+            }
+        }
+        free(state.bytes);
+        pthread_cond_destroy(&state.cond);
+        pthread_mutex_destroy(&state.mutex);
+        if (image)
+            return image;
+        return NULL;
+    }
+#else
+    if (CFArrayGetCount(windowArray) != 0)
+        return NULL;
+#endif
+
     CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
     CGContextRef context = CGBitmapContextCreate(NULL, width, height, 8, 0, space,
-                                                 kCGImageAlphaPremultipliedFirst);
+                                                 shouldBeOpaque ? kCGImageAlphaNoneSkipFirst : kCGImageAlphaPremultipliedFirst);
     CGColorSpaceRelease(space);
     if (context == NULL)
         return NULL;
@@ -412,31 +862,47 @@ CGImageRef __nullable CGWindowListCreateImage(CGRect screenBounds,
                                               CGWindowID windowID,
                                               CGWindowImageOption imageOption)
 {
-    // Only the contents of a single window of this process can be read: windows drawn into with
-    // -[CGSWindow drawImage:atPoint:] keep their pixels. Anything else has no capture backend.
-    if (!(listOption & kCGWindowListOptionIncludingWindow) ||
-        (listOption & (kCGWindowListOptionOnScreenAboveWindow | kCGWindowListOptionOnScreenBelowWindow)))
-        return NULL;
+    // Prefer the pixels kept by a window of this process drawn with
+    // -[CGSWindow drawImage:atPoint:]. The ScreenCast capture below is a
+    // fallback for windows the process cannot read directly.
+    if ((listOption & kCGWindowListOptionIncludingWindow) &&
+        !(listOption & (kCGWindowListOptionOnScreenAboveWindow | kCGWindowListOptionOnScreenBelowWindow))) {
+        CGSWindow *window = copyCGSWindowForNumber(windowID);
+        if (window != nil) {
+            CGImageRef image = [window copyContentsImage];
+            [window release];
+            if (image != NULL) {
+                if (CGRectIsNull(screenBounds) || CGRectIsInfinite(screenBounds))
+                    return image;
 
-    CGSWindow *window = copyCGSWindowForNumber(windowID);
-    if (window == nil)
-        return NULL;
-    CGImageRef image = [window copyContentsImage];
-    [window release];
-    if (image == NULL || CGRectIsNull(screenBounds) || CGRectIsInfinite(screenBounds))
-        return image;
-
-    // Bounds are in global coordinates: the part of the window they select
-    CGRect frame;
-    CGImageRef cropped = NULL;
-    CGSWindow *again = copyCGSWindowForNumber(windowID);
-    if (again != nil && [again getRect: &frame] == kCGSErrorSuccess) {
-        CGRect part = CGRectOffset(screenBounds, -frame.origin.x, -frame.origin.y);
-        cropped = CGImageCreateWithImageInRect(image, part);
+                // Bounds are in global coordinates: the part of the window they select
+                CGRect frame;
+                CGImageRef cropped = NULL;
+                CGSWindow *again = copyCGSWindowForNumber(windowID);
+                if (again != nil && [again getRect: &frame] == kCGSErrorSuccess) {
+                    CGRect part = CGRectOffset(screenBounds, -frame.origin.x, -frame.origin.y);
+                    cropped = CGImageCreateWithImageInRect(image, part);
+                }
+                [again release];
+                CGImageRelease(image);
+                return cropped;
+            }
+        }
     }
-    [again release];
-    CGImageRelease(image);
-    return cropped;
+
+#if defined(HAVE_PIPEWIRE) && HAVE_PIPEWIRE
+    {
+        CFArrayRef windows = CGWindowListCreate(listOption, windowID);
+        CGImageRef image = NULL;
+        if (windows != NULL) {
+            image = CGWindowListCreateImageFromArray(screenBounds, windows, imageOption);
+            CFRelease(windows);
+        }
+        return image;
+    }
+#else
+    return NULL;
+#endif
 }
 
 CGError _CGSWindowDrawImage(CGSConnectionID cid, CGSWindowID wid, CGImageRef image, CGPoint origin)

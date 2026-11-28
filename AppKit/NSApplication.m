@@ -1841,6 +1841,8 @@ static BOOL terminateAfterLastWindowClosedSetting(void) {
     [self finishLaunching];
     [pool release];
 
+    int scrollBurst = 0;
+
     do {
         pool = [NSAutoreleasePool new];
         NSEvent *event;
@@ -1855,8 +1857,18 @@ static BOOL terminateAfterLastWindowClosedSetting(void) {
         NS_HANDLER [self reportException: localException];
         NS_ENDHANDLER
 
-        // The windows are brought up to date after each event
-        [self updateWindows];
+        // Coalesce window toolbar/update work across queued scroll-wheel bursts.
+        NSEvent *nextQueued = ([event type] == NSScrollWheel && scrollBurst < 16)
+            ? _NSEventQueueNextEvent(NSAnyEventMask, [NSDate distantPast],
+                                     NSDefaultRunLoopMode, NO)
+            : nil;
+        if (nextQueued != nil && [nextQueued type] == NSScrollWheel) {
+            scrollBurst++;
+        } else {
+            scrollBurst = 0;
+            // The windows are brought up to date after each event
+            [self updateWindows];
+        }
                 [self _checkForReleasedWindows];
         [self _checkForTerminate];
 
@@ -1944,9 +1956,7 @@ static BOOL terminateAfterLastWindowClosedSetting(void) {
     do {
         NSAutoreleasePool *pool = [NSAutoreleasePool new];
 
-        NS_DURING [NSClassFromString(@"Win32RunningCopyPipe")
-                performSelector: @selector(createRunningCopyPipe)];
-
+        NS_DURING
         // This should happen before _makeSureIsOnAScreen so we don't reposition
         // done windows
         [self _checkForReleasedWindows];
@@ -2180,17 +2190,13 @@ static BOOL activationInProgress;
     return !launchComplete || activationInProgress || [self isActive];
 }
 
-// Unless the display backend activates the process itself, activating means
-// making a window key again, which asks the platform for input focus: the key
-// window, else the main window, else the frontmost window that can become key.
+// Activating means making a window key again, which asks the platform for input
+// focus: the key window, else the main window, else the frontmost window that
+// can become key.
 - (void) activateIgnoringOtherApps: (BOOL) flag {
     // Without the flag the application may only become active if no other
     // application is, which cannot be determined here, so leave focus alone.
     if (!flag)
-        return;
-
-    if ([NS_EXTRA(NSApplication, self)->_display activateProcessIdentifier:
-                      [[NSProcessInfo processInfo] processIdentifier]])
         return;
 
     NSWindow *window = _keyWindow;
@@ -2622,9 +2628,6 @@ static BOOL isModalWindowOrItsSheet(NSWindow *window, NSWindow *modalWindow) {
         [[NSNotificationCenter defaultCenter]
                 postNotificationName: NSApplicationWillTerminateNotification
                               object: self];
-
-        [NSClassFromString(@"Win32RunningCopyPipe")
-                performSelector: @selector(invalidateRunningCopyPipe)];
 
         exit(0);
     }
@@ -3059,11 +3062,6 @@ int NSApplicationMain(int argc, const char *argv[]) {
     NSBundle *bundle = [NSBundle mainBundle];
     Class class = [bundle principalClass];
     NSString *nibFile = [bundle infoDictionary][@"NSMainNibFile"];
-
-#ifndef DARLING
-    [NSClassFromString(@"Win32RunningCopyPipe")
-            performSelector: @selector(startRunningCopyPipe)];
-#endif
 
     if (class == Nil)
         class = [NSApplication class];

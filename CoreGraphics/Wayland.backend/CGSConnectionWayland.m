@@ -21,9 +21,14 @@
 #import "CGSConnectionWayland.h"
 #import "CGSWaylandKeyboard.h"
 #import "CGSWaylandPointer.h"
+#import "CGSWaylandCursor.h"
 #import "CGSWaylandTouch.h"
+#import "CGSWaylandInputMethod.h"
+#import "CGSWaylandTablet.h"
 #import "CGSWaylandKeymap.h"
 #import "CGSWaylandClipboard.h"
+#import "CGSWaylandDrag.h"
+#import "CGSWaylandPortalShortcuts.h"
 #import "CGSWaylandOutputManager.h"
 #import "CGSWindowWayland.h"
 #import "WaylandColor.h"
@@ -31,7 +36,10 @@
 #import <IOKit/pwr_mgt/IOPMLibPrivate.h>
 #import "WaylandLibrary.h"
 #import "WaylandProtocol.h"
+#import "WaylandRender.h"
 #import <CoreGraphics/CGSNativeConnection.h>
+#import <CoreGraphics/CGWindow.h>
+#import <CoreGraphics/CGWindowLevel.h>
 #import <CoreGraphics/CoreGraphicsPrivate.h>
 
 #import <CoreGraphics/CGSKeyboardLayout.h>
@@ -47,6 +55,7 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 // Mode pixels are untransformed. The properties of a wl_output (version 2 and later) take effect
@@ -96,12 +105,22 @@ static int CGSWaylandDispatch(const void *kind, void *proxy, uint32_t opcode,
     // An exception can't unwind through libwayland's native frames.
     @autoreleasepool {
         @try {
-            if (objectKind >= WaylandColorObjectManager &&
-                objectKind <= WaylandColorObjectLast) {
+            WaylandColorObjectKind colorKind = (WaylandColorObjectKind) objectKind;
+            if (colorKind >= WaylandColorObjectManager &&
+                colorKind <= WaylandColorObjectLast) {
                 [(WaylandColorManager *) object handleEvent: opcode
-                                                       kind: (WaylandColorObjectKind) objectKind
+                                                       kind: colorKind
                                                       proxy: (struct wl_proxy *) proxy
                                                   arguments: args];
+                return 0;
+            }
+            WaylandRenderObjectKind renderKind = (WaylandRenderObjectKind) objectKind;
+            if (renderKind >= WaylandRenderObjectManager &&
+                renderKind <= WaylandRenderObjectLast) {
+                [(WaylandRenderManager *) object handleEvent: opcode
+                                                        kind: renderKind
+                                                       proxy: (struct wl_proxy *) proxy
+                                                   arguments: args];
                 return 0;
             }
             switch (objectKind) {
@@ -109,6 +128,7 @@ static int CGSWaylandDispatch(const void *kind, void *proxy, uint32_t opcode,
             case CGSWaylandObjectToplevel:
             case CGSWaylandObjectLayerSurface:
             case CGSWaylandObjectPopup:
+            case CGSWaylandObjectDecoration:
                 [(CGSWindowWayland *) object handleEvent: opcode
                                                     kind: objectKind
                                                arguments: args];
@@ -138,13 +158,54 @@ static int CGSWaylandDispatch(const void *kind, void *proxy, uint32_t opcode,
             case CGSWaylandObjectPinchGesture:
                 [(CGSWaylandPointer *) object pinchEvent: opcode arguments: args];
                 break;
+            case CGSWaylandObjectCursorScale:
+                if (opcode == WP_FRACTIONAL_EV_PREFERRED)
+                    [(CGSWaylandCursor *) object preferredScaleChanged: args[0].u];
+                break;
+            case CGSWaylandObjectHoldGesture:
+                [(CGSWaylandPointer *) object holdEvent: opcode arguments: args];
+                break;
+            case CGSWaylandObjectInputTimestamp: {
+                // The compositor's clock is CLOCK_MONOTONIC; CGEvent time is CLOCK_UPTIME_RAW.
+                // Convert using their relation at arrival. A timestamp generated before a suspend
+                // and delivered after it is shifted by that suspend: the protocol gives no sleep
+                // boundary with which to translate it exactly.
+                uint64_t protocol = ((uint64_t) args[0].u << 32) | (uint32_t) args[1].u;
+                protocol += (uint32_t) args[2].u;
+                int64_t offset = (int64_t) clock_gettime_nsec_np(CLOCK_UPTIME_RAW) -
+                                 (int64_t) clock_gettime_nsec_np(CLOCK_MONOTONIC);
+                uint64_t time = (uint64_t) ((int64_t) protocol + offset);
+                [object setPendingTimestamp: time];
+                break;
+            }
             case CGSWaylandObjectTouch:
                 [(CGSWaylandTouch *) object touchEvent: opcode arguments: args];
+                break;
+            case CGSWaylandObjectTextInput:
+                [(CGSWaylandInputMethod *) object textInputEvent: opcode arguments: args];
+                break;
+            case CGSWaylandObjectTabletSeat:
+                [(CGSWaylandTablet *) object tabletSeatEvent: opcode arguments: args];
+                break;
+            case CGSWaylandObjectTablet:
+                [(CGSWaylandTablet *) object tabletEvent: (struct wl_proxy *) proxy
+                                                 opcode: opcode arguments: args];
+                break;
+            case CGSWaylandObjectTabletTool:
+                [(CGSWaylandTablet *) object toolEvent: (struct wl_proxy *) proxy
+                                                opcode: opcode arguments: args];
+                break;
+            case CGSWaylandObjectTabletPad:
+                [(CGSWaylandTablet *) object padEvent: (struct wl_proxy *) proxy
+                                                opcode: opcode arguments: args];
                 break;
             case CGSWaylandObjectLockedPointer:
             case CGSWaylandObjectRelativePointer:
             case CGSWaylandObjectWarpLock:
                 [(CGSWaylandPointer *) object lockEvent: opcode kind: objectKind proxy: (struct wl_proxy *) proxy arguments: args];
+                break;
+            case CGSWaylandObjectDragSource:
+                [(CGSWaylandDrag *) object sourceEvent: opcode proxy: (struct wl_proxy *) proxy arguments: args];
                 break;
             case CGSWaylandObjectDataDevice:
             case CGSWaylandObjectDataOffer:
@@ -182,6 +243,8 @@ static int CGSWaylandDispatch(const void *kind, void *proxy, uint32_t opcode,
 - (void) seatCapabilities: (uint32_t) capabilities;
 - (void) keyboardEvent: (uint32_t) opcode arguments: (union wl_argument *) args;
 - (void) releaseKeyboard;
+- (CGSWaylandPortalShortcuts *) portalShortcuts;
+- (void) removeHotKeyWithUID: (int) uid notifyPortal: (BOOL) notify;
 @end
 
 static void socketCallback(CFSocketRef socket, CFSocketCallBackType type,
@@ -236,13 +299,18 @@ static const CGEventFlags kHotKeyModifierMask =
         return nil;
 
     _outputs = [NSMutableArray new];
+    // Before the first event: the seat gives the pointer, and with it work to do after the dispatch, during the setup.
+    _afterDispatch = [NSMutableArray new];
     _color = [[WaylandColorManager alloc] initWithDispatcher: CGSWaylandDispatch owner: self];
+    _render = [[WaylandRenderManager alloc] initWithDispatcher: CGSWaylandDispatch];
     // The keyboard layout is described from the system default until the compositor's keymap arrives.
     _keymap = [[CGSWaylandKeymap alloc] init];
     if (_keymap != nil)
         _keyboardDecoder = [[CGSWaylandKeyboard alloc] initWithConnection: self keymap: _keymap];
     _pointerDecoder = [[CGSWaylandPointer alloc] initWithConnection: self];
     _touchDecoder = [[CGSWaylandTouch alloc] initWithConnection: self];
+    _tabletDecoder = [[CGSWaylandTablet alloc] initWithConnection: self];
+    _inputMethodDecoder = [[CGSWaylandInputMethod alloc] initWithConnection: self];
 
     _wlDisplay = WL.wl_display_connect(NULL);
     if (_wlDisplay == NULL) {
@@ -317,14 +385,15 @@ static const CGEventFlags kHotKeyModifierMask =
                                                      ^(int ignored) { [connection activationRequested]; }) ==
                             NOTIFY_STATUS_OK;
 
-    _afterDispatch = [NSMutableArray new];
-
     // The clipboard: the general pasteboard shows the compositor's selection. This goes before the process makes its
     // first pasteboard, which is why the connection does it, not the framework with the windows.
     if (_dataDeviceManager != NULL && _seat != NULL) {
         _clipboard = [[CGSWaylandClipboard alloc] initWithConnection: self manager: _dataDeviceManager seat: _seat];
-        if (_clipboard != nil)
+        if (_clipboard != nil) {
             _CGSHostClipboardStart(_clipboard);
+            _drag = [[CGSWaylandDrag alloc] initWithConnection: self clipboard: (CGSWaylandClipboard *) _clipboard];
+            [(CGSWaylandClipboard *) _clipboard setDrag: _drag];
+        }
     }
     [self observeDisplaySleepAssertions];
 
@@ -341,8 +410,24 @@ static const CGEventFlags kHotKeyModifierMask =
         [_windows removeAllObjects];
     }
 
+    [(CGSWaylandDrag *) _drag invalidate];
+    [_drag release];
     [_clipboard invalidate];
     [_clipboard release];
+    [(CGSWaylandPortalShortcuts *) _portalShortcuts invalidate];
+    [_portalShortcuts release];
+    if (_pointerTimestamps != NULL)
+        WaylandMarshal(_pointerTimestamps, WP_INPUT_TIMESTAMPS_DESTROY, NULL,
+                       WL_MARSHAL_FLAG_DESTROY, NULL);
+    if (_keyboardTimestamps != NULL)
+        WaylandMarshal(_keyboardTimestamps, WP_INPUT_TIMESTAMPS_DESTROY, NULL,
+                       WL_MARSHAL_FLAG_DESTROY, NULL);
+    if (_touchTimestamps != NULL)
+        WaylandMarshal(_touchTimestamps, WP_INPUT_TIMESTAMPS_DESTROY, NULL,
+                       WL_MARSHAL_FLAG_DESTROY, NULL);
+    if (_inputTimestampsManager != NULL)
+        WaylandMarshal(_inputTimestampsManager, WP_INPUT_TIMESTAMPS_MANAGER_DESTROY, NULL,
+                       WL_MARSHAL_FLAG_DESTROY, NULL);
     if (_dataDeviceManager != NULL)
         WL.wl_proxy_destroy(_dataDeviceManager);
     [_afterDispatch release];
@@ -363,12 +448,18 @@ static const CGEventFlags kHotKeyModifierMask =
     [_outputManager release];
     [(WaylandColorManager *) _color shutdown];
     [_color release];
+    WaylandRenderManager *render = (WaylandRenderManager *) _render;
+    [render shutdown];
     [self releaseKeyboard];
     [_keyboardDecoder release];
     [(CGSWaylandPointer *) _pointerDecoder stop];
     [_pointerDecoder release];
     [(CGSWaylandTouch *) _touchDecoder stop];
     [_touchDecoder release];
+    [(CGSWaylandTablet *) _tabletDecoder stop];
+    [_tabletDecoder release];
+    [(CGSWaylandInputMethod *) _inputMethodDecoder stop];
+    [_inputMethodDecoder release];
     if (_pointerGestures != NULL)
         WL.wl_proxy_destroy(_pointerGestures);
     [_hotKeys release];
@@ -386,6 +477,15 @@ static const CGEventFlags kHotKeyModifierMask =
         WL.wl_proxy_destroy(output->_proxy);
     }
     [_outputs release];
+
+    if (render->_dmabuf != NULL)
+        WL.wl_proxy_destroy(render->_dmabuf);
+    if (render->_syncobjManager != NULL)
+        WL.wl_proxy_destroy(render->_syncobjManager);
+    if (render->_fifoManager != NULL)
+        WL.wl_proxy_destroy(render->_fifoManager);
+    [render release];
+    _render = nil;
 
     if (_wlDisplay != NULL) {
         WL.wl_display_disconnect(_wlDisplay);
@@ -456,6 +556,34 @@ static const CGEventFlags kHotKeyModifierMask =
     return _color;
 }
 
+- (BOOL) extendedDynamicRangeAvailable {
+    return [[self colorManager] hasExtendedDynamicRange];
+}
+
+// The appmenu manager came or went: every window gives the compositor the address of its menu, or releases it.
+- (void) notifyWindowsApplicationMenuManagerChanged {
+    NSMutableArray *windows = [NSMutableArray array];
+
+    @synchronized (_windows) {
+        for (NSNumber *key in _windows) {
+            CGSWindow *window = [_windows objectForKey: key];
+            if ([window isKindOfClass: [CGSWindowWayland class]])
+                [windows addObject: window];
+        }
+    }
+    for (CGSWindowWayland *window in windows)
+        [window applyApplicationMenu];
+}
+
+- (BOOL) carriesApplicationMenuAddress {
+    return _appMenuManager != NULL;
+}
+
+// The menu bar window is a layer surface along the top of the screen.
+- (BOOL) placesMenuBar {
+    return _layerShell != NULL;
+}
+
 - (void) notifyWindowsColorManagerAvailable {
     // The windows of the framework above share this manager (see -waylandColorManager).
     id observer = [CGSConnection nativeObserver];
@@ -468,6 +596,28 @@ static const CGEventFlags kHotKeyModifierMask =
                 [(CGSWindowWayland *) window colorManagerAvailable];
         }
     }
+}
+
+- (void) notifyWindowsRenderManagerAvailable {
+    // The windows of the framework above share this manager (see -waylandRenderManager).
+    id observer = [CGSConnection nativeObserver];
+    if ([observer respondsToSelector: @selector(nativeConnectionRenderManagerAvailable)])
+        [observer nativeConnectionRenderManagerAvailable];
+    @synchronized (_windows) {
+        for (NSNumber *key in _windows) {
+            CGSWindow *window = [_windows objectForKey: key];
+            if ([window isKindOfClass: [CGSWindowWayland class]])
+                [(CGSWindowWayland *) window renderManagerAvailable];
+        }
+    }
+}
+
+- (WaylandRenderManager *) renderManager {
+    return (WaylandRenderManager *) _render;
+}
+
+- (id) waylandRenderManager {
+    return _render;
 }
 
 - (void) connectionFailed {
@@ -558,6 +708,121 @@ static const CGEventFlags kHotKeyModifierMask =
     }
 }
 
+
+#pragma mark - Activation and order of the toplevel windows
+
+// The toplevel windows of the UI layer that are ordered in, front to back as far as the process knows (see
+// -[CGSWindowWayland orderRank]).
+- (NSArray<NSNumber *> *) orderedToplevelWindowIDs {
+    NSArray *windows = [self copyAllWindows];
+    NSMutableArray<CGSWindowWayland *> *ordered = [NSMutableArray array];
+    for (CGSWindow *candidate in windows)
+        if ([candidate isKindOfClass: [CGSWindowWayland class]] && [(CGSWindowWayland *) candidate isOrderedIn] &&
+            [(CGSWindowWayland *) candidate isUIToplevel])
+            [ordered addObject: (CGSWindowWayland *) candidate];
+    [windows release];
+    [ordered sortUsingComparator: ^NSComparisonResult(CGSWindowWayland *a, CGSWindowWayland *b) {
+        uint64_t rankA = [a orderRank], rankB = [b orderRank];
+        return rankA > rankB ? NSOrderedAscending : rankA < rankB ? NSOrderedDescending : NSOrderedSame;
+    }];
+    NSMutableArray<NSNumber *> *result = [NSMutableArray arrayWithCapacity: [ordered count]];
+    for (CGSWindowWayland *window in ordered)
+        [result addObject: @(window.windowId)];
+    return result;
+}
+
+// Another process asked for the windows of this one to be activated (see _CGSActivateProcess): the UI layer is told first,
+// as it may be holding windows back until the application is activated, then the compositor is asked to focus the window
+// that was active last.
+- (void) activationRequested {
+    [super activationRequested];
+    if (_activation == NULL || _activationToken != NULL)
+        return;
+    CGSWindowWayland *window = [self windowForActivation];
+    [self requestActivationOfWindow: window from: window];
+}
+
+- (CGSWindowWayland *) windowForActivation {
+    CGSWindowWayland *best = nil;
+    NSArray *windows = [self copyAllWindows];
+    for (CGSWindow *candidate in windows) {
+        if (![candidate isKindOfClass: [CGSWindowWayland class]])
+            continue;
+        CGSWindowWayland *window = (CGSWindowWayland *) candidate;
+        if (![window isShown] || [window role] != CGSWaylandRoleToplevel)
+            continue;
+        if (best == nil || [window orderRank] > [best orderRank])
+            best = window;
+    }
+    [best retain];
+    [windows release];
+    return [best autorelease];
+}
+
+- (BOOL) requestActivationOfWindow: (CGSWindowWayland *) window {
+    CGSWindowWayland *requester = nil;
+    NSArray *windows = [self copyAllWindows];
+    for (CGSWindow *candidate in windows) {
+        if (![candidate isKindOfClass: [CGSWindowWayland class]])
+            continue;
+        CGSWindowWayland *other = (CGSWindowWayland *) candidate;
+        if (other == window || ![other isShown] || [other role] != CGSWaylandRoleToplevel || [other isMinimizedByRequest])
+            continue;
+        if (requester == nil || [other orderRank] > [requester orderRank])
+            requester = other;
+    }
+    [requester retain];
+    [windows release];
+    BOOL requested = [self requestActivationOfWindow: window from: requester];
+    [requester release];
+    return requested;
+}
+
+- (BOOL) requestActivationOfWindow: (CGSWindowWayland *) window from: (CGSWindowWayland *) requester {
+    if (_activation == NULL || _activationToken != NULL || window == nil || window->_surface == NULL)
+        return NO;
+    union wl_argument none[1] = {{.o = NULL}};
+    _activationToken = [self createObject: _activation
+                                   opcode: WP_ACTIVATION_GET_TOKEN
+                                interface: &xdg_activation_token_v1_interface
+                                arguments: none
+                                     kind: CGSWaylandObjectActivationToken
+                                   object: self];
+    if (_activationToken == NULL)
+        return NO;
+    if (_inputSerial != 0 && _seat != NULL) {
+        union wl_argument serial[2] = {{.u = _inputSerial}, {.o = (struct wl_object *) _seat}};
+        WaylandMarshal(_activationToken, WP_ACTIVATION_TOKEN_SET_SERIAL, NULL, 0, serial);
+    }
+    if (requester != nil && requester->_surface != NULL) {
+        union wl_argument forSurface[1] = {{.o = (struct wl_object *) requester->_surface}};
+        WaylandMarshal(_activationToken, WP_ACTIVATION_TOKEN_SET_SURFACE, NULL, 0, forSurface);
+    }
+    WaylandMarshal(_activationToken, WP_ACTIVATION_TOKEN_COMMIT, NULL, 0, NULL);
+    _activationWindow = [window retain];
+    [self flush];
+    return YES;
+}
+
+- (void) cancelActivationRequest {
+    if (_activationToken != NULL) {
+        WaylandMarshal(_activationToken, WP_ACTIVATION_TOKEN_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
+        _activationToken = NULL;
+    }
+    [_activationWindow release];
+    _activationWindow = nil;
+}
+
+- (void) activationTokenDone: (const char *) token {
+    struct wl_proxy *surface = _activationWindow != nil ? _activationWindow->_surface : NULL;
+    if (_activation != NULL && surface != NULL) {
+        union wl_argument args[2] = {{.s = token}, {.o = (struct wl_object *) surface}};
+        WaylandMarshal(_activation, WP_ACTIVATION_ACTIVATE, NULL, 0, args);
+    }
+    [self cancelActivationRequest];
+    [self flush];
+}
+
 #pragma mark - Clipboard
 
 // How long the serial of a press stays good for the clipboard after the keyboard focus left.
@@ -589,13 +854,17 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
         _compositor = [self bindGlobal: name interface: &wl_compositor_interface
                                version: MIN(version, 4u)
                                    kind: CGSWaylandObjectNone object: nil];
+    } else if (strcmp(interface, "wl_subcompositor") == 0 && _subcompositor == NULL) {
+        _subcompositor = [self bindGlobal: name interface: &wl_subcompositor_interface
+                                  version: 1
+                                     kind: CGSWaylandObjectNone object: nil];
     } else if (strcmp(interface, "wl_shm") == 0 && _shm == NULL) {
         _shm = [self bindGlobal: name interface: &wl_shm_interface
                         version: 1
                            kind: CGSWaylandObjectNone object: nil];
     } else if (strcmp(interface, "xdg_wm_base") == 0 && _wmBase == NULL) {
         _wmBase = [self bindGlobal: name interface: &xdg_wm_base_interface
-                           version: MIN(version, 2u)
+                           version: MIN(version, 7u)
                               kind: CGSWaylandObjectWmBase object: self];
     } else if (strcmp(interface, "zwlr_layer_shell_v1") == 0 && _layerShell == NULL) {
         _layerShell = [self bindGlobal: name interface: &zwlr_layer_shell_v1_interface
@@ -607,9 +876,17 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
         _plasmaShell = [self bindGlobal: name interface: &org_kde_plasma_shell_interface
                                 version: _plasmaShellVersion
                                    kind: CGSWaylandObjectNone object: nil];
+    } else if (strcmp(interface, "org_kde_kwin_appmenu_manager") == 0 && _appMenuManager == NULL) {
+        // Version 2 adds the manager's release request.
+        _appMenuManagerName = name;
+        _appMenuManagerVersion = MIN(version, 2u);
+        _appMenuManager = [self bindGlobal: name interface: &org_kde_kwin_appmenu_manager_interface
+                                   version: _appMenuManagerVersion
+                                      kind: CGSWaylandObjectNone object: nil];
+        [self notifyWindowsApplicationMenuManagerChanged];
     } else if (strcmp(interface, "zxdg_decoration_manager_v1") == 0 && _decorationManager == NULL) {
         _decorationManager = [self bindGlobal: name interface: &zxdg_decoration_manager_v1_interface
-                                      version: 1
+                                      version: MIN(version, 2u)
                                          kind: CGSWaylandObjectNone object: nil];
     } else if (strcmp(interface, "wp_color_manager_v1") == 0 &&
                ((WaylandColorManager *) _color)->_colorManager == NULL) {
@@ -630,12 +907,56 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
                                            object: _color];
         [(WaylandColorManager *) _color bindRepresentationManager: proxy version: 1 name: name];
         [self notifyWindowsColorManagerAvailable];
+    } else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0 &&
+               ((WaylandRenderManager *) _render)->_dmabuf == NULL) {
+        uint32_t renderVersion = MIN(version, (uint32_t) zwp_linux_dmabuf_v1_interface.version);
+        struct wl_proxy *proxy = [self bindGlobal: name
+                                         interface: &zwp_linux_dmabuf_v1_interface
+                                          version: renderVersion
+                                             kind: CGSWaylandObjectNone object: nil];
+        [(WaylandRenderManager *) _render bindDMABuf: proxy version: renderVersion name: name];
+        [self notifyWindowsRenderManagerAvailable];
+    } else if (strcmp(interface, "wp_linux_drm_syncobj_manager_v1") == 0 &&
+               ((WaylandRenderManager *) _render)->_syncobjManager == NULL) {
+        struct wl_proxy *proxy = [self bindGlobal: name
+                                         interface: &wp_linux_drm_syncobj_manager_v1_interface
+                                          version: 1
+                                             kind: CGSWaylandObjectNone object: nil];
+        [(WaylandRenderManager *) _render bindSyncobjManager: proxy name: name];
+        [self notifyWindowsRenderManagerAvailable];
+    } else if (strcmp(interface, "wp_fifo_manager_v1") == 0 &&
+               ((WaylandRenderManager *) _render)->_fifoManager == NULL) {
+        struct wl_proxy *proxy = [self bindGlobal: name
+                                         interface: &wp_fifo_manager_v1_interface
+                                          version: 1
+                                             kind: CGSWaylandObjectNone object: nil];
+        [(WaylandRenderManager *) _render bindFifoManager: proxy name: name];
+        [self notifyWindowsRenderManagerAvailable];
     } else if (strcmp(interface, "wl_seat") == 0 && _seat == NULL) {
         // Version 4 adds wl_keyboard.repeat_info, 5 wl_pointer.frame and 8 wl_pointer.axis_value120. A
         // protocol table older than that offers less.
         _seat = [self bindGlobal: name interface: &wl_seat_interface
                          version: MIN(MIN(version, 8u), (uint32_t) wl_seat_interface.version)
                             kind: CGSWaylandObjectSeat object: self];
+        [(CGSWaylandTablet *) _tabletDecoder seatBound: _seat name: name];
+        [(CGSWaylandInputMethod *) _inputMethodDecoder seatBound: _seat name: name];
+    } else if (strcmp(interface, "zwp_text_input_manager_v3") == 0 &&
+               [(CGSWaylandInputMethod *) _inputMethodDecoder managerName] == 0) {
+        struct wl_proxy *manager = [self bindGlobal: name
+                                          interface: &zwp_text_input_manager_v3_interface
+                                            version: 1
+                                               kind: CGSWaylandObjectNone object: nil];
+        [(CGSWaylandInputMethod *) _inputMethodDecoder managerBound: manager name: name seat: _seat];
+    } else if (strcmp(interface, "zwp_tablet_manager_v2") == 0 &&
+               [(CGSWaylandTablet *) _tabletDecoder manager] == NULL) {
+        // Tablet seats are made from the wl_seat, whether or not it has pointer or keyboard
+        // capability: wl_seat.capabilities says nothing about tablets.
+        uint32_t managerName = name;
+        struct wl_proxy *manager = [self bindGlobal: name
+                                          interface: &zwp_tablet_manager_v2_interface
+                                            version: 1
+                                               kind: CGSWaylandObjectNone object: nil];
+        [(CGSWaylandTablet *) _tabletDecoder managerBound: manager name: managerName seat: _seat];
     } else if (strcmp(interface, "wl_data_device_manager") == 0 && _dataDeviceManager == NULL) {
         _dataDeviceManager = [self bindGlobal: name interface: &wl_data_device_manager_interface
                                       version: MIN(version, 3u)
@@ -654,12 +975,46 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
         _pointerWarpName = name;
         _pointerWarp = [self bindGlobal: name interface: &wp_pointer_warp_v1_interface
                                 version: 1 kind: CGSWaylandObjectNone object: nil];
+    } else if (strcmp(interface, "wp_cursor_shape_manager_v1") == 0 && _cursorShapeManager == NULL) {
+        _cursorShapeManagerName = name;
+        _cursorShapeManager = [self bindGlobal: name interface: &wp_cursor_shape_manager_v1_interface
+                                       version: MIN(version, (uint32_t) wp_cursor_shape_manager_v1_interface.version)
+                                          kind: CGSWaylandObjectNone object: nil];
+        [(CGSWaylandPointer *) _pointerDecoder cursorGlobalsChanged];
+    } else if (strcmp(interface, "xdg_activation_v1") == 0 && _activation == NULL) {
+        _activationName = name;
+        _activation = [self bindGlobal: name interface: &xdg_activation_v1_interface
+                               version: 1 kind: CGSWaylandObjectNone object: nil];
+    } else if (strcmp(interface, "wp_alpha_modifier_v1") == 0 && _alphaModifierManager == NULL) {
+        _alphaModifierManagerName = name;
+        _alphaModifierManager = [self bindGlobal: name interface: &wp_alpha_modifier_v1_interface
+                                         version: 1 kind: CGSWaylandObjectNone object: nil];
+        // A window made before the global arrived gets its opacity now.
+        @synchronized (_windows) {
+            for (NSNumber *key in _windows) {
+                CGSWindow *window = [_windows objectForKey: key];
+                if ([window isKindOfClass: [CGSWindowWayland class]])
+                    [(CGSWindowWayland *) window alphaModifierAvailable];
+            }
+        }
+    } else if (strcmp(interface, "wp_fractional_scale_manager_v1") == 0 && _fractionalScaleManager == NULL) {
+        _fractionalScaleManagerName = name;
+        _fractionalScaleManager = [self bindGlobal: name interface: &wp_fractional_scale_manager_v1_interface
+                                           version: 1 kind: CGSWaylandObjectNone object: nil];
+        [(CGSWaylandPointer *) _pointerDecoder cursorGlobalsChanged];
     } else if (strcmp(interface, "zwp_pointer_gestures_v1") == 0 && _pointerGestures == NULL) {
-        // Version 2 adds the release request.
+        // Version 2 adds release, version 3 the hold gesture.
         _pointerGesturesName = name;
         _pointerGestures = [self bindGlobal: name interface: &zwp_pointer_gestures_v1_interface
-                                    version: MIN(version, 2u) kind: CGSWaylandObjectNone object: nil];
+                                    version: MIN(version, 3u) kind: CGSWaylandObjectNone object: nil];
         [(CGSWaylandPointer *) _pointerDecoder pointerGesturesChanged];
+    } else if (strcmp(interface, "zwp_input_timestamps_manager_v1") == 0 && _inputTimestampsManager == NULL) {
+        _inputTimestampsName = name;
+        _inputTimestampsManager = [self bindGlobal: name
+                                         interface: &zwp_input_timestamps_manager_v1_interface
+                                           version: 1
+                                              kind: CGSWaylandObjectNone object: nil];
+        [self updateInputTimestamps];
     } else if (strcmp(interface, "zxdg_output_manager_v1") == 0 && _logicalOutputManager == NULL) {
         _logicalOutputManagerName = name;
         _logicalOutputManager = [self bindGlobal: name interface: &zxdg_output_manager_v1_interface
@@ -729,7 +1084,49 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
 }
 
 - (void) registryGlobalRemove: (uint32_t) name {
+    WaylandRenderManager *render = (WaylandRenderManager *) _render;
+    struct wl_proxy *renderManagerProxy = NULL;
+    if (name != 0)
+        renderManagerProxy =
+            name == render->_dmabufName ? render->_dmabuf :
+            name == render->_syncobjManagerName ? render->_syncobjManager :
+            name == render->_fifoManagerName ? render->_fifoManager : NULL;
+    [render globalRemoved: name];
+    if (renderManagerProxy != NULL)
+        WL.wl_proxy_destroy(renderManagerProxy);
+
     [(WaylandColorManager *) _color globalRemoved: name];
+    if (_appMenuManager != NULL && name == _appMenuManagerName) {
+        struct wl_proxy *manager = _appMenuManager;
+        uint32_t version = _appMenuManagerVersion;
+        _appMenuManager = NULL;
+        _appMenuManagerName = 0;
+        // The windows release their appmenu objects while the manager is gone.
+        [self notifyWindowsApplicationMenuManagerChanged];
+        if (version >= 2)
+            WaylandMarshal(manager, WP_APPMENU_MANAGER_RELEASE, NULL, WL_MARSHAL_FLAG_DESTROY,
+                           (union wl_argument[1]) {{.o = NULL}});
+        else
+            WL.wl_proxy_destroy(manager);
+        return;
+    }
+    if (name == [(CGSWaylandInputMethod *) _inputMethodDecoder managerName]) {
+        [(CGSWaylandInputMethod *) _inputMethodDecoder managerRemoved];
+        return;
+    }
+    if ([(CGSWaylandTablet *) _tabletDecoder manager] != NULL &&
+        name == [(CGSWaylandTablet *) _tabletDecoder managerName]) {
+        [(CGSWaylandTablet *) _tabletDecoder managerRemoved];
+        return;
+    }
+    if (_seat != NULL && name == [(CGSWaylandTablet *) _tabletDecoder seatName]) {
+        // The wl_seat proxy is invalid once its global is gone; a later tablet manager must not
+        // be given it. The other seat decoders keep their own state.
+        _seat = NULL;
+        [(CGSWaylandInputMethod *) _inputMethodDecoder seatRemoved];
+        [(CGSWaylandTablet *) _tabletDecoder seatRemoved];
+        return;
+    }
     if ((_pointerConstraints != NULL && name == _pointerConstraintsName) ||
         (_relativePointerManager != NULL && name == _relativePointerManagerName)) {
         // The lock objects go before the global that made them.
@@ -744,10 +1141,40 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
         [(CGSWaylandPointer *) _pointerDecoder pointerLockGlobalsChanged];
         return;
     }
+    if (_activation != NULL && name == _activationName) {
+        [self cancelActivationRequest];
+        WaylandMarshal(_activation, WP_ACTIVATION_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
+        _activation = NULL;
+        _activationName = 0;
+        return;
+    }
+    if (_alphaModifierManager != NULL && name == _alphaModifierManagerName) {
+        // The protocol says objects created with the manager survive its destruction.
+        WaylandMarshal(_alphaModifierManager, WP_ALPHA_MODIFIER_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
+        _alphaModifierManager = NULL;
+        _alphaModifierManagerName = 0;
+        return;
+    }
     if (_pointerWarp != NULL && name == _pointerWarpName) {
         WaylandMarshal(_pointerWarp, WP_POINTER_WARP_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
         _pointerWarp = NULL;
         _pointerWarpName = 0;
+        return;
+    }
+    if (_cursorShapeManager != NULL && name == _cursorShapeManagerName) {
+        struct wl_proxy *manager = _cursorShapeManager;
+        _cursorShapeManager = NULL;
+        _cursorShapeManagerName = 0;
+        [(CGSWaylandPointer *) _pointerDecoder cursorGlobalsChanged];
+        WaylandMarshal(manager, WP_CURSOR_SHAPE_MANAGER_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
+        return;
+    }
+    if (_fractionalScaleManager != NULL && name == _fractionalScaleManagerName) {
+        struct wl_proxy *manager = _fractionalScaleManager;
+        _fractionalScaleManager = NULL;
+        _fractionalScaleManagerName = 0;
+        [(CGSWaylandPointer *) _pointerDecoder cursorGlobalsChanged];
+        WaylandMarshal(manager, WP_FRACTIONAL_MANAGER_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
         return;
     }
     if (_pointerGestures != NULL && name == _pointerGesturesName) {
@@ -760,6 +1187,14 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
             WaylandMarshal(gestures, WP_GESTURES_RELEASE, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
         else
             WL.wl_proxy_destroy(gestures);
+        return;
+    }
+    if (_inputTimestampsManager != NULL && name == _inputTimestampsName) {
+        // Timestamp objects made from a manager stay valid after it goes away.
+        WaylandMarshal(_inputTimestampsManager, WP_INPUT_TIMESTAMPS_MANAGER_DESTROY, NULL,
+                       WL_MARSHAL_FLAG_DESTROY, NULL);
+        _inputTimestampsManager = NULL;
+        _inputTimestampsName = 0;
         return;
     }
     if (_outputManager != nil && name == _outputManagerName) {
@@ -815,6 +1250,17 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
 // the same way as when an output's description changes.
 - (void) waylandColorManagerDidLoseGlobal: (WaylandColorManager *) manager {
     [self waylandColorManagerOutputInfoChanged: manager];
+}
+
+// A window's preferred content description changed. CoreGraphics owns the feedback proxy, but only
+// the framework above knows which window it belongs to, so hand the change to its observer.
+- (void) waylandColorManagerPreferredInfoChanged: (WaylandColorManager *) manager
+                                     forFeedback: (struct wl_proxy *) feedback
+{
+    (void) manager;
+    id observer = [CGSConnection nativeObserver];
+    if ([observer respondsToSelector: @selector(nativeConnectionSurfaceColorPreferenceChanged:)])
+        [observer nativeConnectionSurfaceColorPreferenceChanged: feedback];
 }
 
 // What changed in the outputs is a change of the displays, for the callbacks once the setup is over.
@@ -949,6 +1395,11 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
         }
         break;
 
+    case CGSWaylandObjectActivationToken:
+        if (opcode == WP_ACTIVATION_TOKEN_EV_DONE)
+            [self activationTokenDone: args[0].s];
+        break;
+
     case CGSWaylandObjectOutput:
         [self outputEvent: opcode output: (CGSWaylandOutput *) object arguments: args];
         break;
@@ -988,6 +1439,7 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
         // Also with no wl_keyboard object: the decoder may still hold state (a pending modifier key).
         [self releaseKeyboard];
     }
+    [self updateInputTimestamps];
 }
 
 - (void) releaseKeyboard {
@@ -1024,9 +1476,30 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
     return [(CGSWaylandKeyboard *) _keyboardDecoder modifierFlags];
 }
 
+#pragma mark - Input method
+
+- (BOOL) _inputMethodAvailable {
+    return [(CGSWaylandInputMethod *) _inputMethodDecoder available];
+}
+
+- (void) inputMethodWindowChanged: (CGSWindow *) window {
+    [(CGSWaylandInputMethod *) _inputMethodDecoder windowChanged: window];
+}
+
+- (void) inputMethodWindowUnmapped: (CGSWindow *) window {
+    [(CGSWaylandInputMethod *) _inputMethodDecoder windowUnmapped: window];
+    // The same two places tell a drag that started in the window that it is gone.
+    [(CGSWaylandDrag *) _drag windowUnmapped: [window windowId]];
+}
+
+- (void) inputMethodWindowDestroyed: (uint32_t) windowID {
+    [(CGSWaylandInputMethod *) _inputMethodDecoder windowDestroyed: windowID];
+}
+
 - (void) nativeObjectDestroyed: (void *) object {
     [(CGSWaylandPointer *) _pointerDecoder surfaceDestroyed: (struct wl_proxy *) object];
     [(CGSWaylandTouch *) _touchDecoder surfaceDestroyed: (struct wl_proxy *) object];
+    [(CGSWaylandTablet *) _tabletDecoder surfaceDestroyed: (struct wl_proxy *) object];
     [(CGSWaylandKeyboard *) _keyboardDecoder surfaceDestroyed: (struct wl_proxy *) object];
 }
 
@@ -1044,6 +1517,47 @@ static const CFTimeInterval kInputSerialGrace = 1.0;
 
 - (struct wl_proxy *) pointerGestures {
     return _pointerGestures;
+}
+
+// One timestamp object follows one device: the event it sends belongs to the next event of that
+// device, so the decoder of that device is the proxy's user data.
+- (void) updateTimestamp: (struct wl_proxy **) slot
+               forDevice: (struct wl_proxy *) device
+                 decoder: (id) decoder
+                  opcode: (uint32_t) opcode
+{
+    if (device == NULL || _inputTimestampsManager == NULL) {
+        if (*slot != NULL) {
+            WaylandMarshal(*slot, WP_INPUT_TIMESTAMPS_DESTROY, NULL,
+                           WL_MARSHAL_FLAG_DESTROY, NULL);
+            *slot = NULL;
+        }
+        return;
+    }
+    if (*slot != NULL)
+        return;
+    union wl_argument args[2] = {{.o = NULL}, {.o = (struct wl_object *) device}};
+    *slot = [self createObject: _inputTimestampsManager
+                       opcode: opcode
+                    interface: &zwp_input_timestamps_v1_interface
+                    arguments: args
+                         kind: CGSWaylandObjectInputTimestamp
+                       object: decoder];
+}
+
+- (void) updateInputTimestamps {
+    [self updateTimestamp: &_pointerTimestamps
+               forDevice: [(CGSWaylandPointer *) _pointerDecoder pointerProxy]
+                 decoder: _pointerDecoder
+                  opcode: WP_INPUT_TIMESTAMPS_MANAGER_GET_POINTER_TIMESTAMPS];
+    [self updateTimestamp: &_keyboardTimestamps
+               forDevice: _keyboard
+                 decoder: _keyboardDecoder
+                  opcode: WP_INPUT_TIMESTAMPS_MANAGER_GET_KEYBOARD_TIMESTAMPS];
+    [self updateTimestamp: &_touchTimestamps
+               forDevice: [(CGSWaylandTouch *) _touchDecoder touchProxy]
+                 decoder: _touchDecoder
+                  opcode: WP_INPUT_TIMESTAMPS_MANAGER_GET_TOUCH_TIMESTAMPS];
 }
 
 - (struct wl_proxy *) pointerConstraints {
@@ -1145,6 +1659,24 @@ static BOOL ProcessHoldsDisplaySleepAssertion(void) {
     return YES;
 }
 
+- (struct wl_proxy *) cursorShapeManager {
+    return _cursorShapeManager;
+}
+
+- (struct wl_proxy *) fractionalScaleManager {
+    return _fractionalScaleManager;
+}
+
+- (uint32_t) maximumOutputScale120 {
+    uint32_t scale = 1;
+    @synchronized (self) {
+        for (CGSWaylandOutput *output in _outputs)
+            if (output->_current.scale > 0 && (uint32_t) output->_current.scale > scale)
+                scale = (uint32_t) output->_current.scale;
+    }
+    return scale * 120;
+}
+
 - (BOOL) cancelsHiddenUntilMouseMoves {
     return YES;
 }
@@ -1155,6 +1687,14 @@ static BOOL ProcessHoldsDisplaySleepAssertion(void) {
         [(CGSWaylandPointer *) _pointerDecoder cursorHiddenChanged];
     else
         [_pointerDecoder performSelectorOnMainThread: @selector(cursorHiddenChanged) withObject: nil waitUntilDone: NO];
+}
+
+// The cursor the process selected changed.
+- (void) cursorChanged {
+    if ([NSThread isMainThread])
+        [(CGSWaylandPointer *) _pointerDecoder cursorChanged];
+    else
+        [_pointerDecoder performSelectorOnMainThread: @selector(cursorChanged) withObject: nil waitUntilDone: NO];
 }
 
 - (void) mouseAssociationChanged: (BOOL) associated {
@@ -1215,6 +1755,17 @@ static BOOL ProcessHoldsDisplaySleepAssertion(void) {
         }
     }
     return 0;
+}
+
+- (uint32_t) heldLeftPressSerialForSurface: (struct wl_proxy *) surface {
+    return [(CGSWaylandPointer *) _pointerDecoder heldLeftPressSerialForSurface: surface];
+}
+
+- (CGSWindowWayland *) toplevelForSurface: (struct wl_proxy *) surface {
+    uint32_t windowID = [self windowIDForSurface: surface];
+    CGSWindow *window = windowID != 0 ? [self windowForId: (CGSWindowID) windowID] : nil;
+
+    return [window isKindOfClass: [CGSWindowWayland class]] ? (CGSWindowWayland *) window : nil;
 }
 
 - (BOOL) isDisplayOverlaySurface: (struct wl_proxy *) surface {
@@ -1307,13 +1858,13 @@ static BOOL ProcessHoldsDisplaySleepAssertion(void) {
 
 #pragma mark - Hot keys
 
-// Wayland has no request to grab a key for the whole session, so the hot keys of this connection are
-// matched against the keys the compositor sends to the process' own wl_keyboard (CGSWaylandKeyboard asks
-// -activeHotKeyUIDsForKeyCode:flags:), which is while one of the process' surfaces has the keyboard focus.
-// Registration always succeeds, since no other client can hold a key combination here.
-// Limitation: while none of the process' surfaces has the keyboard focus the hot keys do not report. Wayland
-// itself has no global key request; the compositor-specific ways (the xdg-desktop-portal GlobalShortcuts
-// interface, KDE's KGlobalAccel) are not used, since they ask the user to confirm and assign each shortcut.
+// Wayland has no request to grab a key for the whole session. Each registered hot key is therefore
+// offered to the xdg-desktop-portal GlobalShortcuts interface (CGSWaylandPortalShortcuts), which lets
+// the desktop bind it globally after the user confirms it. While a portal session has not bound a
+// shortcut, the key is still matched against the compositor's wl_keyboard events, so the process gets
+// the same event when one of its surfaces has the focus (CGSWaylandKeyboard asks
+// -activeHotKeyUIDsForKeyCode:flags:). Registration always succeeds: no other Wayland client grabs a
+// combination, and a portal that declines one only leaves that hot key focused-only.
 - (CGSWaylandHotKeyEntry *) _hotKeyWithUID: (int) uid {
     for (CGSWaylandHotKeyEntry *entry in _hotKeys) {
         if (entry->uid == uid)
@@ -1323,7 +1874,7 @@ static BOOL ProcessHoldsDisplaySleepAssertion(void) {
 }
 
 - (void) setHotKeyWithUID: (int) uid keyCode: (CGKeyCode) keyCode flags: (CGEventFlags) flags exclusion: (int) exclusion {
-    [self removeHotKeyWithUID: uid];
+    [self removeHotKeyWithUID: uid notifyPortal: NO];
     CGSWaylandHotKeyEntry *entry = [[CGSWaylandHotKeyEntry alloc] init];
     entry->uid = uid;
     entry->virtualKey = keyCode;
@@ -1335,6 +1886,7 @@ static BOOL ProcessHoldsDisplaySleepAssertion(void) {
         [_hotKeys addObject: entry];
     }
     [entry release];
+    [[self portalShortcuts] hotKeysDidChange];
 }
 
 - (BOOL) getHotKeyWithUID: (int) uid keyCode: (CGKeyCode *) outKeyCode flags: (CGEventFlags *) outFlags {
@@ -1351,11 +1903,17 @@ static BOOL ProcessHoldsDisplaySleepAssertion(void) {
 }
 
 - (void) removeHotKeyWithUID: (int) uid {
+    [self removeHotKeyWithUID: uid notifyPortal: YES];
+}
+
+- (void) removeHotKeyWithUID: (int) uid notifyPortal: (BOOL) notify {
     @synchronized(self) {
         CGSWaylandHotKeyEntry *entry = [self _hotKeyWithUID: uid];
         if (entry != nil)
             [_hotKeys removeObject: entry];
     }
+    if (notify)
+        [[self portalShortcuts] hotKeysDidChange];
 }
 
 - (BOOL) isHotKeyEnabledWithUID: (int) uid {
@@ -1371,6 +1929,7 @@ static BOOL ProcessHoldsDisplaySleepAssertion(void) {
         if (entry != nil)
             entry->enabled = enabled;
     }
+    [[self portalShortcuts] hotKeysDidChange];
 }
 
 - (NSArray *) activeHotKeyUIDsForKeyCode: (CGKeyCode) keyCode flags: (uint64_t) flags {
@@ -1379,7 +1938,8 @@ static BOOL ProcessHoldsDisplaySleepAssertion(void) {
         return nil;
     @synchronized(self) {
         for (CGSWaylandHotKeyEntry *entry in _hotKeys) {
-            if (entry->enabled && entry->virtualKey == keyCode && entry->flags == (flags & kHotKeyModifierMask)) {
+            if (entry->enabled && entry->virtualKey == keyCode && entry->flags == (flags & kHotKeyModifierMask)
+                    && ![self isHotKeyBoundToPortalWithUID: entry->uid]) {
                 if (uids == nil)
                     uids = [NSMutableArray array];
                 [uids addObject: @(entry->uid)];
@@ -1387,6 +1947,60 @@ static BOOL ProcessHoldsDisplaySleepAssertion(void) {
         }
     }
     return uids;
+}
+
+- (CGSWaylandPortalShortcuts *) portalShortcuts {
+    if (_portalShortcuts == nil)
+        _portalShortcuts = [[CGSWaylandPortalShortcuts alloc] initWithConnection: self];
+    return _portalShortcuts;
+}
+
+- (NSArray<NSDictionary *> *) enabledHotKeysForPortal {
+    NSMutableArray *result = [NSMutableArray array];
+    @synchronized(self) {
+        for (CGSWaylandHotKeyEntry *entry in _hotKeys) {
+            if (!entry->enabled)
+                continue;
+            [result addObject: @{@"uid": @(entry->uid), @"virtualKey": @(entry->virtualKey),
+                                 @"flags": @(entry->flags)}];
+        }
+    }
+    return result;
+}
+
+- (BOOL) isHotKeyBoundToPortalWithUID: (int) uid {
+    return [(CGSWaylandPortalShortcuts *) _portalShortcuts isUIDBound: uid];
+}
+
+- (void) postPortalHotKeyEventForUID: (int) uid pressed: (BOOL) pressed {
+    if (_hotKeyOperatingMode != 0)
+        return;
+    CGEventFlags flags = 0;
+    @synchronized(self) {
+        CGSWaylandHotKeyEntry *entry = [self _hotKeyWithUID: uid];
+        if (entry == nil || !entry->enabled)
+            return;
+        flags = entry->flags;
+    }
+    [self postHotKeyEventForUID: uid pressed: pressed flags: flags location: CGPointZero
+                           time: clock_gettime_nsec_np(CLOCK_UPTIME_RAW)];
+}
+
+- (NSString *) portalTriggerForKeyCode: (CGKeyCode) keyCode flags: (CGEventFlags) flags {
+    NSString *name = [_keymap portalKeysymNameForKeyCode: keyCode];
+    if (name == nil)
+        return nil;
+    NSMutableArray *parts = [NSMutableArray array];
+    if (flags & kCGEventFlagMaskControl)
+        [parts addObject: @"CTRL"];
+    if (flags & kCGEventFlagMaskAlternate)
+        [parts addObject: @"ALT"];
+    if (flags & kCGEventFlagMaskShift)
+        [parts addObject: @"SHIFT"];
+    if (flags & kCGEventFlagMaskCommand)
+        [parts addObject: @"LOGO"];
+    [parts addObject: name];
+    return [parts componentsJoinedByString: @"+"];
 }
 
 // The outputs that have reported a mode, in the order the compositor announced them. The first is
@@ -1534,8 +2148,84 @@ static NSDictionary *modeDictionary(int32_t width, int32_t height, double refres
     return changed;
 }
 
+- (struct wl_proxy *) seat {
+    return _seat;
+}
+
+// The windows of the process: a Wayland client cannot see those of other clients. Front to back is not known, so the
+// window made last is first.
+- (NSArray<NSDictionary *> *) copyWindowDescriptions {
+    NSMutableArray<NSDictionary *> *result = [[NSMutableArray alloc] init];
+    NSArray *windows = [self copyAllWindows];
+    // The windows of the UI layer first, in the order of -orderedToplevelWindowIDs, then the others, the newer first.
+    NSArray<NSNumber *> *ordered = [self orderedToplevelWindowIDs];
+    NSArray *sorted = [windows sortedArrayUsingComparator: ^NSComparisonResult(CGSWindow *a, CGSWindow *b) {
+        NSUInteger indexA = [ordered indexOfObject: @(a.windowId)], indexB = [ordered indexOfObject: @(b.windowId)];
+        if (indexA != indexB)
+            return indexA < indexB ? NSOrderedAscending : NSOrderedDescending;
+        return a.windowId < b.windowId ? NSOrderedDescending : a.windowId > b.windowId ? NSOrderedAscending
+                                                                                        : NSOrderedSame;
+    }];
+    NSString *process = [[NSProcessInfo processInfo] processName];
+    for (CGSWindow *candidate in sorted) {
+        if (![candidate isKindOfClass: [CGSWindowWayland class]])
+            continue;
+        CGSWindowWayland *window = (CGSWindowWayland *) candidate;
+        CGRect bounds = CGRectNull;
+        if ([window getRect: &bounds] != kCGSErrorSuccess)
+            continue;
+        NSMutableDictionary *description = [NSMutableDictionary dictionary];
+        description[(NSString *) kCGWindowNumber] = @(window.windowId);
+        description[(NSString *) kCGWindowOwnerPID] = @(getpid());
+        description[(NSString *) kCGWindowOwnerName] = process;
+        description[(NSString *) kCGWindowLayer] =
+                @([window role] == CGSWaylandRoleLayer ? kCGMainMenuWindowLevel
+                  : [window role] == CGSWaylandRolePopup ? kCGPopUpMenuWindowLevel : kCGNormalWindowLevel);
+        description[(NSString *) kCGWindowAlpha] = @([window listedAlpha]);
+        description[(NSString *) kCGWindowIsOnscreen] = @([window isShown]);
+        description[(NSString *) kCGWindowStoreType] = @(kCGBackingStoreBuffered);
+        // Capturing windows is not supported, so no window can be read.
+        description[(NSString *) kCGWindowSharingState] = @(kCGWindowSharingNone);
+        description[(NSString *) kCGWindowMemoryUsage] = @((long long) bounds.size.width * bounds.size.height * 4);
+        CFDictionaryRef boundsDictionary = CGRectCreateDictionaryRepresentation(bounds);
+        if (boundsDictionary != NULL) {
+            description[(NSString *) kCGWindowBounds] = (NSDictionary *) boundsDictionary;
+            CFRelease(boundsDictionary);
+        }
+        CFTypeRef title = NULL;
+        if ([window getProperty: kCGSWindowTitle value: &title] == kCGSErrorSuccess && title != NULL) {
+            description[(NSString *) kCGWindowName] = (NSString *) title;
+            CFRelease(title);
+        }
+        [result addObject: description];
+    }
+    [windows release];
+    return result;
+}
+
+- (CGSWindow *) newToplevelWindowWithAttributes: (const CGSToplevelAttributes *) attributes {
+    CGSWindowID windowID = [self _allocateWindowID];
+    CGSWindowWayland *window =
+            [[CGSWindowWayland alloc] initToplevelWithAttributes: attributes
+                                                      connection: self
+                                                        windowID: windowID];
+    if (window == nil)
+        return nil;
+
+    @synchronized (_windows) {
+        [_windows setObject: window forKey: [NSNumber numberWithInt: windowID]];
+    }
+    [window release];
+    return window;
+}
+
+// The windows are shm buffers with an alpha channel, so what is behind them shows through.
+- (BOOL) supportsTranslucentToplevels {
+    return YES;
+}
+
 - (CGSWindow *) newWindow: (CGSRegionRef) region {
-    CGSWindowID windowID = _nextWindowId++;
+    CGSWindowID windowID = [self _allocateWindowID];
     CGSWindowWayland *window =
             [[CGSWindowWayland alloc] initWithRegion: region
                                           connection: self

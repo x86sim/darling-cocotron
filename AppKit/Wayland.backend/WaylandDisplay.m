@@ -16,15 +16,13 @@
  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  SOFTWARE. */
 
-#import <AppKit/NSTextInputBackend.h>
 #import "WaylandDisplay.h"
 #import "../private-include/AppKit/NSEventTime.h"
 #import "NSEvent_gesture.h"
 #import "NSEvent_mouse.h"
-#import "WaylandCursor.h"
+#import <CoreGraphics/CGSCursor.h>
 #import "WaylandScale.h"
-#import "WaylandDataDevice.h"
-#import "WaylandDraggingManager.h"
+#import "../NSCGSDraggingManager.h"
 #import "WaylandAppMenu.h"
 #import "../private-include/AppKit/NSGlobalMenu+Private.h"
 #import <OpenGL/CGLInternal.h>
@@ -33,6 +31,7 @@
 #import "WaylandLibrary.h"
 #import "WaylandPointerLock.h"
 #import "WaylandProtocol.h"
+#import "WaylandRender.h"
 #import "WaylandWindow.h"
 #import "WaylandAppMenu.h"
 #import "WaylandToplevelIcon.h"
@@ -110,12 +109,6 @@ int WaylandDispatch(const void *kind, void *proxy, uint32_t opcode,
                                                  kind: objectKind
                                                 proxy: proxy
                                             arguments: args];
-                break;
-            case WaylandObjectDataDevice:
-            case WaylandObjectDataOffer:
-            case WaylandObjectDataSource:
-                [(WaylandDataDevice *) object handleEvent: opcode kind: objectKind
-                                                     proxy: proxy arguments: args];
                 break;
             case WaylandObjectIconManager:
                 [(WaylandToplevelIcons *) object handleEvent: opcode arguments: args];
@@ -248,28 +241,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     if (!_eglAvailable)
         NSLog(@"Wayland backend: EGL subwindows unavailable; CPU drawing remains enabled");
 
-    _dataDevice = [[WaylandDataDevice alloc] initWithDisplay: self manager: _dataDeviceManager seat: _seat];
-
-    if (WL.hasCursor) {
-        const char *sizeString = getenv("XCURSOR_SIZE");
-        long parsed = sizeString ? strtol(sizeString, NULL, 10) : 24;
-        int size = parsed > 0 && parsed <= INT_MAX ? (int)parsed : 24;
-        _cursorTheme = WL.wl_cursor_theme_load(getenv("XCURSOR_THEME"),
-                                               size > 0 ? size : 24,
-                                               (struct wl_shm *) _shm);
-        _cursorThemeScale120 = 120;
-        if (_cursorTheme == NULL) {
-            NSLog(@"Wayland backend: no cursor theme, the compositor's cursor "
-                  @"stays");
-        }
-    }
-    // Image cursors only need wl_shm, even without libwayland-cursor or a theme.
-    args[0].o = NULL;
-    _cursorSurface = WaylandCreateObject(_compositor, WP_COMPOSITOR_CREATE_SURFACE,
-                                        &wl_surface_interface, args, 0, nil);
-
-    _cursorFractionalScale = [self newFractionalScaleForSurface: _cursorSurface owner: (id)self];
-
     // Windows ordered in while the application was not active are mapped once it is.
     [[NSNotificationCenter defaultCenter] addObserver: self
                                              selector: @selector(applicationBecameActive:)
@@ -286,17 +257,10 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 
 - (void) dealloc {
     [_appMenu release];
-    [_draggingManager invalidate];
-    [_draggingManager release];
     [self consumeDragPress];
-    [_dataDevice invalidate];
-    [_dataDevice release];
 
     _CGSSetNativeConnectionObserver(nil);
-    [self cancelActivationRequest];
 
-    if (_cursorTheme != NULL)
-        WL.wl_cursor_theme_destroy(_cursorTheme);
     [_appMenu release];
     _appMenu = nil;
     [_toplevelIcons release];
@@ -310,12 +274,13 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         if (_sessionManager != NULL)
             WaylandMarshal(_sessionManager, WP_SESSION_MANAGER_DESTROY,
                            NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
-        struct wl_proxy *proxies[] = {_imageCursorBuffer, _cursorFractionalScale, _cursorSurface,
-                                      _cursorShapeDevice, _cursorShapeManager, _dialogManager, _bell,
-                                      _alphaModifierManager, _toplevelTagManager, _idleInhibitManager,
-                                      _textInput, _textInputManager,
-                                      _seat, _decorationManager, _dataDeviceManager, _wmBase,
-                                      _shm, _viewporter, _fractionalScaleManager, _activationToken, _activation, _appMenuManager, _subcompositor, _compositor, _registry};
+        struct wl_proxy *proxies[] = {_dialogManager, _bell,
+                                      _toplevelTagManager, _idleInhibitManager,
+                                      _contentTypeManager,
+                                      _shortcutsInhibitManager,
+                                      _seat, _decorationManager, _wmBase,
+                                      _shm, _viewporter, _fractionalScaleManager, _subcompositor, _compositor,
+                                       _registry};
         for (size_t i = 0; i < sizeof(proxies) / sizeof(proxies[0]); i++)
             if (proxies[i] != NULL)
                 WL.wl_proxy_destroy(proxies[i]);
@@ -324,7 +289,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         // The connection is CoreGraphics'; it stays open.
     }
 
-    [_cursor release];
     [_inputEvent release];
     [_sessionIdentifier release];
     [_outputs release];
@@ -347,6 +311,15 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 // color objects per surface).
 - (WaylandColorManager *) colorManager {
     return _CGSNativeConnectionWaylandColorManager();
+}
+
+- (WaylandRenderManager *) renderManager {
+    return _CGSNativeConnectionWaylandRenderManager();
+}
+
+- (void) renderGlobalsAvailable {
+    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
+        [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) renderGlobalsAvailable];
 }
 
 #pragma mark - Window-system session
@@ -452,10 +425,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) dialogManagerAvailable];
 }
 
-- (void) alphaModifierManagerAvailable {
-    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
-        [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) alphaModifierAvailable];
-}
 
 - (void) toplevelTagManagerAvailable {
     for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
@@ -465,6 +434,16 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 - (void) idleInhibitManagerAvailable {
     for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
         [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) updateIdleInhibitor];
+}
+
+- (void) contentTypeManagerAvailable {
+    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
+        [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) updateContentType];
+}
+
+- (void) shortcutsInhibitManagerAvailable {
+    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
+        [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) updateShortcutsInhibitor];
 }
 
 - (void) applicationIconImageChanged {
@@ -536,6 +515,21 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     [self outputsDidChange];
 }
 
+// The preferred description of one of our surfaces changed. CoreGraphics gave us the feedback
+// proxy; the window that owns it reads the description through the same color manager.
+- (void) nativeConnectionSurfaceColorPreferenceChanged: (void *) feedback {
+    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++) {
+        WaylandWindow *window = (WaylandWindow *) CFArrayGetValueAtIndex(_windows, i);
+        if ([window surfaceFeedback] == (struct wl_proxy *) feedback) {
+            [window preferredColorInfoChanged];
+            break;
+        }
+        // Metal layers and OpenGL subwindows can have surface feedback of their own.
+        if ([window preferredSubwindowColorInfoChangedForFeedback: (struct wl_proxy *) feedback])
+            break;
+    }
+}
+
 // CoreGraphics has rebuilt the screens with an output's new color description.
 - (void) nativeConnectionDisplayColorSpaceChanged {
     // Windows without an explicit color space follow the screen, so their surface descriptions
@@ -551,6 +545,12 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
                        forModes: nil];
 }
 
+// CoreGraphics bound a dma-buf, explicit synchronization or fifo global after the windows were made.
+- (void) nativeConnectionRenderManagerAvailable {
+    [self renderGlobalsAvailable];
+    [self flush];
+}
+
 // CoreGraphics bound a color management or color representation global after the windows were made.
 - (void) nativeConnectionColorManagerAvailable {
     for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
@@ -561,14 +561,17 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 // The process took or dropped the power assertion that keeps the display awake: the windows hold
 // an idle inhibitor only while it is held.
 - (void) nativeConnectionDisplaySleepPreventionChanged {
-    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
+    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++) {
         [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) updateIdleInhibitor];
+        [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) updateContentType];
+    }
     [self flush];
 }
 
-// Another process asked for the activation of this one's windows (see _CGSActivateProcess).
+// Another process asked for the activation of this one's windows (see _CGSActivateProcess). The compositor is asked by
+// CoreGraphics, which follows this; an application that is asked to activate shows the windows it was holding back.
 - (void) nativeConnectionActivationRequested {
-    [self requestActivation];
+    [self mapDeferredWindows];
 }
 
 // Sends the requests made since the last wait, and handles the events libwayland has already
@@ -630,14 +633,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
                          version: 1
                             kind: 0
                           object: nil];
-    } else if (strcmp(interface, "wp_alpha_modifier_v1") == 0 && _alphaModifierManager == NULL) {
-        _alphaModifierManagerName = name;
-        _alphaModifierManager = [self bindGlobal: name
-                                       interface: &wp_alpha_modifier_v1_interface
-                                         version: 1
-                                            kind: 0
-                                          object: nil];
-        [self alphaModifierManagerAvailable];
     } else if (strcmp(interface, "xdg_toplevel_tag_manager_v1") == 0 && _toplevelTagManager == NULL) {
         _toplevelTagManagerName = name;
         _toplevelTagManager = [self bindGlobal: name
@@ -654,6 +649,24 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
                                           kind: 0
                                         object: nil];
         [self idleInhibitManagerAvailable];
+    } else if (strcmp(interface, "wp_content_type_manager_v1") == 0 && _contentTypeManager == NULL) {
+        _contentTypeManagerName = name;
+        _contentTypeManager = [self bindGlobal: name
+                                     interface: &wp_content_type_manager_v1_interface
+                                       version: 1
+                                          kind: 0
+                                        object: nil];
+        [self contentTypeManagerAvailable];
+    } else if (strcmp(interface, "zwp_keyboard_shortcuts_inhibit_manager_v1") == 0 &&
+               _shortcutsInhibitManager == NULL)
+    {
+        _shortcutsInhibitManagerName = name;
+        _shortcutsInhibitManager = [self bindGlobal: name
+                                          interface: &zwp_keyboard_shortcuts_inhibit_manager_v1_interface
+                                            version: 1
+                                               kind: 0
+                                             object: nil];
+        [self shortcutsInhibitManagerAvailable];
     } else if (strcmp(interface, "wl_compositor") == 0 && _compositor == NULL) {
         // Version 4 has wl_surface.damage_buffer.
         _compositorVersion = MIN(version, 4);
@@ -670,16 +683,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         _fractionalScaleManagerName = name;
         _fractionalScaleManager = [self bindGlobal: name interface: &wp_fractional_scale_manager_v1_interface
                                           version: 1 kind: 0 object: nil];
-    } else if (strcmp(interface, "xdg_activation_v1") == 0 && _activation == NULL) {
-        _activationName = name;
-        _activation = [self bindGlobal: name interface: &xdg_activation_v1_interface
-                               version: 1 kind: 0 object: nil];
-    } else if (strcmp(interface, "org_kde_kwin_appmenu_manager") == 0 && _appMenuManager == NULL) {
-        // Version 2 adds the manager's release request.
-        _appMenuManagerName = name;
-        _appMenuManagerVersion = MIN(version, 2);
-        _appMenuManager = [self bindGlobal: name interface: &org_kde_kwin_appmenu_manager_interface
-                                   version: _appMenuManagerVersion kind: 0 object: nil];
     } else if (strcmp(interface, "xdg_toplevel_icon_manager_v1") == 0 && _toplevelIcons == nil) {
         _toplevelIcons = [[WaylandToplevelIcons alloc] initWithDisplay: self];
         [_toplevelIcons setManager: [self bindGlobal: name interface: &xdg_toplevel_icon_manager_v1_interface
@@ -694,9 +697,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     } else if (strcmp(interface, "wl_subcompositor") == 0 && _subcompositor == NULL) {
         _subcompositor = [self bindGlobal: name interface: &wl_subcompositor_interface
                                   version: 1 kind: 0 object: nil];
-    } else if (strcmp(interface, "wl_data_device_manager") == 0 && _dataDeviceManager == NULL) {
-        _dataDeviceManager = [self bindGlobal: name interface: &wl_data_device_manager_interface
-                                    version: MIN(version, 3) kind: 0 object: nil];
     } else if (strcmp(interface, "wl_shm") == 0 && _shm == NULL) {
         _shm = [self bindGlobal: name
                       interface: &wl_shm_interface
@@ -706,7 +706,7 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     } else if (strcmp(interface, "xdg_wm_base") == 0 && _wmBase == NULL) {
         _wmBase = [self bindGlobal: name
                          interface: &xdg_wm_base_interface
-                           version: MIN(version, 6)
+                           version: MIN(version, 7)
                               kind: WaylandObjectWmBase
                             object: self];
     } else if (strcmp(interface, "zxdg_decoration_manager_v1") == 0 &&
@@ -715,22 +715,9 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         _decorationManager =
                 [self bindGlobal: name
                        interface: &zxdg_decoration_manager_v1_interface
-                         version: 1
+                         version: MIN(version, 2u)
                             kind: 0
                           object: nil];
-    } else if (strcmp(interface, "zwp_text_input_manager_v3") == 0 && _textInputManager == NULL) {
-        _textInputManagerName = name;
-        _textInputManager = [self bindGlobal: name interface: &zwp_text_input_manager_v3_interface
-                                     version: 1 kind: 0 object: nil];
-        [self attachTextInput];
-    } else if (strcmp(interface, "wp_cursor_shape_manager_v1") == 0 && _cursorShapeManager == NULL) {
-        _cursorShapeManagerName = name;
-        _cursorShapeManager = [self bindGlobal: name
-                                     interface: &wp_cursor_shape_manager_v1_interface
-                                      version: MIN(version, (uint32_t) wp_cursor_shape_manager_v1_interface.version)
-                                         kind: 0
-                                       object: nil];
-        [self updateCursorShapeDevice];
     } else if (strcmp(interface, "wl_seat") == 0 && _seat == NULL) {
         // Version 4 adds wl_keyboard.repeat_info, 5 wl_pointer.frame.
         _seat = [self bindGlobal: name
@@ -738,7 +725,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
                          version: MIN(version, 5)
                             kind: WaylandObjectSeat
                           object: self];
-        [self attachTextInput];
     } else if (strcmp(interface, "zwlr_layer_shell_v1") == 0 && _layerShell == NULL) {
         _layerShellName = name;
         // Version 4 adds the on-demand keyboard interactivity the bar asks for.
@@ -794,14 +780,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         _bellName = 0;
         return;
     }
-    if (_alphaModifierManager != NULL && name == _alphaModifierManagerName) {
-        // The protocol says objects created with the manager survive its destruction.
-        WaylandMarshal(_alphaModifierManager, WP_ALPHA_MODIFIER_DESTROY, NULL,
-                       WL_MARSHAL_FLAG_DESTROY, NULL);
-        _alphaModifierManager = NULL;
-        _alphaModifierManagerName = 0;
-        return;
-    }
     if (_toplevelTagManager != NULL && name == _toplevelTagManagerName) {
         WaylandMarshal(_toplevelTagManager, XDG_TOPLEVEL_TAG_MANAGER_DESTROY, NULL,
                        WL_MARSHAL_FLAG_DESTROY, NULL);
@@ -817,37 +795,26 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         _idleInhibitManagerName = 0;
         return;
     }
-    if (_cursorShapeManager != NULL && name == _cursorShapeManagerName) {
-        // The device becomes inert with the manager; the compositor keeps the last shape that was set.
-        [self updateCursorShapeDevice];
-        WaylandMarshal(_cursorShapeManager, WP_CURSOR_SHAPE_MANAGER_DESTROY, NULL,
+    if (_contentTypeManager != NULL && name == _contentTypeManagerName) {
+        // The content type objects already made from this factory stay valid.
+        WaylandMarshal(_contentTypeManager, WP_CONTENT_TYPE_MANAGER_DESTROY, NULL,
                        WL_MARSHAL_FLAG_DESTROY, NULL);
-        _cursorShapeManager = NULL;
-        _cursorShapeManagerName = 0;
+        _contentTypeManager = NULL;
+        _contentTypeManagerName = 0;
         return;
     }
-    if (_textInputManager && name == _textInputManagerName) {
-        [self detachTextInput];
-        WaylandMarshal(_textInputManager, WP_TEXT_INPUT_MANAGER_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
-        _textInputManager = NULL; _textInputManagerName = 0;
+    if (_shortcutsInhibitManager != NULL && name == _shortcutsInhibitManagerName) {
+        // Inhibitors stay valid; the windows destroy them when they are no longer needed.
+        WaylandMarshal(_shortcutsInhibitManager, ZWP_KEYBOARD_SHORTCUTS_INHIBIT_MANAGER_DESTROY,
+                       NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
+        _shortcutsInhibitManager = NULL;
+        _shortcutsInhibitManagerName = 0;
         return;
     }
     if (_fractionalScaleManager && name == _fractionalScaleManagerName) {
         WaylandMarshal(_fractionalScaleManager, WP_FRACTIONAL_MANAGER_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
         _fractionalScaleManager = NULL; _fractionalScaleManagerName = 0;
         return; // Existing surface preferences survive factory removal.
-    }
-    if (_appMenuManager && name == _appMenuManagerName) {
-        struct wl_proxy *manager = _appMenuManager;
-        _appMenuManager = NULL; _appMenuManagerName = 0;
-        // The windows release their appmenu objects while the manager is gone.
-        for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
-            [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) updateApplicationMenu];
-        if (_appMenuManagerVersion >= 2)
-            WaylandMarshal(manager, WP_APPMENU_MANAGER_RELEASE, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
-        else
-            WL.wl_proxy_destroy(manager);
-        return;
     }
     if (_toplevelIcons && name == [_toplevelIcons name]) {
         // The windows keep the icons they were given.
@@ -861,12 +828,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         // their windows unmap.
         WL.wl_proxy_destroy(_plasmaShell);
         _plasmaShell = NULL; _plasmaShellName = 0;
-        return;
-    }
-    if (_activation && name == _activationName) {
-        [self cancelActivationRequest];
-        WaylandMarshal(_activation, WP_ACTIVATION_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
-        _activation = NULL; _activationName = 0;
         return;
     }
     if (_viewporter && name == _viewporterName) {
@@ -884,7 +845,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         if (output->_globalName == name) {
             for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
                 [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) outputRemoved: output->_proxy];
-            [_draggingManager outputRemoved: output->_proxy];
             WL.wl_proxy_destroy(output->_proxy);
             [_outputs removeObject: output];
             [self scheduleOutputsDidChange];
@@ -905,11 +865,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         if (output->_proxy == proxy)
             return output->_current.refresh > 0 ? (uint32_t)output->_current.refresh : 0;
     return 0;
-}
-
-- (void) windowScaleChanged: (WaylandWindow *) window {
-    if (window == _pointerWindow)
-        [self applyCursor];
 }
 
 // An output changed. The displays are CoreGraphics', which learns of it on the same connection: its
@@ -937,7 +892,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 - (void) outputsDidChange {
     _outputsChangePending = NO;
     [self _invalidateScreens];
-    [_draggingManager outputsChanged];
     for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++) {
         WaylandWindow *window = (WaylandWindow *) CFArrayGetValueAtIndex(_windows, i);
         [window scheduleScaleUpdate];
@@ -1007,13 +961,6 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         // object and decodes them into CGEvents.
         break;
 
-    case WaylandObjectTextInput:
-        [self textInputEvent: opcode arguments: args];
-        break;
-
-    case WaylandObjectActivationToken:
-        if (proxy == _activationToken && opcode == WP_ACTIVATION_TOKEN_EV_DONE)
-            [self activationTokenDone: args[0].s];
         break;
 
     case WaylandObjectSession:
@@ -1055,13 +1002,10 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
 - (void) nativeConnectionPointerAvailabilityChanged: (BOOL) available {
     if (available) {
         _pointer = (struct wl_proxy *) _CGSNativeConnectionPointer();
-        [self updateCursorShapeDevice];
         return;
     }
-    [_draggingManager cancel];
     [self consumeDragPress];
     _pointer = NULL;
-    [self updateCursorShapeDevice];
     _pointerWindow = nil;
     _pointerEnterSerial = 0;
     _pressedButtons = 0;
@@ -1071,14 +1015,12 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
     // The seat may have given CoreGraphics the pointer before this display was an observer: an enter says it exists.
     if (_pointer == NULL) {
         _pointer = (struct wl_proxy *) _CGSNativeConnectionPointer();
-        // The cursor shape device is made for the pointer, wherever the display learned of it.
-        [self updateCursorShapeDevice];
     }
     _pointerEnterSerial = serial;
     _pointerWindow = [self windowForSurface: (struct wl_proxy *) surface];
     _pointerSurfacePoint = CGPointMake(x, y);
     [_pointerWindow setLastKnownCursorPosition: [_pointerWindow transformPoint: _pointerSurfacePoint]];
-    [self performAfterDispatch: ^{ [self applyCursor]; }];
+    [self syncDecorationCursor];
 }
 
 - (void) nativeConnectionPointerLeft {
@@ -1129,25 +1071,17 @@ struct wl_proxy *WaylandCreateObject(struct wl_proxy *proxy, uint32_t opcode,
         return NO;
 
     [window setLastKnownCursorPosition: [window transformPoint: _pointerSurfacePoint]];
+    [self syncDecorationCursor];
 
-    if (_pressedButtons == 0 && [window isDecorationPoint: _pointerSurfacePoint]) {
-        [self performAfterDispatch: ^{ [self applyCursor]; }];
-        return YES;
-    }
+    // The pointer over the window's frame is the frame's (CoreGraphics posts no event for it).
+    if (_pressedButtons == 0 && [window isDecorationPoint: _pointerSurfacePoint])
+        return NO;
 
     [self performAfterDispatch: ^{
       if ([window delegate] != nil)
           [[window delegate] platformWindowSetCursorEvent: window];
     }];
     return NO;
-}
-
-// A window decoration (the buttons of a title bar, the edges that resize) takes the first button for itself.
-- (BOOL) nativeConnectionPointerButton: (uint32_t) button pressed: (BOOL) pressed serial: (uint32_t) serial {
-    return _pressedButtons == 0 && [_pointerWindow decorationButton: button
-                                                            pressed: pressed
-                                                             serial: serial
-                                                            atPoint: _pointerSurfacePoint];
 }
 
 // A Linux button code of the Cocoa button number of a mouse event, and the mask of it in _pressedButtons.
@@ -1269,209 +1203,20 @@ static NSUInteger buttonMaskForNumber(int64_t number) {
     return YES;
 }
 
-#pragma mark - Text input (text-input-v3)
-
-// The compositor's input method sends the composition (preedit_string) and the final text
-// (commit_string) between enter and leave, as one state applied at done. They go to the
-// text input client of the window's first responder through its NSTextInputContext.
-
-- (void) attachTextInput {
-    if (_textInputManager == NULL || _seat == NULL || _textInput != NULL)
-        return;
-    union wl_argument args[2] = {{.o = NULL}, {.o = (struct wl_object *) _seat}};
-    _textInput = WaylandCreateObject(_textInputManager, WP_TEXT_INPUT_MANAGER_GET_TEXT_INPUT,
-                                     &zwp_text_input_v3_interface, args,
-                                     WaylandObjectTextInput, self);
-}
-
-- (void) detachTextInput {
-    if (_textInput == NULL)
-        return;
-    [self textInputLeft];
-    WaylandMarshal(_textInput, WP_TEXT_INPUT_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
-    _textInput = NULL;
-}
-
-- (NSTextInputContext *) textInputContext {
-    return _textInputWindow != nil
-            ? [NSTextInputContext inputContextForWindow: [_textInputWindow delegate]] : nil;
-}
-
-// Sends the text input state to the compositor: whether the first responder takes text and where
-// its caret is. Only a change is sent, because the compositor answers every commit.
-- (void) syncTextInput {
-    if (_textInput == NULL || _textInputWindow == nil)
-        return;
-
-    NSTextInputContext *context = [self textInputContext];
-    BOOL wanted = context != nil;
-    BOOL changed = NO;
-
-    if (wanted != _textInputEnabled) {
-        WaylandMarshal(_textInput, wanted ? WP_TEXT_INPUT_ENABLE : WP_TEXT_INPUT_DISABLE,
-                       NULL, 0, NULL);
-        _textInputEnabled = wanted;
-        changed = YES;
-        if (!wanted) {
-            [_textInputPreedit release];
-            _textInputPreedit = nil;
-        }
-    }
-    if (wanted) {
-        // The caret rectangle in the surface's logical coordinates, y down.
-        NSRect screenRect = [context candidateRectOnScreen];
-        NSRect rect = NSZeroRect;
-        if (!NSEqualRects(screenRect, NSZeroRect)) {
-            NSRect windowRect = [[_textInputWindow delegate] convertRectFromScreen: screenRect];
-            NSPoint offset = [_textInputWindow contentOffset];
-            rect = NSMakeRect(NSMinX(windowRect) + offset.x,
-                              [_textInputWindow frame].size.height - NSMaxY(windowRect) + offset.y,
-                              NSWidth(windowRect), NSHeight(windowRect));
-        }
-        if (!NSEqualRects(rect, _textInputRect) || changed) {
-            union wl_argument args[4] = {{.i = (int32_t) floor(rect.origin.x)},
-                                         {.i = (int32_t) floor(rect.origin.y)},
-                                         {.i = (int32_t) ceil(rect.size.width)},
-                                         {.i = (int32_t) ceil(rect.size.height)}};
-            WaylandMarshal(_textInput, WP_TEXT_INPUT_SET_CURSOR_RECTANGLE, NULL, 0, args);
-            _textInputRect = rect;
-            changed = YES;
-        }
-    }
-    if (changed) {
-        WaylandMarshal(_textInput, WP_TEXT_INPUT_COMMIT, NULL, 0, NULL);
-        [self flush];
-    }
-}
-
-- (void) textInputCandidateRectChangedInWindow: (NSWindow *) window {
-    if (_textInputWindow != nil && [_textInputWindow delegate] == window)
-        [self syncTextInput];
-}
-
-// The compositor took the text input away from the window: a composition that was showing is
-// removed, as no commit can follow it.
-- (void) textInputLeft {
-    NSTextInputContext *context = [self textInputContext];
-
-    if (_textInputPreedit != nil)
-        [context cancelComposition];
-    [_textInputPreedit release];
-    _textInputPreedit = nil;
-    [_textInputPendingPreedit release];
-    _textInputPendingPreedit = nil;
-    [_textInputPendingCommit release];
-    _textInputPendingCommit = nil;
-    _textInputWindow = nil;
-    _textInputEnabled = NO;
-    _textInputRect = NSZeroRect;
-}
-
-// Converts a byte offset in the UTF-8 string to a UTF-16 offset in `text`.
-static NSUInteger utf16OffsetOfUTF8Offset(NSString *text, int byteOffset) {
-    if (byteOffset < 0)
-        return [text length];
-
-    NSUInteger length = [text length];
-    NSUInteger offset = 0;
-    int bytes = 0;
-
-    while (offset < length && bytes < byteOffset) {
-        unichar c = [text characterAtIndex: offset];
-        if (c >= 0xD800 && c < 0xDC00 && offset + 1 < length) {
-            bytes += 4;
-            offset += 2;
-        } else {
-            bytes += c < 0x80 ? 1 : (c < 0x800 ? 2 : 3);
-            offset++;
-        }
-    }
-    return offset;
-}
-
-// Applies one done batch in the order the protocol gives: the old composition goes, the
-// committed text is inserted, the new composition is shown with its caret.
-- (void) textInputDone {
-    NSTextInputContext *context = [self textInputContext];
-    NSString *commit = [_textInputPendingCommit autorelease];
-    NSString *preedit = [_textInputPendingPreedit autorelease];
-    int cursorBegin = _textInputPendingCursorBegin;
-    int cursorEnd = _textInputPendingCursorEnd;
-
-    _textInputPendingCommit = nil;
-    _textInputPendingPreedit = nil;
-    _textInputPendingCursorBegin = _textInputPendingCursorEnd = -1;
-
-    if (context == nil)
-        return;
-    if ([preedit length] == 0)
-        preedit = nil;
-    // Nothing the client has not already got: the compositor answers each commit with a done.
-    BOOL samePreedit = preedit == nil ? _textInputPreedit == nil : [preedit isEqualToString: _textInputPreedit];
-    if ([commit length] == 0 && samePreedit)
-        return;
-
-    if ([commit length] > 0) {
-        [context cancelComposition];
-        [_textInputPreedit release];
-        _textInputPreedit = nil;
-        [context commitComposition: commit];
-    }
-    if (preedit == nil) {
-        if (_textInputPreedit != nil)
-            [context cancelComposition];
-        [_textInputPreedit release];
-        _textInputPreedit = nil;
-        return;
-    }
-    NSUInteger begin = utf16OffsetOfUTF8Offset(preedit, cursorBegin);
-    NSUInteger end = cursorEnd < 0 ? begin : utf16OffsetOfUTF8Offset(preedit, cursorEnd);
-    if (end < begin)
-        end = begin;
-    [_textInputPreedit release];
-    _textInputPreedit = [preedit copy];
-    [context updateComposition: preedit selection: NSMakeRange(begin, end - begin)];
-}
-
-- (void) textInputEvent: (uint32_t) opcode arguments: (union wl_argument *) args {
-    switch (opcode) {
-    case WP_TEXT_INPUT_EV_ENTER:
-        [self textInputLeft];
-        _textInputWindow = [self windowForSurface: (struct wl_proxy *) args[0].o];
-        [self syncTextInput];
-        break;
-
-    case WP_TEXT_INPUT_EV_LEAVE:
-        [self textInputLeft];
-        break;
-
-    case WP_TEXT_INPUT_EV_PREEDIT_STRING:
-        [_textInputPendingPreedit release];
-        _textInputPendingPreedit = args[0].s != NULL ? [[NSString alloc] initWithUTF8String: args[0].s] : nil;
-        _textInputPendingCursorBegin = args[1].i;
-        _textInputPendingCursorEnd = args[2].i;
-        break;
-
-    case WP_TEXT_INPUT_EV_COMMIT_STRING:
-        [_textInputPendingCommit release];
-        _textInputPendingCommit = args[0].s != NULL ? [[NSString alloc] initWithUTF8String: args[0].s] : nil;
-        break;
-
-    case WP_TEXT_INPUT_EV_DELETE_SURROUNDING_TEXT:
-        // No surrounding text is reported to the input method, so it has nothing to delete.
-        break;
-
-    case WP_TEXT_INPUT_EV_DONE:
-        [self textInputDone];
-        break;
-    }
-}
-
 // Wayland clients can't move the pointer, but while it is locked the cursor is
 // the application's own and a warp only moves where it is. That position is
 // where +[NSEvent mouseLocation] reports it and where the pointer reappears on unlock.
 // Without a lock the call does nothing, and nothing pretends otherwise.
 // position is in CoreGraphics' global space, as -[NSDisplay warpMouse:] documents.
+// The window system's input method follows the first responder and the caret (see NSCGSInputMethod): the window
+// tells CoreGraphics, which runs the text input protocol.
+- (void) textInputCandidateRectChangedInWindow: (NSWindow *) window {
+    WaylandWindow *platformWindow = (WaylandWindow *) [window platformWindow];
+
+    if ([platformWindow isKindOfClass: [WaylandWindow class]])
+        [platformWindow updateInputMethodSpot];
+}
+
 #pragma mark - Pointer lock
 
 // The window to lock: the one activated last. The lock activates once it also
@@ -1506,14 +1251,6 @@ static NSUInteger utf16OffsetOfUTF8Offset(NSString *text, int byteOffset) {
 
     _pointerSurfacePoint = CGPointMake(x, y);
     [window setLastKnownCursorPosition: [window transformPoint: _pointerSurfacePoint]];
-}
-
-// The cursor was hidden or is visible again: the image (or none) is applied after the dispatch, like every
-// cursor change.
-- (void) nativeConnectionCursorHiddenChanged: (BOOL) hidden {
-    // Not necessarily in the middle of a dispatch: the run is scheduled for the next run loop pass.
-    [self performAfterDispatch: ^{ [self applyCursor]; }];
-    [self scheduleAfterDispatchRun];
 }
 
 - (WaylandWindow *) pointerLockTarget {
@@ -1670,16 +1407,28 @@ static NSUInteger utf16OffsetOfUTF8Offset(NSString *text, int byteOffset) {
     return count;
 }
 
-- (CGRect) insetRect: (CGRect) frame
-        forNativeWindowBorderWithStyle: (NSUInteger) styleMask
-{
-    return frame;
-}
-
-- (CGRect) outsetRect: (CGRect) frame
-        forNativeWindowBorderWithStyle: (NSUInteger) styleMask
-{
-    return frame;
+- (BOOL) fullscreenScreenFrameForSize: (NSSize) size entered: (NSSet *) entered frame: (NSRect *) frame {
+    NSArray *outputs = [self outputsWithModes];
+    NSArray *screens = [self screens];
+    BOOL found = NO;
+    NSUInteger matches = 0;
+    NSRect match = NSZeroRect, enteredMatch = NSZeroRect;
+    for (NSUInteger i = 0; i < [outputs count] && i < [screens count]; i++) {
+        NSRect screen = [(NSScreen *) screens[i] frame];
+        if (WaylandFullscreenRound(screen.size.width) != WaylandFullscreenRound(size.width) ||
+            WaylandFullscreenRound(screen.size.height) != WaylandFullscreenRound(size.height))
+            continue;
+        matches++;
+        match = screen;
+        if ([entered containsObject: [NSValue valueWithPointer: ((WaylandOutput *) outputs[i])->_proxy]]) {
+            enteredMatch = screen;
+            found = YES;
+        }
+    }
+    if (!found && matches != 1)
+        return NO;
+    *frame = found ? enteredMatch : match;
+    return YES;
 }
 
 #pragma mark - Windows
@@ -1732,26 +1481,23 @@ static NSUInteger utf16OffsetOfUTF8Offset(NSString *text, int byteOffset) {
     return nil;
 }
 
-// The window a window of a raised level, or any window that is not an application window, is made
-// transient for: the window it is attached to as a child window, else the application's key
-// window, else its main window, provided it is a mapped toplevel and naming it would
-// not make a window its own ancestor.
-- (WaylandWindow *) levelParentForWindow: (WaylandWindow *) window {
+// The windows a window of a raised level, or any window that is not an application window, may be made transient for,
+// best first: the window it is attached to as a child window, its sheet's parent, the application's key window, else its
+// main window, provided it is a mapped toplevel. The window system window takes the first it accepts (one that would
+// make a window its own ancestor is refused).
+- (NSArray *) levelParentCandidatesForWindow: (WaylandWindow *) window {
     NSWindow *candidates[4] = {[[window delegate] parentWindow], [[window delegate] sheetParent], [NSApp keyWindow],
                                 [NSApp mainWindow]};
+    NSMutableArray *result = [NSMutableArray array];
 
     for (int i = 0; i < 4; i++) {
         id platform = [candidates[i] platformWindow];
-        if (![platform isKindOfClass: [WaylandWindow class]] || ![platform isMapped] || [platform isPopup])
+        if (![platform isKindOfClass: [WaylandWindow class]] || platform == window || ![platform isMapped] ||
+            [platform isPopup])
             continue;
-        const void *ancestors[16];
-        int count = 0;
-        for (WaylandWindow *up = [platform levelParent]; up != nil && count < 16; up = [up levelParent])
-            ancestors[count++] = up;
-        if (DarlingWindowParentAllowed(window, platform, ancestors, count))
-            return platform;
+        [result addObject: platform];
     }
-    return nil;
+    return result;
 }
 
 - (uint32_t) popupGrabSerialForParent: (WaylandWindow *) parent {
@@ -1817,7 +1563,7 @@ static NSUInteger utf16OffsetOfUTF8Offset(NSString *text, int byteOffset) {
     NSEvent *cancel = [NSEvent otherEventWithType: NSAppKitDefined location: NSZeroPoint
                                    modifierFlags: 0 timestamp: NSEventCurrentTime() windowNumber: 0 context: nil
                                          subtype: NSApplicationDeactivated data1: 0 data2: 0];
-    [self postEvent: cancel atStart: YES];
+    [NSApp postEvent: cancel atStart: YES];
 }
 
 - (CGWindow *) newWindowWithDelegate: (NSWindow *) delegate {
@@ -1826,32 +1572,20 @@ static NSUInteger utf16OffsetOfUTF8Offset(NSString *text, int byteOffset) {
 
 #pragma mark - Main menu
 
-// The main menu goes to the desktop's global menu when the compositor takes the
-// address of a window's menu (KDE's appmenu protocol) and something on the
-// session bus shows application menus (the com.canonical.AppMenu.Registrar
-// name has an owner). Plasma's appmenu service owns that name only while a
-// global menu view, the Global Menu applet or the application menu button of
-// the window title bars, is in use. Otherwise nothing outside the application
-// would show the menu, and a client cannot put a bar of its own along the top
-// of the screen with xdg-shell, so the windows draw it themselves.
-- (BOOL) _showsMainMenuOutsideWindows {
-    // With a layer shell the menu bar window shows the menu when the desktop does not.
-    return _layerShell != NULL || [self _desktopShowsMainMenu];
-}
+// The main menu goes to the desktop's global menu when the compositor takes the address of a window's menu (KDE's
+// appmenu protocol) and something on the session bus shows application menus (the com.canonical.AppMenu.Registrar
+// name has an owner). Plasma's appmenu service owns that name only while a global menu view, the Global Menu applet
+// or the application menu button of the window title bars, is in use. Otherwise nothing outside the application
+// would show the menu, and a client cannot put a bar of its own along the top of the screen with xdg-shell without a
+// layer shell, so the windows draw it themselves (see -[NSDisplay _showsMainMenuOutsideWindows]).
+//
+// Whether a registrar owns its name is asked with a throw-away exporter.
+- (BOOL) _probeGlobalMenuRegistrar {
+    WaylandAppMenu *probe = [[WaylandAppMenu alloc] initWithDisplay: self exporting: YES];
+    BOOL present = [probe globalMenuPresent];
 
-// Asked once, with a throw-away exporter, because the answer decides whether the application exports its
-// menu at all.
-- (BOOL) _desktopShowsMainMenu {
-    if (!_desktopMenuProbed) {
-        _desktopMenuProbed = YES;
-        if (_appMenuManager != NULL) {
-            WaylandAppMenu *probe = [[WaylandAppMenu alloc] initWithDisplay: self exporting: YES];
-
-            _desktopMenuPresent = [probe globalMenuPresent];
-            [probe release];
-        }
-    }
-    return _desktopMenuPresent;
+    [probe release];
+    return present;
 }
 
 // The menu is exported for the desktop's global menu unless the windows carry it as strips. The menu bar
@@ -1860,7 +1594,7 @@ static NSUInteger utf16OffsetOfUTF8Offset(NSString *text, int byteOffset) {
     if (_appMenu == nil) {
         BOOL strips = [NSWindow _usesInWindowMenuBar];
 
-        if (strips && _layerShell == NULL)
+        if (strips && !_CGSNativeConnectionPlacesMenuBar())
             return;
         _appMenu = [[WaylandAppMenu alloc] initWithDisplay: self exporting: !strips];
     }
@@ -1915,21 +1649,14 @@ static NSUInteger utf16OffsetOfUTF8Offset(NSString *text, int byteOffset) {
         CFArrayRemoveValueAtIndex(_windows, index);
         CFArrayInsertValueAtIndex(_windows, 0, window);
     }
+    // The window system window keeps the order of the windows too (see -[CGSWindow orderToplevelAbove:]).
+    [window activatedInWindowSystem];
     _CGSNativeConnectionPointerLockTargetChanged();
 }
 
 - (void) windowUnmapped: (WaylandWindow *) window {
-    // The compositor reparents the window's transient children itself.
-    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++) {
-        WaylandWindow *other = (WaylandWindow *) CFArrayGetValueAtIndex(_windows, i);
-        if ([other levelParent] == window)
-            [other levelParentUnmapped];
-    }
     // The window to lock the pointer to may be another one now (after the window is gone from the list).
     [self performAfterDispatch: ^{ _CGSNativeConnectionPointerLockTargetChanged(); }];
-    if (_textInputWindow == window)
-        [self textInputLeft];
-    [_draggingManager windowUnmapped: window];
     if (_dragPressWindow == window) [self consumeDragPress];
     if (_pointerWindow == window) {
         _pointerWindow = nil;
@@ -1959,345 +1686,53 @@ static NSUInteger utf16OffsetOfUTF8Offset(NSString *text, int byteOffset) {
         CFArrayRemoveValueAtIndex(_windows, index);
 }
 
-// Most recently activated first; Wayland doesn't expose the stacking order.
+// The window numbers of this app's windows, frontmost first: the window system window keeps the order, which on Wayland
+// is the one the windows were activated in (the stacking order is not exposed), and lists them in the order
+// CGWindowListCopyWindowInfo lists them in.
 - (NSArray *) orderedWindowNumbers {
-    NSMutableArray *result = [NSMutableArray array];
-    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++) {
-        WaylandWindow *window =
-                (WaylandWindow *) CFArrayGetValueAtIndex(_windows, i);
-        if ([window isOrderedIn])
-            [result addObject: @([window windowNumber])];
-    }
-    return result;
+    // A window gets its number, and so its place in the registry that maps numbers back to windows, when it is first
+    // asked for it; the numbers CoreGraphics lists have to be known by then.
+    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++)
+        [(WaylandWindow *) CFArrayGetValueAtIndex(_windows, i) windowNumber];
+    return _CGSOrderedToplevelWindowIDs();
 }
 
 #pragma mark - Cursors
 
-// The output scale must be applied exactly once. wl_surface.set_buffer_scale is the
-// one mechanism every compositor applies to a cursor surface; a wp_viewport
-// destination is not (Hyprland derives the logical size from buffer size / buffer
-// scale and ignores it, wlroots honours it). A raster pinned to buffer_scale 1 and
-// cropped by a viewport therefore shows 2x too large on a 2x Hyprland. So the raster is
-// made at the next whole scale and tagged with it; the compositor scales it down
-// to a fractional output. Without a fractional-scale manager, or without
-// set_buffer_scale, the compositor owns the scaling: hand over a 1x raster.
-- (uint32_t) cursorRenderScale120 {
-    // set_buffer_scale needs wl_surface v3.
-    if (!_cursorFractionalScale || _compositorVersion < 3) return 120;
-    return WaylandCursorBufferScale120(
-            _cursorPreferredScale120 ?: (_pointerWindow ? [_pointerWindow renderScale120] : 120));
-}
-- (void) preferredScaleChanged: (uint32_t) scale120 {
-    if (!_cursorFractionalScale || !scale120 || scale120 == _cursorPreferredScale120) return;
-    _cursorPreferredScale120 = scale120;
-    if (_applyingCursor) { _cursorApplyPending = YES; return; }
-    if (_cursorApplyQueued) return;
-    _cursorApplyQueued = YES;
-    [self performAfterDispatch: ^{ self->_cursorApplyQueued = NO; [self applyCursor]; }];
-}
+// The cursor of the process is CoreGraphics' (see CGSCursor.h): it gives the one NSCursor selected (or none, which is
+// the arrow) to the pointer, at the scale of the output, on every enter, and keeps it hidden while the process hid it.
+// What only this display knows is the window decoration the pointer is over: it shows the arrow, and the cursor the
+// application selected is selected again when the pointer is over the content.
+- (void) syncDecorationCursor {
+    BOOL decoration = _pointerWindow != nil && [_pointerWindow isDecorationPoint: _pointerSurfacePoint];
 
-- (struct wl_proxy *) imageCursorBufferForScale120: (uint32_t) scale120 cursor: (WaylandCursor *) cursor {
-    if (_imageCursorBuffer != NULL && _imageCursorBufferScale120 != scale120) {
-        union wl_argument none[1] = {{.o = NULL}};
-        WaylandMarshal(_imageCursorBuffer, WP_BUFFER_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, none);
-        _imageCursorBuffer = NULL;
-    }
-    if (_imageCursorBuffer != NULL)
-        return _imageCursorBuffer;
-    NSData *pixels = [cursor pixelsForScale120: scale120];
-    // Rendering an NSImage can select a different cursor or dispatch input.
-    // Never install that obsolete result as the active cursor buffer.
-    if (_cursorApplyPending || cursor != _cursor || pixels == nil)
-        return NULL;
-
-    NSSize dimensions = [cursor pixelSizeForScale120: scale120];
-    _imageCursorBuffer = [self newARGBBuffer: pixels pixelSize: dimensions];
-    _imageCursorBufferScale120 = scale120;
-    return _imageCursorBuffer;
-}
-
-- (struct wl_proxy *) newARGBBuffer: (NSData *) pixels pixelSize: (NSSize) dimensions {
-    double width = dimensions.width, height = dimensions.height;
-    if (!isfinite(width) || !isfinite(height) || width < 1 || height < 1 ||
-        width != floor(width) || height != floor(height) ||
-        width > INT32_MAX / 4 || height > INT32_MAX / (width * 4) ||
-        [pixels length] != (NSUInteger) (width * height * 4)) return NULL;
-    size_t size = [pixels length];
-    int fd = WaylandCreateAnonymousFile(size);
-    if (fd < 0)
-        return NULL;
-    void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) {
-        close(fd);
-        return NULL;
-    }
-    memcpy(data, [pixels bytes], size);
-    // Immutable storage: the queued request owns a duplicate of fd and the
-    // compositor keeps its mapping. We never rewrite pixels still in use.
-    munmap(data, size);
-    union wl_argument poolArgs[3] = {{.o = NULL}, {.h = fd}, {.i = (int32_t) size}};
-    struct wl_proxy *pool = WaylandCreateObject(_shm, WP_SHM_CREATE_POOL,
-                                                &wl_shm_pool_interface, poolArgs, 0, nil);
-    close(fd);
-    union wl_argument bufferArgs[6] = {{.o = NULL}, {.i = 0},
-        {.i = (int32_t) width}, {.i = (int32_t) height},
-        {.i = (int32_t) width * 4}, {.u = WP_SHM_FORMAT_ARGB8888}};
-    struct wl_proxy *buffer = WaylandCreateObject(pool, WP_SHM_POOL_CREATE_BUFFER,
-            &wl_buffer_interface, bufferArgs, 0, nil);
-    union wl_argument none[1] = {{.o = NULL}};
-    WaylandMarshal(pool, WP_SHM_POOL_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, none);
-    return buffer;
-}
-
-// The freedesktop names WaylandCursor looks up, and the matching wp_cursor_shape_device_v1.shape.
-// Names that are not in this table (a custom NSImage, for example) use the default shape.
-static uint32_t CursorShapeForCursor(WaylandCursor *cursor) {
-    static const struct { const char *name; uint32_t shape; } shapes[] = {
-            {"default", WP_CURSOR_SHAPE_DEFAULT},
-            {"grabbing", WP_CURSOR_SHAPE_GRABBING},
-            {"crosshair", WP_CURSOR_SHAPE_CROSSHAIR},
-            {"text", WP_CURSOR_SHAPE_TEXT},
-            {"vertical-text", WP_CURSOR_SHAPE_VERTICAL_TEXT},
-            {"zoom-in", WP_CURSOR_SHAPE_ZOOM_IN},
-            {"zoom-out", WP_CURSOR_SHAPE_ZOOM_OUT},
-            {"grab", WP_CURSOR_SHAPE_GRAB},
-            {"pointer", WP_CURSOR_SHAPE_POINTER},
-            {"s-resize", WP_CURSOR_SHAPE_S_RESIZE},
-            {"w-resize", WP_CURSOR_SHAPE_W_RESIZE},
-            {"ew-resize", WP_CURSOR_SHAPE_EW_RESIZE},
-            {"e-resize", WP_CURSOR_SHAPE_E_RESIZE},
-            {"n-resize", WP_CURSOR_SHAPE_N_RESIZE},
-            {"ns-resize", WP_CURSOR_SHAPE_NS_RESIZE},
-            {"nw-resize", WP_CURSOR_SHAPE_NW_RESIZE},
-            {"ne-resize", WP_CURSOR_SHAPE_NE_RESIZE},
-            {"se-resize", WP_CURSOR_SHAPE_SE_RESIZE},
-            {"sw-resize", WP_CURSOR_SHAPE_SW_RESIZE},
-            {"nwse-resize", WP_CURSOR_SHAPE_NWSE_RESIZE},
-            {"nesw-resize", WP_CURSOR_SHAPE_NESW_RESIZE},
-    };
-    const char *const *names = cursor != nil ? [cursor names] : NULL;
-    for (int i = 0; names != NULL && names[i] != NULL; i++)
-        for (size_t j = 0; j < sizeof(shapes) / sizeof(shapes[0]); j++)
-            if (strcmp(names[i], shapes[j].name) == 0)
-                return shapes[j].shape;
-    return WP_CURSOR_SHAPE_DEFAULT;
-}
-
-- (void) updateCursorShapeDevice {
-    if (_cursorShapeManager != NULL && _pointer != NULL && _cursorShapeDevice == NULL) {
-        union wl_argument args[2] = {{.o = NULL}, {.o = (struct wl_object *) _pointer}};
-        _cursorShapeDevice = WaylandCreateObject(_cursorShapeManager,
-                                                 WP_CURSOR_SHAPE_MANAGER_GET_POINTER,
-                                                 &wp_cursor_shape_device_v1_interface,
-                                                 args, 0, nil);
-        // The current cursor was set with wl_pointer.set_cursor before the manager existed.
-        if (_cursorShapeDevice != NULL)
-            [self performAfterDispatch: ^{ [self applyCursor]; }];
-    } else if ((_cursorShapeManager == NULL || _pointer == NULL) && _cursorShapeDevice != NULL) {
-        // A device whose pointer went away is inert; there is nothing to send it.
-        WaylandMarshal(_cursorShapeDevice, WP_CURSOR_SHAPE_DEVICE_DESTROY, NULL,
-                       WL_MARSHAL_FLAG_DESTROY, NULL);
-        _cursorShapeDevice = NULL;
-    }
-}
-
-- (void) applyCursorSnapshot: (WaylandCursor *) cursor {
-    if (_pointer == NULL || _pointerEnterSerial == 0)
+    if (decoration == _cursorOverDecoration)
         return;
-
-    struct wl_proxy *pointer = _pointer, *surface = _cursorSurface;
-    uint32_t serial = _pointerEnterSerial;
-    WaylandWindow *window = _pointerWindow;
-    CGPoint point = _pointerSurfacePoint;
-    union wl_argument args[4];
-    args[0].u = serial;
-
-    BOOL decoration = [_pointerWindow isDecorationPoint: _pointerSurfacePoint];
-    if (!decoration && ([cursor isBlank] || _CGSNativeConnectionCursorHidden())) {
-        args[1].o = NULL;
-        args[2].i = 0;
-        args[3].i = 0;
-        WaylandMarshal(_pointer, WP_POINTER_SET_CURSOR, NULL, 0, args);
-        [self flush];
-        return;
-    }
-    // A named cursor needs neither a cursor surface nor a theme: the compositor draws the shape.
-    // The protocol requires the latest wl_pointer.enter serial, which is the one kept for the
-    // surface cursor too.
-    if (_cursorShapeDevice != NULL) {
-        union wl_argument shapeArgs[2] = {{.u = serial}, {.u = CursorShapeForCursor(cursor)}};
-        WaylandMarshal(_cursorShapeDevice, WP_CURSOR_SHAPE_DEVICE_SET_SHAPE, NULL, 0, shapeArgs);
-        [self flush];
-        return;
-    }
-    if (_cursorSurface == NULL)
-        return;
-
-    uint32_t scale120 = [self cursorRenderScale120];
-    int32_t wireScale = (int32_t)(scale120 / 120);
-    struct wl_proxy *buffer = decoration ? NULL : [self imageCursorBufferForScale120: scale120 cursor: cursor];
-    if (_cursorApplyPending || cursor != _cursor || pointer != _pointer ||
-        surface != _cursorSurface || serial != _pointerEnterSerial ||
-        window != _pointerWindow || !CGPointEqualToPoint(point, _pointerSurfacePoint) ||
-        decoration != [_pointerWindow isDecorationPoint: _pointerSurfacePoint] ||
-        scale120 != [self cursorRenderScale120]) {
-        _cursorApplyPending = YES;
-        return;
-    }
-    NSSize logical = [cursor size];
-    NSPoint hotSpot = [cursor hotSpot];
-    if (buffer == NULL) {
-        if (WL.hasCursor && _cursorThemeScale120 != scale120) {
-            const char *sizeString = getenv("XCURSOR_SIZE");
-            long nominal = sizeString ? strtol(sizeString, NULL, 10) : 24;
-            if (nominal <= 0 || nominal > INT32_MAX) nominal = 24;
-            int32_t requested;
-            struct wl_cursor_theme *theme = WaylandScaleExtent((int32_t)nominal, scale120, INT32_MAX, &requested)
-                ? WL.wl_cursor_theme_load(getenv("XCURSOR_THEME"), requested, (struct wl_shm *)_shm) : NULL;
-            if (theme != NULL) {
-                if (_cursorTheme != NULL) WL.wl_cursor_theme_destroy(_cursorTheme);
-                _cursorTheme = theme; _cursorThemeScale120 = scale120;
+    _cursorOverDecoration = decoration;
+    [self performAfterDispatch: ^{
+        if (self->_cursorOverDecoration) {
+            CGSCursorRef arrow = CGSCursorCreateWithShape(kCGSCursorShapeArrow);
+            CGSCursorSetCurrent(arrow);
+            CGSCursorRelease(arrow);
+        } else {
+            // Selects what the application's cursor stack ends in, with the stack as it was.
+            NSCursor *current = [NSCursor currentCursor];
+            if (current != nil) {
+                [current push];
+                [current pop];
+            } else {
+                CGSCursorSetCurrent(NULL);
             }
         }
-        if (_cursorTheme == NULL)
-            return;
-        static const char *const arrowNames[] = {"default", "left_ptr", NULL};
-        const char *const *names = !decoration && cursor ? [cursor names] : arrowNames;
-        struct wl_cursor *cursor = NULL;
-        for (int i = 0; cursor == NULL && names[i] != NULL; i++)
-            cursor = WL.wl_cursor_theme_get_cursor(_cursorTheme, names[i]);
-        for (int i = 0; cursor == NULL && arrowNames[i] != NULL; i++)
-            cursor = WL.wl_cursor_theme_get_cursor(_cursorTheme, arrowNames[i]);
-        if (cursor == NULL || cursor->image_count == 0)
-            return;
-
-        struct wl_cursor_image *image = cursor->images[0];
-        buffer = (struct wl_proxy *) WL.wl_cursor_image_get_buffer(image);
-        if (buffer == NULL)
-            return;
-        if (!image->width || !image->height || image->width > INT32_MAX || image->height > INT32_MAX) return;
-        // The theme was loaded at the nominal size times the whole scale: the
-        // surface is tagged with that scale, so the logical size and the hotspot
-        // are the image's divided by it. A theme without that exact size hands
-        // back its nearest one, which the scale may not divide.
-        wireScale = WaylandCursorWireScale((int32_t)image->width, (int32_t)image->height,
-                                           (int32_t)(_cursorThemeScale120 / 120));
-        logical = NSMakeSize(image->width / wireScale, image->height / wireScale);
-        hotSpot = NSMakePoint(image->hotspot_x / wireScale, image->hotspot_y / wireScale);
-    }
-
-    if (_compositorVersion >= 3) {
-        union wl_argument scaleArgs[1] = {{.i = wireScale}};
-        WaylandMarshal(_cursorSurface, WP_SURFACE_SET_BUFFER_SCALE, NULL, 0, scaleArgs);
-    }
-
-    union wl_argument attach[3] = {{.o = (struct wl_object *) buffer}, {.i = 0}, {.i = 0}};
-    WaylandMarshal(_cursorSurface, WP_SURFACE_ATTACH, NULL, 0, attach);
-    union wl_argument damage[4] = {{.i = 0}, {.i = 0},
-                                   {.i = (int32_t)logical.width},
-                                   {.i = (int32_t)logical.height}};
-    WaylandMarshal(_cursorSurface, WP_SURFACE_DAMAGE, NULL, 0, damage);
-    union wl_argument none[1] = {{.o = NULL}};
-    WaylandMarshal(_cursorSurface, WP_SURFACE_COMMIT, NULL, 0, none);
-
-    args[1].o = (struct wl_object *) _cursorSurface;
-    args[2].i = (int32_t) hotSpot.x;
-    args[3].i = (int32_t) hotSpot.y;
-    WaylandMarshal(_pointer, WP_POINTER_SET_CURSOR, NULL, 0, args);
-    [self flush];
-}
-
-- (void) applyCursor {
-    if (_applyingCursor) { _cursorApplyPending = YES; return; }
-    _applyingCursor = YES;
-    // Keep the image receiver alive even if drawing changes the display cursor.
-    WaylandCursor *cursor = [_cursor retain];
-    WaylandWindow *window = [_pointerWindow retain];
-    @try { [self applyCursorSnapshot: cursor]; }
-    @finally {
-        [window release];
-        [cursor release];
-        _applyingCursor = NO;
-        if (_cursorApplyPending) {
-            _cursorApplyPending = NO;
-            if (!_cursorApplyQueued) {
-                _cursorApplyQueued = YES;
-                [self performAfterDispatch: ^{
-                    self->_cursorApplyQueued = NO;
-                    [self applyCursor];
-                }];
-            }
-        }
-    }
-}
-
-// Names from the freedesktop cursor specification, then the older X11 names.
-- (id) cursorWithName: (NSString *) name {
-    static const struct {
-        NSString *name;
-        const char *cursor, *fallback;
-    } names[] = {
-            {@"arrowCursor", "default", "left_ptr"},
-            {@"closedHandCursor", "grabbing", "hand3"},
-            {@"crosshairCursor", "crosshair", "cross"},
-            {@"IBeamCursor", "text", "xterm"},
-            {@"IBeamCursorForVerticalLayout", "vertical-text", "xterm"},
-            {@"zoomInCursor", "zoom-in", "left_ptr"},
-            {@"zoomOutCursor", "zoom-out", "left_ptr"},
-            {@"openHandCursor", "grab", "fleur"},
-            {@"pointingHandCursor", "pointer", "hand2"},
-            {@"resizeDownCursor", "s-resize", "bottom_side"},
-            {@"resizeLeftCursor", "w-resize", "left_side"},
-            {@"resizeLeftRightCursor", "ew-resize", "h_double_arrow"},
-            {@"resizeRightCursor", "e-resize", "right_side"},
-            {@"resizeUpCursor", "n-resize", "top_side"},
-            {@"resizeUpDownCursor", "ns-resize", "v_double_arrow"},
-            {@"frameResizeNorthWestCursor", "nw-resize", "top_left_corner"},
-            {@"frameResizeNorthEastCursor", "ne-resize", "top_right_corner"},
-            {@"frameResizeSouthEastCursor", "se-resize", "bottom_right_corner"},
-            {@"frameResizeSouthWestCursor", "sw-resize", "bottom_left_corner"},
-            {@"frameResizeNorthWestSouthEastCursor", "nwse-resize", "fd_double_arrow"},
-            {@"frameResizeNorthEastSouthWestCursor", "nesw-resize", "bd_double_arrow"},
-    };
-
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
-        if ([name isEqualToString: names[i].name])
-            return [[[WaylandCursor alloc] initWithName: names[i].cursor
-                                               fallback: names[i].fallback]
-                    autorelease];
-    return [[[WaylandCursor alloc] initWithName: "default" fallback: "left_ptr"]
-            autorelease];
-}
-
-- (id) cursorWithImage: (NSImage *) image hotSpot: (NSPoint) hotSpot {
-    WaylandCursor *cursor = [[[WaylandCursor alloc] initWithImage: image hotSpot: hotSpot] autorelease];
-    return cursor != nil ? cursor : [self cursorWithName: @"arrowCursor"];
-}
-
-- (void) setCursor: (id) cursor {
-    if (![cursor isKindOfClass: [WaylandCursor class]])
-        return;
-    // Retain first: AppKit can select the currently active cursor again.
-    [cursor retain];
-    if (cursor != _cursor && _imageCursorBuffer != NULL) {
-        union wl_argument none[1] = {{.o = NULL}};
-        WaylandMarshal(_imageCursorBuffer, WP_BUFFER_DESTROY, NULL,
-                        WL_MARSHAL_FLAG_DESTROY, none);
-        _imageCursorBuffer = NULL;
-    }
-    [_cursor release];
-    _cursor = cursor;
-    [self applyCursor];
+    }];
 }
 
 #pragma mark - Clipboard, drag and drop, input state and unsupported calls
 
+// Drag and drop is CoreGraphics' (the data device of its connection); this is the manager on top of it.
 - (NSDraggingManager *) draggingManager {
-    if (_draggingManager == nil)
-        _draggingManager = [[WaylandDraggingManager alloc] initWithDisplay: self];
-    return _draggingManager;
+    return [NSCGSDraggingManager sharedManager];
 }
-- (struct wl_proxy *) dragDataDevice { return [_dataDevice dataDevice]; }
 - (void) consumeDragPress {
     [_dragPressEvent release]; _dragPressEvent = nil;
     _dragPressWindow = nil; _dragPressSerial = 0;
@@ -2333,38 +1768,7 @@ static uint32_t CursorShapeForCursor(WaylandCursor *cursor) {
 
 #pragma mark - Activation
 
-// Wayland has no protocol to activate another client's window: the request goes
-// to the process, as a Darwin notification that its own backend answers with
-// -requestActivation (see _CGSActivateProcess).
-- (BOOL) activateProcessIdentifier: (pid_t) processIdentifier {
-    if (processIdentifier <= 0 || processIdentifier == getpid())
-        return NO;
-    return _CGSActivateProcess(processIdentifier, kCGSActivateProcessFrontWindowOnly) ==
-           kCGErrorSuccess;
-}
-
-// The window an activation request is for: the key window, else the main window,
-// else the window that was active most recently.
-- (WaylandWindow *) windowForActivation {
-    NSWindow *candidates[] = {[NSApp keyWindow], [NSApp mainWindow]};
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-        id platform = [candidates[i] platformWindow];
-        if ([platform isKindOfClass: [WaylandWindow class]] && [platform isMapped] &&
-            ![platform isPopup])
-            return platform;
-    }
-    for (CFIndex i = 0; i < CFArrayGetCount(_windows); i++) {
-        WaylandWindow *window = (WaylandWindow *) CFArrayGetValueAtIndex(_windows, i);
-        if ([window isMapped] && ![window isPopup])
-            return window;
-    }
-    return nil;
-}
-
-// Asks the compositor, through xdg-activation, to focus one of our windows. The
-// compositor decides: it may only mark the window as wanting attention. The token
-// carries the serial of the last input event when there is one, because
-// compositors refuse requests that cannot be tied to user input.
+// Whether the display is mapping the windows that were held back for an activation.
 - (BOOL) mappingForActivation {
     return _mappingForActivation;
 }
@@ -2384,80 +1788,6 @@ static uint32_t CursorShapeForCursor(WaylandCursor *cursor) {
 
 - (void) applicationBecameActive: (NSNotification *) notification {
     [self mapDeferredWindows];
-}
-
-- (void) requestActivation {
-    if (_activation == NULL || _activationToken != NULL)
-        return;
-    // An application that is asked to activate shows the windows it was holding back.
-    [self mapDeferredWindows];
-    WaylandWindow *window = [self windowForActivation];
-    [self requestActivationOf: window from: window];
-}
-
-// The same request for a given window, for instance one the compositor was asked to minimize. The
-// requesting surface the token names (xdg-activation set_surface) is not the surface to activate:
-// it is the key or main window, when there is another one that is shown. GUESS: with none the token
-// names no surface, which the protocol allows and some compositors refuse. Returns whether a
-// request was made; one is not while another waits for its token, and then nothing was asked.
-- (BOOL) requestActivationOfWindow: (WaylandWindow *) window {
-    NSWindow *candidates[] = {[NSApp keyWindow], [NSApp mainWindow]};
-    WaylandWindow *requester = nil;
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]) && requester == nil; i++) {
-        id platform = [candidates[i] platformWindow];
-        if ([platform isKindOfClass: [WaylandWindow class]] && platform != window &&
-            [platform isMapped] && ![platform isPopup] && ![platform isMiniaturized])
-            requester = platform;
-    }
-    return [self requestActivationOf: window from: requester];
-}
-
-- (BOOL) requestActivationOf: (WaylandWindow *) window from: (WaylandWindow *) requester {
-    if (_activation == NULL || _activationToken != NULL)
-        return NO;
-    struct wl_proxy *surface = [window surface];
-    if (surface == NULL)
-        return NO;
-
-    union wl_argument none[1] = {{.o = NULL}};
-    _activationToken = WaylandCreateObject(_activation, WP_ACTIVATION_GET_TOKEN,
-                                           &xdg_activation_token_v1_interface, none,
-                                           WaylandObjectActivationToken, self);
-    if (_inputSerial != 0 && _seat != NULL) {
-        union wl_argument serial[2] = {{.u = _inputSerial}, {.o = (struct wl_object *) _seat}};
-        WaylandMarshal(_activationToken, WP_ACTIVATION_TOKEN_SET_SERIAL, NULL, 0, serial);
-    }
-    struct wl_proxy *requesting = [requester surface];
-    if (requesting != NULL) {
-        union wl_argument forSurface[1] = {{.o = (struct wl_object *) requesting}};
-        WaylandMarshal(_activationToken, WP_ACTIVATION_TOKEN_SET_SURFACE, NULL, 0, forSurface);
-    }
-    WaylandMarshal(_activationToken, WP_ACTIVATION_TOKEN_COMMIT, NULL, 0, NULL);
-    _activationWindow = [window retain];
-    [self flush];
-    return YES;
-}
-
-- (void) cancelActivationRequest {
-    if (_activationToken != NULL) {
-        WaylandMarshal(_activationToken, WP_ACTIVATION_TOKEN_DESTROY, NULL,
-                       WL_MARSHAL_FLAG_DESTROY, NULL);
-        _activationToken = NULL;
-    }
-    [_activationWindow release];
-    _activationWindow = nil;
-}
-
-- (void) activationTokenDone: (const char *) token {
-    WaylandWindow *window = _activationWindow;
-    struct wl_proxy *surface = [window isInvalidated] ? NULL : [window surface];
-
-    if (_activation != NULL && surface != NULL) {
-        union wl_argument args[2] = {{.s = token}, {.o = (struct wl_object *) surface}};
-        WaylandMarshal(_activation, WP_ACTIVATION_ACTIVATE, NULL, 0, args);
-    }
-    [self cancelActivationRequest];
-    [self flush];
 }
 
 @end

@@ -16,7 +16,14 @@
  You should have received a copy of the GNU General Public License
  along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include <dispatch/dispatch.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <math.h>
 #import <CoreGraphics/CGSConnection.h>
 #import <CoreGraphics/CoreGraphicsPrivate.h>
@@ -30,7 +37,50 @@
 #import <CoreGraphics/CGDisplayConfiguration.h>
 #import "CGDisplayReconfiguration.h"
 
+// The counter the window ids of all processes come from. A window id is the window server's name for a window: it is
+// the window's NSWindow number and its kCGWindowNumber, and other processes list the window under it, so two processes
+// must never give the same id. The processes share a counter in a file the container keeps (it is mapped, and advanced
+// with atomic operations). Without the file, a process counts on its own.
+static _Atomic uint32_t* sharedWindowIDCounter(void)
+{
+	static _Atomic uint32_t* counter;
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		int fd = open("/var/run/.cgs-window-id", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644);
+		if (fd < 0)
+			return;
+		struct stat st;
+		if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || (st.st_size < (off_t) sizeof(uint32_t) &&
+				ftruncate(fd, 4096) != 0))
+		{
+			close(fd);
+			return;
+		}
+		void* memory = mmap(NULL, sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		close(fd);
+		if (memory != MAP_FAILED)
+			counter = (_Atomic uint32_t*) memory;
+	});
+	return counter;
+}
+
 @implementation CGSConnection
+-(CGSWindowID) _allocateWindowID
+{
+	_Atomic uint32_t* shared = sharedWindowIDCounter();
+	if (shared == NULL)
+		return _nextWindowId++;
+
+	// 1 ... INT32_MAX; a window id stays positive when it is read as a signed number, and never repeats while the
+	// counter is not exhausted.
+	uint32_t last = atomic_load(shared), next;
+	do
+		next = last >= INT32_MAX || last == 0 ? 1 : last + 1;
+	while (!atomic_compare_exchange_weak(shared, &last, next));
+	return next;
+}
+
 -(instancetype) initWithConnectionID:(CGSConnectionID)connId
 {
 	_nextWindowId = 1;
@@ -66,6 +116,7 @@
 -(void) dealloc
 {
 	[_screens release];
+	[_cursor release];
 	[_reportedScreens release];
 	[_windows release];
 	[super dealloc];
@@ -235,6 +286,32 @@ extern void _CGSPostHotKeyEvent(CGSConnectionID connection, int uid, BOOL presse
 		[self cursorHiddenStateChanged: NO];
 }
 
+-(void) setCursor:(CGSCursor*)cursor
+{
+	@synchronized (self)
+	{
+		if (cursor != _cursor)
+		{
+			[cursor retain];
+			[_cursor release];
+			_cursor = cursor;
+		}
+	}
+	[self cursorChanged];
+}
+
+-(CGSCursor*) cursor
+{
+	@synchronized (self)
+	{
+		return [[_cursor retain] autorelease];
+	}
+}
+
+-(void) cursorChanged
+{
+}
+
 -(BOOL) cursorIsVisible
 {
 	@synchronized (self)
@@ -325,6 +402,32 @@ extern void _CGSPostHotKeyEvent(CGSConnectionID connection, int uid, BOOL presse
 	return NO;
 }
 
+-(BOOL) carriesApplicationMenuAddress
+{
+	return NO;
+}
+
+-(BOOL) placesMenuBar
+{
+	return NO;
+}
+
+-(BOOL) globalMenuAvailable
+{
+	@synchronized (self)
+	{
+		return _globalMenuAvailable;
+	}
+}
+
+-(void) setGlobalMenuAvailable:(BOOL) available
+{
+	@synchronized (self)
+	{
+		_globalMenuAvailable = available;
+	}
+}
+
 -(void) pointerWindowsChanged
 {
 }
@@ -341,6 +444,16 @@ extern void _CGSPostHotKeyEvent(CGSConnectionID connection, int uid, BOOL presse
 -(id) waylandColorManager
 {
 	return nil;
+}
+
+-(id) waylandRenderManager
+{
+	return nil;
+}
+
+-(BOOL) extendedDynamicRangeAvailable
+{
+	return NO;
 }
 
 -(BOOL) cancelsHiddenUntilMouseMoves
@@ -512,6 +625,11 @@ static CGDisplayChangeSummaryFlags changeFlags(CGSScreen* before, CGSScreen* aft
 -(BOOL) supportsTranslucentToplevels
 {
 	return NO;
+}
+
+-(NSArray<NSNumber*>*) orderedToplevelWindowIDs
+{
+	return @[];
 }
 
 -(void*) nativeDisplay

@@ -76,6 +76,8 @@ typedef enum {
     // before it saw the unmapping, and acknowledging those is a protocol error: only the last one, the
     // answer to the empty commit, is acknowledged, when the unmapping is over.
     BOOL _unmapping;
+    // The toplevel was unmapped by ordering it out; the compositor forgets its title, size limits and parent then.
+    BOOL _unmappedToplevel;
     BOOL _hasPendingConfigure;
     uint32_t _pendingConfigureSerial;
     // Per-surface color objects, when the compositor offers the protocols.
@@ -89,11 +91,88 @@ typedef enum {
     BOOL _activated;
     BOOL _usesContents; // a program draws into the window with -drawImage:atPoint: (it set a style)
     BOOL _displayOverlay; // -becomeDisplayOverlay: made this window the cover of a display
+
+    // A toplevel window of the UI layer (see CGSWindow.h, -[CGSConnection newToplevelWindowWithAttributes:]): the
+    // UI layer says what the window is and when it is shown, the window system's objects follow. The role is made
+    // when the window is shown, from the hints, and is destroyed when the window is hidden.
+    BOOL _ui;
+    CGRect _uiFrame; // in the space of -setToplevelFrame:
+    CGSToplevelHints _uiHints;
+    CGSize _uiMinimumSize, _uiMaximumSize;
+    BOOL _uiLimitsSet;
+    // Who draws the window's frame, as asked: 0 not asked, 1 the compositor, 2 the client, 3 asked to leave it open.
+    int _uiDecorationRequest;
+    // What the compositor said about the frame, once it said.
+    BOOL _uiDecorationReported, _uiClientDecorated;
+    // The window's frame drawn by the UI layer inside the surface: where the content starts, in points from the top left
+    // corner of the surface.
+    CGPoint _uiContentOffset;
+    // The address of the window's application menu (see -setToplevelApplicationMenuServiceName:objectPath:) and the
+    // org_kde_kwin_appmenu object that tells the compositor, while the window is a toplevel and there is a manager.
+    NSString *_uiMenuService, *_uiMenuPath;
+    struct wl_proxy *_uiAppMenu;
+    // What the window shows of a title bar and who draws the frame (see -setToplevelTitlebarKind:), and the frame the
+    // UI layer draws inside the surface (see -setToplevelClientDecorationLayout:).
+    CGSToplevelTitlebarKind _uiTitlebarKind;
+    BOOL _uiPrefersClientDecoration;
+    BOOL _uiHasDecorationLayout;
+    CGSToplevelDecorationLayout _uiDecorationLayout;
+    uint32_t _uiPopupGrabSerial;
+    uint32_t _uiRepositionToken;
+    // What the events of the configure sequence in progress said.
+    CGSToplevelConfigure _uiPending;
+    BOOL _uiMinimizeAdvertised;
+    BOOL _uiIgnoresMouse;
+    // The compositor's first configure of the role was acknowledged: content may be attached.
+    BOOL _uiConfigured;
+    // alpha-modifier-v1's object for the surface, and the opacity the UI layer asked for.
+    struct wl_proxy *_alphaModifier;
+    CGFloat _uiAlpha;
+    BOOL _uiAlphaSet;
+
+    // Relation, order, focus, minimizing and fullscreen of the window (see CGSWindow.h). What the compositor said of the
+    // window is kept as of the configure that said it; what the UI layer asked for is kept as asked.
+    int _uiLevel;
+    BOOL _uiStacksByLevel;
+    // Ordered in by the UI layer but kept from the compositor (see -setToplevelHeldBack:).
+    BOOL _uiHeldBack;
+    // The order the process knows of its windows: the window activated or ordered to the front last comes first, the
+    // others follow in the order they were made (see -[CGSConnectionWayland orderedToplevelWindowIDs]).
+    uint64_t _orderStamp, _creationStamp;
+    BOOL _uiActivated, _uiSuspended;
+    BOOL _uiMinimized;
+    // Fullscreen: what was asked for, what the compositor said, and whether a change waits for its answer.
+    BOOL _uiFullscreenRequested, _uiFullscreen, _uiFullscreenSettling;
+    NSUInteger _uiSettleToken;
 }
+
+- (instancetype) initToplevelWithAttributes: (const CGSToplevelAttributes *) attributes
+                                 connection: (CGSConnection *) connection
+                                   windowID: (CGSWindowID) windowID;
 
 - (void) handleEvent: (uint32_t) opcode
                 kind: (CGSWaylandObjectKind) kind
            arguments: (union wl_argument *) args;
+
+// The order of the window among the process' windows (see the connection's -orderedToplevelWindowIDs): larger is further
+// in front. A window that was never ordered or activated is behind those that were, the older window in front.
+- (uint64_t) orderRank;
+// Whether the UI layer ordered the window in: shown, or held back from the compositor.
+- (BOOL) isOrderedIn;
+// Whether the window is a toplevel window of the UI layer (see CGSWindow.h).
+- (BOOL) isUIToplevel;
+// The window was asked to be activated through xdg-activation and the compositor did not minimize it any more (see
+// -[CGSConnectionWayland requestActivationOfWindow:from:]).
+- (BOOL) isMinimizedByRequest;
+// Whether the compositor minimizes toplevels when asked (see -miniaturizeToplevel).
+- (BOOL) compositorMinimizes;
+// A toplevel of this connection was hidden: windows that were related to it lose the relation, as the compositor
+// drops it.
+- (void) relatedToplevelHidden: (CGSWindowWayland *) hidden;
+// Asks the compositor to fullscreen the window on an output (a wl_output, NULL: its choice) or to leave fullscreen. The
+// UI layer chooses the output, as it knows what the window's surface entered (see -setToplevelFullscreen:force:, which lets
+// the compositor choose).
+- (CGError) setToplevelFullscreen: (BOOL) fullscreen onOutput: (struct wl_proxy *) output force: (BOOL) force;
 
 // The role the window has, CGSWaylandRoleNone before it is first used.
 - (CGSWaylandRole) role;
@@ -106,14 +185,54 @@ typedef enum {
 - (BOOL) isDocumentLike;
 // Makes a floating window a child of the current document window when it has none.
 - (void) updateLevelParent;
+- (void) mapFloatingWindowsAgain: (NSArray *) windows;
+- (void) restoreToplevelState;
 
 - (void) surfaceDestroyed: (CGSSurfaceWayland *) surface;
 // A wl_buffer of the window's contents was released (or not used any more) by the compositor.
 - (void) bufferReleased: (struct wl_proxy *) buffer opcode: (uint32_t) opcode;
 // A color global arrived after the window was made: create its per-surface objects now.
 - (void) colorManagerAvailable;
+- (void) renderManagerAvailable;
 // Where the window is, as far as the connection knows (the rect that was asked for).
 - (CGPoint) frameOrigin;
+// Where the window's content starts in the surface, when the UI layer draws the window's frame inside it (see
+// -setToplevelContentOffset:).
+- (CGPoint) toplevelContentOffset;
+// Whether the point of the surface (in points from its top left corner) is in the window's content and not in the frame
+// the UI layer draws around it.
+- (BOOL) toplevelContentContainsSurfacePoint: (CGPoint) point;
+
+// The window's objects of the window system, for the UI layer that owns the window's content and what the protocol
+// has beyond CGSWindow.h (the toplevel's fullscreen, parent and move requests, the objects that must be made
+// before the first commit); NULL while the window is not shown or has not that role. They are valid until the window is
+// ordered out, and are the UI layer's to use, not to destroy.
+- (struct wl_proxy *) xdgSurfaceProxy;
+- (struct wl_proxy *) toplevelProxy;
+- (struct wl_proxy *) popupProxy;
+- (struct wl_proxy *) layerSurfaceProxy;
+// The pop-up grab: the serial of the input event that entitles the pop-up to a grab, set before the window is shown (0:
+// no grab).
+- (void) setToplevelPopupGrabSerial: (uint32_t) serial;
+// Where the window's content starts inside its surface when the UI layer draws a frame of its own, in points from the
+// top left corner: pop-ups of the window are placed relative to the content.
+- (void) setToplevelContentOffset: (CGPoint) offset;
+// Tells the compositor where the window's application menu is, or that there is none (the appmenu manager came or went).
+- (void) applyApplicationMenu;
+// Replaces CGSWindow's -setToplevelFrame: for a frame the window system itself reported (the UI layer's window
+// follows it): remembers it without asking the window system for it.
+- (void) noteToplevelFrame: (CGRect) frame;
+// Tells the window system that the frame is not decided by the UI layer (the compositor's choice: used when the
+// window has no title bar).
+- (void) unsetToplevelDecoration;
+// A pointer button was pressed or released over the window's surface at a point of it (points from its top left corner):
+// whether it is the frame's (see -setToplevelClientDecorationLayout:), which then acts on a press of the left button with
+// the compositor's serial (resize, move, close, miniaturize, zoom) and takes the button.
+- (BOOL) handleToplevelDecorationButton: (uint32_t) button pressed: (BOOL) pressed serial: (uint32_t) serial atPoint: (CGPoint) point;
+// The alpha-modifier global arrived after the window was made: the window's opacity is told now.
+- (void) alphaModifierAvailable;
+// The opacity the window lists in CGWindowListCopyWindowInfo().
+- (CGFloat) listedAlpha;
 
 @end
 

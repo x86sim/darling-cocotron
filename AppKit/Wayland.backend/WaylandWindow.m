@@ -22,8 +22,13 @@
 #import "WaylandColor.h"
 #import "WaylandLibrary.h"
 #import "WaylandProtocol.h"
-#import "WaylandWindowLevel.h"
+#import "WaylandRender.h"
+#import "../DarlingWindowLevelPolicy.h"
+#import "../../CoreGraphics/Wayland.backend/CGSWindowWayland.h"
+#import <CoreGraphics/CGSServerSPI.h>
+#import <IOSurface/IOSurface.h>
 #import "../DarlingWindowPresentation.h"
+#import "../NSCGSInputMethod.h"
 #import <AppKit/NSApplication.h>
 #import <AppKit/NSColorSpace.h>
 #import <AppKit/NSScreen.h>
@@ -48,6 +53,12 @@
 #import "WaylandScale.h"
 #include <math.h>
 
+// Implemented by NSScreen for both screen outputs and compositor-preferred descriptions. Declared
+// here rather than in AppKit's public header because only this backend needs it.
+@interface NSScreen (WaylandColorDescription)
++ (NSColorSpace *) _colorSpaceFromDisplayColorInfo: (NSDictionary *) info;
+@end
+
 // NSView replaces the user CTM whenever it locks focus. Keep scaling in the
 // device transform, alongside Onyx2D's bottom-left to top-left conversion.
 @interface WaylandDrawingContext : O2Context_builtin_FT
@@ -69,6 +80,8 @@
 
 @implementation WaylandWindow
 
+static void WaylandWindowToplevelEvent(CGSWindow *window, const CGSToplevelEvent *event, void *info);
+
 static const CGFloat WaylandTitleHeight = 28;
 static const CGFloat WaylandBorder = 6;
 
@@ -84,6 +97,8 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     _delegate = delegate;
     _level = [delegate level];
     _styleMask = [delegate styleMask];
+    // Until NSWindow says what the window shows of a title bar, a titled window has a standard one.
+    _titlebarKind = (_styleMask & NSWindowStyleMaskTitled) ? kCGSToplevelTitlebarStandard : kCGSToplevelTitlebarNone;
     _backingType = (CGSBackingStoreType) [delegate backingType];
     _isOpaque = [delegate isOpaque];
     _deviceDictionary = [NSMutableDictionary new];
@@ -96,19 +111,47 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     _frame.size.width = MAX(_frame.size.width, 1.0);
     _frame.size.height = MAX(_frame.size.height, 1.0);
 
+    // The window system's window: its id is this window's number.
+    CGSToplevelAttributes attributes = {
+        .frame = NSRectToCGRect(_frame),
+        .unmanaged = NO,
+        .translucent = YES,
+    };
+    _cgsWindow = [_CGSNewToplevelWindow(&attributes) retain];
+    if (_cgsWindow == nil) {
+        NSLog(@"Wayland backend: CoreGraphics has no window to make for this window");
+        [self release];
+        return nil;
+    }
+    [_cgsWindow setToplevelEventProc: WaylandWindowToplevelEvent info: self];
+
     [_display windowCreated: self];
     return self;
+}
+
+// The window's number is the id of its CoreGraphics window.
+- (NSInteger) _assignedWindowNumber {
+    return _cgsWindow != nil ? (NSInteger) [_cgsWindow windowId] : 0;
 }
 
 - (void) dealloc {
     [self invalidate];
     [self destroySurface];
+    // CoreGraphics destroys the window system's window, with the surface.
+    [_cgsWindow setToplevelEventProc: NULL info: NULL];
+    [_inputMethod invalidate];
+    [_inputMethod release];
+    _inputMethod = nil;
+    if (_cgsWindow != nil)
+        CGSReleaseWindow(CGSMainConnectionID(), [_cgsWindow windowId]);
+    [_cgsWindow release];
     [_subwindows release];
     [_display release];
     [_deviceDictionary release];
     [_surfaceOutputs release];
     [_title release];
     [_sessionName release];
+    [_preferredColorSpace release];
     [super dealloc];
 }
 
@@ -116,6 +159,7 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     // Like X11Window, this can run several times.
     if (_invalidated) return;
     _invalidated = YES;
+    [_cgsWindow setToplevelHeldBack: NO];
     [_context release];
     _context = nil;
 
@@ -123,11 +167,25 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     _delegate = nil;
 
     [self unmap];
+    [_inputMethod invalidate];
+    [_inputMethod release];
+    _inputMethod = nil;
     if (_display != nil) {
         [_display windowDestroyed: self];
         // Children retain this window until their EGL surfaces are released.
         // Keep the native parent surface/display alive for that whole lifetime.
     }
+}
+
+// The window uses the window system's input method, which CoreGraphics runs, for the text of its first responder; what
+// it composes comes back as toplevel events (see -toplevelEvent:).
+- (void) updateInputMethodSpot {
+    if (_inputMethod == nil) {
+        if (_cgsWindow == nil || _invalidated || ![NSCGSInputMethod available])
+            return;
+        _inputMethod = [[NSCGSInputMethod alloc] initWithPlatformWindow: self cgsWindow: _cgsWindow];
+    }
+    [_inputMethod firstResponderChanged];
 }
 
 - (void) setDelegate: (id) delegate {
@@ -154,16 +212,23 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 
 - (struct wl_proxy *) ensureSurface {
     if (!_surface && !_invalidated) {
-        union wl_argument args[] = {{.o = NULL}};
-        _surface = WaylandCreateObject(_display->_compositor, WP_COMPOSITOR_CREATE_SURFACE,
-            &wl_surface_interface, args, WaylandObjectSurface, self);
+        // The wl_surface is the window system window's; this window listens to what it says of the outputs.
+        _surface = (struct wl_proxy *) [_cgsWindow nativeWindow];
+        if (_surface != NULL)
+            WL.wl_proxy_add_dispatcher(_surface, WaylandDispatch, (void *) (uintptr_t) WaylandObjectSurface, self);
         _fractionalScale = [_display newFractionalScaleForSurface: _surface owner: (id)self];
         if (_fractionalScale) {
             union wl_argument viewportArgs[] = {{.o = NULL}, {.o = (struct wl_object *)_surface}};
             _viewport = WaylandCreateObject(_display->_viewporter, WP_VIEWPORTER_GET_VIEWPORT,
                 &wp_viewport_interface, viewportArgs, 0, nil);
         }
+        WaylandColorManager *color = [_display colorManager];
+        if (color != nil && _surfaceFeedback == NULL)
+            _surfaceFeedback = [color newSurfaceFeedbackForSurface: _surface];
+        [[_display renderManager] observeSurface: _surface];
         [self updateSurfaceColorIfNeeded];
+        [self updateContentType];
+        [self updateShortcutsInhibitor];
     }
     return _surface;
 }
@@ -173,6 +238,8 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 - (NSColorSpace *) contentColorSpace {
     NSColorSpace *space = [_delegate respondsToSelector: @selector(colorSpace)]
                           ? [_delegate colorSpace] : nil;
+    if (space == nil)
+        space = _preferredColorSpace;
     if (space == nil)
         space = [[NSScreen screens] count] > 0 ? [[NSScreen mainScreen] colorSpace] : nil;
     return space != nil ? space : [NSColorSpace sRGBColorSpace];
@@ -189,8 +256,42 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     if (_representationSurface == NULL)
         _representationSurface = [color newRepresentationSurfaceForSurface: _surface];
     CGColorSpaceRef space = [[self contentColorSpace] CGColorSpace];
-    if (space != NULL)
-        [color setColorSpace: space onSurface: _colorSurface];
+    if (space == NULL)
+        return;
+    NSDictionary *preferred = _surfaceFeedback != NULL
+                              ? [color preferredInfoForFeedback: _surfaceFeedback] : nil;
+    WaylandColorHDRMetadata metadata = [color hdrMetadataForColorInfo: preferred space: space];
+    [color setColorSpace: space
+         renderingIntent: WP_COLOR_RENDER_INTENT_PERCEPTUAL
+              hdrMetadata: &metadata
+                onSurface: _colorSurface];
+}
+
+// The compositor's preferred image description for this surface changed. Use it for content whose
+// color space the application has not chosen, and pass its HDR metadata with the next description.
+- (void) preferredColorInfoChanged {
+    if (_invalidated)
+        return;
+    WaylandColorManager *color = [_display colorManager];
+    NSDictionary *info = _surfaceFeedback != NULL
+                         ? [color preferredInfoForFeedback: _surfaceFeedback] : nil;
+    NSColorSpace *preferred = [NSScreen _colorSpaceFromDisplayColorInfo: info];
+    [_preferredColorSpace release];
+    _preferredColorSpace = [preferred retain];
+    [self updateSurfaceColor];
+    // The subwindows use the parent's preference when their own feedback has none.
+    for (NSValue *value in _subwindows)
+        [(WaylandSubWindow *) [value pointerValue] colorManagerAvailable];
+    [_display flush];
+}
+
+- (BOOL) preferredSubwindowColorInfoChangedForFeedback: (struct wl_proxy *) feedback {
+    for (NSValue *value in _subwindows) {
+        WaylandSubWindow *child = (WaylandSubWindow *) [value pointerValue];
+        if ([child preferredColorInfoChangedForFeedback: feedback])
+            return YES;
+    }
+    return NO;
 }
 
 - (void) updateSurfaceColorIfNeeded {
@@ -207,35 +308,24 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 }
 
 - (void) colorManagerAvailable {
+    if (_surface != NULL && _surfaceFeedback == NULL) {
+        WaylandColorManager *color = [_display colorManager];
+        _surfaceFeedback = [color newSurfaceFeedbackForSurface: _surface];
+    }
     [self updateSurfaceColorIfNeeded];
+    for (NSValue *value in _subwindows)
+        [(WaylandSubWindow *) [value pointerValue] colorManagerAvailable];
 }
 
-// alpha-modifier-v1 multiplies the surface's per-pixel alpha. The protocol's factor is 0 for fully
-// transparent and UINT32_MAX for fully opaque, which is NSWindow.alphaValue mapped to that range.
+- (void) renderGlobalsAvailable {
+    if (_surface != NULL)
+        [[_display renderManager] observeSurface: _surface];
+}
+
+// The window's opacity is the window system window's (alpha-modifier-v1 where the compositor has it).
 - (void) updateAlphaModifier {
-    if (_surface == NULL || _display->_alphaModifierManager == NULL)
-        return;
-    if (_alphaModifier == NULL) {
-        union wl_argument args[2] = {{.o = NULL}, {.o = (struct wl_object *) _surface}};
-        _alphaModifier = WaylandCreateObject(_display->_alphaModifierManager,
-                                             WP_ALPHA_MODIFIER_GET_SURFACE,
-                                             &wp_alpha_modifier_surface_v1_interface, args, 0, nil);
-        if (_alphaModifier == NULL)
-            return;
-    }
     double alpha = _delegate != nil ? (double) [_delegate alphaValue] : 1.0;
-    if (!(alpha > 0)) alpha = 0;
-    if (alpha > 1) alpha = 1;
-    union wl_argument value[1] = {{.u = (uint32_t) (alpha * (double) UINT32_MAX)}};
-    WaylandMarshal(_alphaModifier, WP_ALPHA_MODIFIER_SURFACE_SET_MULTIPLIER, NULL, 0, value);
-    if (_mapped && _configured) {
-        [self commitSurface];
-        [_display flush];
-    }
-}
-
-- (void) alphaModifierAvailable {
-    [self updateAlphaModifier];
+    [_cgsWindow setToplevelAlpha: alpha];
 }
 
 - (void) sessionManagerAvailable {
@@ -278,6 +368,10 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     _surfaceCommitted = YES;
 }
 
+- (struct wl_proxy *) surfaceFeedback {
+    return _surfaceFeedback;
+}
+
 - (struct wl_proxy *) toplevelSession {
     return _toplevelSession;
 }
@@ -295,13 +389,19 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     WaylandColorManager *color = [_display colorManager];
     [color destroyColorSurface: _colorSurface];
     [color destroyRepresentationSurface: _representationSurface];
-    _colorSurface = _representationSurface = NULL;
-    if (_alphaModifier != NULL)
-        sendRequest(_alphaModifier, WP_ALPHA_MODIFIER_SURFACE_DESTROY, WL_MARSHAL_FLAG_DESTROY);
-    _alphaModifier = NULL;
+    [color destroySurfaceFeedback: _surfaceFeedback];
+    _colorSurface = _representationSurface = _surfaceFeedback = NULL;
     if (_idleInhibitor != NULL)
         sendRequest(_idleInhibitor, ZWP_IDLE_INHIBITOR_DESTROY, WL_MARSHAL_FLAG_DESTROY);
     _idleInhibitor = NULL;
+    if (_shortcutsInhibitor != NULL)
+        sendRequest(_shortcutsInhibitor, ZWP_KEYBOARD_SHORTCUTS_INHIBITOR_DESTROY,
+                    WL_MARSHAL_FLAG_DESTROY);
+    _shortcutsInhibitor = NULL;
+    if (_contentType != NULL)
+        sendRequest(_contentType, WP_CONTENT_TYPE_DESTROY, WL_MARSHAL_FLAG_DESTROY);
+    _contentType = NULL;
+    _contentTypeValue = WP_CONTENT_TYPE_NONE;
     if (_toplevelSession != NULL)
         sendRequest(_toplevelSession, WP_TOPLEVEL_SESSION_DESTROY, WL_MARSHAL_FLAG_DESTROY);
     _toplevelSession = NULL;
@@ -311,8 +411,8 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     _dialogModal = NO;
     if (_fractionalScale) sendRequest(_fractionalScale, WP_FRACTIONAL_DESTROY, WL_MARSHAL_FLAG_DESTROY);
     if (_viewport) sendRequest(_viewport, WP_VIEWPORT_DESTROY, WL_MARSHAL_FLAG_DESTROY);
-    if (_surface)
-        sendRequest(_surface, WP_SURFACE_DESTROY, WL_MARSHAL_FLAG_DESTROY);
+    // The surface is the window system window's: it is destroyed with that window, or when it makes another.
+    [[_display renderManager] destroySurface: _surface];
     _fractionalScale = _viewport = _surface = NULL;
     _surfaceCommitted = NO;
 }
@@ -330,6 +430,9 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     for (NSValue *value in _subwindows)
         [(WaylandSubWindow *) [value pointerValue] parentSurfaceWillBeReplaced];
     [self destroySurface];
+    CGSToplevelAttributes attributes = {.frame = NSRectToCGRect(_frame), .unmanaged = NO, .translucent = YES};
+    if ([_cgsWindow recreateToplevelWithAttributes: &attributes] != kCGSErrorSuccess)
+        NSLog(@"Wayland backend: CoreGraphics cannot make a new surface for a window");
     _surfaceRole = WaylandSurfaceRoleNone;
     return YES;
 }
@@ -407,8 +510,21 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
         [delegate platformWindowDeactivated: self checkForAppDeactivation: NO];
 }
 
+// The compositor activated the window, or it is the key window of a window that is never shown: it comes first in the
+// order of the windows.
+- (void) activatedInWindowSystem {
+    [_cgsWindow orderToplevelAbove: nil];
+}
+
 - (BOOL) isOrderedIn {
     return _mapped || ((_fullyTransparent || _mapDeferred) && _shouldBeMapped && !_invalidated);
+}
+
+// A window that is ordered in but not mapped (fully transparent, or held back while the application cannot take the
+// focus) is not given to the compositor, but counts as ordered in for the window order, which the window system window
+// keeps (see -[CGSWindow setToplevelHeldBack:]).
+- (void) syncHeldBack {
+    [_cgsWindow setToplevelHeldBack: !_mapped && [self isOrderedIn]];
 }
 
 - (BOOL) isMapDeferred {
@@ -450,38 +566,6 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
            [_delegate isKindOfClass: NSClassFromString(@"NSMenuBarWindow")];
 }
 
-// The bar is anchored to the top, left and right edges, as tall as the window
-// is, and keeps that strip free of other windows (the exclusive zone).
-- (void) updateLayerSize {
-    int32_t height = MAX(1, (int32_t) ceil(_frame.size.height));
-    union wl_argument args[2] = {{.u = 0}, {.u = (uint32_t) height}};
-
-    WaylandMarshal(_layerSurface, WP_LAYER_SURFACE_SET_SIZE, NULL, 0, args);
-    args[0].i = height;
-    WaylandMarshal(_layerSurface, WP_LAYER_SURFACE_SET_EXCLUSIVE_ZONE, NULL, 0, args);
-}
-
-- (void) createLayerRole {
-    union wl_argument args[5];
-
-    args[0].o = NULL;
-    args[1].o = (struct wl_object *) _surface;
-    args[2].o = NULL; // the compositor picks the output
-    args[3].u = WP_LAYER_TOP;
-    args[4].s = "menubar";
-    _layerSurface = WaylandCreateObject(_display->_layerShell, WP_LAYER_SHELL_GET_LAYER_SURFACE,
-                                        &zwlr_layer_surface_v1_interface, args,
-                                        WaylandObjectLayerSurface, self);
-    args[0].u = WP_LAYER_ANCHOR_TOP | WP_LAYER_ANCHOR_LEFT | WP_LAYER_ANCHOR_RIGHT;
-    WaylandMarshal(_layerSurface, WP_LAYER_SURFACE_SET_ANCHOR, NULL, 0, args);
-    [self updateLayerSize];
-    // The bar never takes the keyboard focus (the protocol default): a compositor that gives an
-    // on-demand surface the focus when the pointer is over it (KWin does as soon as the bar is
-    // mapped under the pointer) would take it from the application's window, which then looks to
-    // AppKit like the application losing the focus, so the bar would hide, and show again once the
-    // focus came back, in a loop. The menus the bar opens grab the keyboard themselves.
-}
-
 #pragma mark - Mapping
 
 // Whether AppKit considers this window a pop-up (see -[NSWindow _windowPresentation]).
@@ -491,6 +575,11 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 }
 
 - (void) ensureMapped {
+    [self ensureMappedUnsynced];
+    [self syncHeldBack];
+}
+
+- (void) ensureMappedUnsynced {
     if (_unmapPending && !_invalidated) {
         // Ordered out and in again within one pass of the run loop: nothing changed for the window.
         _unmapPending = NO;
@@ -544,68 +633,39 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     BOOL forceClient = strcmp(decorations, "client") == 0;
     _pendingClientDecorated = _display->_decorationManager == NULL || forceClient;
 
-    union wl_argument args[4];
-
     BOOL layerRole = [self wantsLayerSurface];
     BOOL surfaceRenewed = [self prepareSurfaceForRole: layerRole ? WaylandSurfaceRoleLayer
                                                        : parent != nil ? WaylandSurfaceRolePopup
                                                                        : WaylandSurfaceRoleToplevel];
     [self ensureSurface];
 
-    if (layerRole) {
-        [self createLayerRole];
-        _surfaceRole = WaylandSurfaceRoleLayer;
-    } else {
-        args[0].o = NULL;
-        args[1].o = (struct wl_object *) _surface;
-        _xdgSurface = WaylandCreateObject(_display->_wmBase,
-                                          WP_WM_BASE_GET_XDG_SURFACE,
-                                          &xdg_surface_interface, args,
-                                          WaylandObjectXdgSurface, self);
-
-        if (parent != nil) {
-            _popupParent = [parent retain];
-            [self createPopupRole];
-            _surfaceRole = WaylandSurfaceRolePopup;
-        } else {
-            args[0].o = NULL;
-            _toplevel = WaylandCreateObject(_xdgSurface, WP_XDG_SURFACE_GET_TOPLEVEL,
-                                        &xdg_toplevel_interface, args,
-                                        WaylandObjectToplevel, self);
-            _surfaceRole = WaylandSurfaceRoleToplevel;
-            _minimizeAdvertised = _pendingMinimizeAdvertised = NO;
-
-            [self updateTitle];
-            args[0].s = [[[NSProcessInfo processInfo] processName] UTF8String];
-            if (args[0].s != NULL)
-                WaylandMarshal(_toplevel, WP_TOPLEVEL_SET_APP_ID, NULL, 0, args);
-            _fullscreenRequested = NO;
-            [self updateFullscreen];
-            [self updateSizeLimits];
-            _levelParent = nil;
-            [self updateLevelParent];
-            [self updateDialogForToplevel];
-
-            _decorationForcedClient = forceClient;
-            [self updateDecorationMode];
-            [self updateApplicationMenu];
-            [self updateTaskbarPresence];
-            _toplevelIconSet = NO;
-            [self updateToplevelIcon];
-            // The session request has to precede the initial commit on the surface.
-            [self joinSessionBeforeCommit];
-        }
-
+    // What the window is, for the window system window that makes the role.
+    CGSToplevelHints hints = {
+        .kind = layerRole ? kCGSToplevelKindDock
+                          : parent == nil ? kCGSToplevelKindNormal
+                          : tooltip ? kCGSToplevelKindTooltip
+                          : menu ? kCGSToplevelKindDropdownMenu : kCGSToplevelKindPopupMenu,
+        .transientFor = parent != nil ? parent->_cgsWindow : nil,
+    };
+    [_cgsWindow setToplevelHints: &hints];
+    [self syncCGFrame];
+    _surfaceRole = layerRole ? WaylandSurfaceRoleLayer
+                 : parent != nil ? WaylandSurfaceRolePopup : WaylandSurfaceRoleToplevel;
+    _decorationForcedClient = forceClient;
+    if (parent != nil) {
+        _popupParent = [parent retain];
+        // A pop-up window of the application ends when the application orders it out; the compositor dismissing it
+        // with a click elsewhere would leave the application showing it, as it would for a tool tip.
+        _popupGrabSerial = (tooltip || _genericPopup) ? 0 : [_display popupGrabSerialForParent: _popupParent];
+        [(CGSWindowWayland *) _cgsWindow setToplevelPopupGrabSerial: _popupGrabSerial];
     }
-
-    // The multiplier is double-buffered, so it has to be set before the surface's first commit.
-    [self updateAlphaModifier];
+    // The window system window makes the role and the window system's objects of it, then tells -toplevelEvent:
+    // (kCGSToplevelEventWillShow) before it commits the surface for the first time.
+    [_cgsWindow orderWindow: kCGSOrderIn relativeTo: nil];
+    _surfaceCommitted = YES;
     _pendingWidth = _pendingHeight = 0;
     _pendingActivated = NO;
-    _pendingSuspended = NO;
     _pendingFullscreen = NO;
-    // The initial commit has no buffer; content follows the first configure.
-    [self commitSurface];
     _mapped = YES;
     [self updateIdleInhibitor];
     [self scheduleScaleUpdate];
@@ -667,106 +727,27 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 }
 
 - (void) updateApplicationMenu {
-    NSString *service = [_display applicationMenuServiceName];
-    NSString *path = [_display applicationMenuObjectPath];
-
-    if (_toplevel == NULL || _display->_appMenuManager == NULL || service == nil || path == nil) {
-        if (_appMenu != NULL) {
-            sendRequest(_appMenu, WP_APPMENU_RELEASE, WL_MARSHAL_FLAG_DESTROY);
-            _appMenu = NULL;
-        }
-        return;
-    }
-
-    if (_appMenu == NULL) {
-        union wl_argument args[2] = {{.o = NULL}, {.o = (struct wl_object *) _surface}};
-        _appMenu = WaylandCreateObject(_display->_appMenuManager, WP_APPMENU_MANAGER_CREATE,
-                                       &org_kde_kwin_appmenu_interface, args, 0, nil);
-    }
-    // Both are ASCII: a unique bus name and an object path.
-    union wl_argument address[2] = {{.s = [service UTF8String]}, {.s = [path UTF8String]}};
-    WaylandMarshal(_appMenu, WP_APPMENU_SET_ADDRESS, NULL, 0, address);
+    // The window system's window tells the compositor (KDE's appmenu protocol) while it is a toplevel and the compositor
+    // has the protocol; both are ASCII: a unique bus name and an object path.
+    [_cgsWindow setToplevelApplicationMenuServiceName: [_display applicationMenuServiceName]
+                                           objectPath: [_display applicationMenuObjectPath]];
 }
 
-- (struct wl_proxy *) newPopupPositioner {
-    union wl_argument args[4] = {{.o = NULL}};
-    struct wl_proxy *positioner = WaylandCreateObject(_display->_wmBase,
-            WP_WM_BASE_CREATE_POSITIONER, &xdg_positioner_interface, args, 0, nil);
-    args[0].i = MAX(1, (int32_t) ceil(_frame.size.width));
-    args[1].i = MAX(1, (int32_t) ceil(_frame.size.height));
-    WaylandMarshal(positioner, WP_POSITIONER_SET_SIZE, NULL, 0, args);
-    NSRect parent = [_popupParent frame];
-    NSPoint offset = [_popupParent contentOffset];
-    int32_t x = (int32_t) floor(_frame.origin.x - parent.origin.x + offset.x);
-    int32_t y = (int32_t) floor(NSMaxY(parent) - NSMaxY(_frame) + offset.y);
-    // A submenu can start beyond its parent edge. Keep the anchor inside the
-    // parent geometry, expressing the remaining displacement as an offset.
-    int32_t anchorX = MAX(0, MIN(x, (int32_t) ceil(parent.size.width + 2 * offset.x) - 1));
-    int32_t anchorY = MAX(0, MIN(y, (int32_t) ceil(parent.size.height + offset.x + offset.y) - 1));
-    args[0].i = anchorX;
-    args[1].i = anchorY;
-    args[2].i = args[3].i = 1;
-    WaylandMarshal(positioner, WP_POSITIONER_SET_ANCHOR_RECT, NULL, 0, args);
-    args[0].i = x - anchorX;
-    args[1].i = y - anchorY;
-    WaylandMarshal(positioner, WP_POSITIONER_SET_OFFSET, NULL, 0, args);
-    args[0].u = WP_POSITIONER_ANCHOR_TOP_LEFT;
-    WaylandMarshal(positioner, WP_POSITIONER_SET_ANCHOR, NULL, 0, args);
-    args[0].u = WP_POSITIONER_GRAVITY_BOTTOM_RIGHT;
-    WaylandMarshal(positioner, WP_POSITIONER_SET_GRAVITY, NULL, 0, args);
-    args[0].u = WP_POSITIONER_SLIDE_X | WP_POSITIONER_SLIDE_Y |
-                WP_POSITIONER_FLIP_X | WP_POSITIONER_FLIP_Y;
-    WaylandMarshal(positioner, WP_POSITIONER_SET_CONSTRAINT_ADJUSTMENT, NULL, 0, args);
-    return positioner;
-}
-
-- (void) createPopupRole {
-    struct wl_proxy *positioner = [self newPopupPositioner];
-    union wl_argument args[3];
-    args[0].o = NULL;
-    // A popup of a layer surface has no xdg parent; the layer surface adopts it.
-    BOOL layerParent = [_popupParent layerSurface] != NULL;
-    args[1].o = layerParent ? NULL : (struct wl_object *) [_popupParent xdgSurface];
-    args[2].o = (struct wl_object *) positioner;
-    _popup = WaylandCreateObject(_xdgSurface, WP_XDG_SURFACE_GET_POPUP,
-            &xdg_popup_interface, args, WaylandObjectPopup, self);
-    if (layerParent) {
-        args[0].o = (struct wl_object *) _popup;
-        WaylandMarshal([_popupParent layerSurface], WP_LAYER_SURFACE_GET_POPUP, NULL, 0, args);
+- (void) discardBuffer: (struct WaylandBuffer *) buffer {
+    if (buffer->buffer != NULL) {
+        [[_display renderManager] bufferDestroyed: buffer->buffer];
+        sendRequest(buffer->buffer, WP_BUFFER_DESTROY, WL_MARSHAL_FLAG_DESTROY);
     }
-    sendRequest(positioner, WP_POSITIONER_DESTROY, WL_MARSHAL_FLAG_DESTROY);
-    if ([self isTooltip] || (_genericPopup && [_delegate ignoresMouseEvents])) {
-        // No grab, and an empty input region: the pointer keeps its focus on the
-        // parent while a tool tip is shown beside it.
-        args[0].o = NULL;
-        struct wl_proxy *region = WaylandCreateObject(_display->_compositor,
-                WP_COMPOSITOR_CREATE_REGION, &wl_region_interface, args, 0, nil);
-        args[0].o = (struct wl_object *) region;
-        WaylandMarshal(_surface, WP_SURFACE_SET_INPUT_REGION, NULL, 0, args);
-        sendRequest(region, WP_REGION_DESTROY, WL_MARSHAL_FLAG_DESTROY);
-        return;
-    }
-    // A pop-up window of the application ends when the application orders it out; the compositor
-    // dismissing it with a click elsewhere would leave the application showing it.
-    if (_genericPopup)
-        return;
-    _popupGrabSerial = [_display popupGrabSerialForParent: _popupParent];
-    if (_popupGrabSerial != 0 && [_display seat] != NULL) {
-        args[0].o = (struct wl_object *) [_display seat];
-        args[1].u = _popupGrabSerial;
-        WaylandMarshal(_popup, WP_POPUP_GRAB, NULL, 0, args);
-    }
+    if (buffer->data != NULL)
+        munmap(buffer->data, buffer->size);
+    if (buffer->surface != NULL)
+        CFRelease(buffer->surface);
+    memset(buffer, 0, sizeof(*buffer));
 }
 
 - (void) destroyBuffers {
-    for (int i = 0; i < 2; i++) {
-        struct WaylandBuffer *buffer = &_buffers[i];
-        if (buffer->buffer != NULL)
-            sendRequest(buffer->buffer, WP_BUFFER_DESTROY, WL_MARSHAL_FLAG_DESTROY);
-        if (buffer->data != NULL)
-            munmap(buffer->data, buffer->size);
-        memset(buffer, 0, sizeof(*buffer));
-    }
+    for (int i = 0; i < 2; i++)
+        [self discardBuffer: &_buffers[i]];
 }
 
 // Unmapping an xdg surface requires a new configure sequence before it can be
@@ -774,6 +755,11 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 - (BOOL) isPopupWaitingForParent { return _popupWaitingForParent; }
 
 - (void) unmap {
+    [self unmapUnsynced];
+    [self syncHeldBack];
+}
+
+- (void) unmapUnsynced {
     _unmapPending = NO;
     _shouldBeMapped = NO;
     _mapDeferred = NO;
@@ -788,49 +774,27 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
         WL.wl_proxy_destroy(_frameCallback);
         _frameCallback = NULL;
     }
-    if (_decoration != NULL) {
-        sendRequest(_decoration, WP_TOPLEVEL_DECORATION_DESTROY,
-                    WL_MARSHAL_FLAG_DESTROY);
-        _decoration = NULL;
-    }
     if (_popup != NULL) {
-        sendRequest(_popup, WP_POPUP_DESTROY, WL_MARSHAL_FLAG_DESTROY);
         _popup = NULL;
         [_popupParent release];
         _popupParent = nil;
         _popupGrabSerial = 0;
         _genericPopup = NO;
     }
-    if (_appMenu != NULL) {
-        sendRequest(_appMenu, WP_APPMENU_RELEASE, WL_MARSHAL_FLAG_DESTROY);
-        _appMenu = NULL;
-    }
     if (_plasmaSurface != NULL) {
         sendRequest(_plasmaSurface, WP_PLASMA_SURFACE_DESTROY, WL_MARSHAL_FLAG_DESTROY);
         _plasmaSurface = NULL;
     }
-    if (_toplevel != NULL)
-        sendRequest(_toplevel, WP_TOPLEVEL_DESTROY, WL_MARSHAL_FLAG_DESTROY);
-    if (_layerSurface != NULL) {
-        sendRequest(_layerSurface, WP_LAYER_SURFACE_DESTROY, WL_MARSHAL_FLAG_DESTROY);
-        _layerSurface = NULL;
-    }
-    if (_xdgSurface != NULL)
-        sendRequest(_xdgSurface, WP_XDG_SURFACE_DESTROY, WL_MARSHAL_FLAG_DESTROY);
-    // Retain the parent wl_surface across hide/show: EGL child surfaces keep
-    // their native-window identity. A NULL buffer unmaps the entire subtree.
-    union wl_argument detach[] = {{.o = NULL}, {.i = 0}, {.i = 0}};
-    WaylandMarshal(_surface, WP_SURFACE_ATTACH, NULL, 0, detach);
-    [self commitSurface];
-    _toplevel = _xdgSurface = NULL;
+    // The window system window destroys the role and hides the surface's content. It keeps the wl_surface across
+    // hide/show: EGL child surfaces keep their native-window identity, and the NULL buffer unmaps the entire subtree.
+    [_cgsWindow orderWindow: kCGSOrderOut relativeTo: nil];
+    _surfaceCommitted = YES;
+    _toplevel = _xdgSurface = _layerSurface = NULL;
     [_surfaceOutputs removeAllObjects];
     [self destroyBuffers];
 
     _mapped = NO;
     [self updateIdleInhibitor];
-    // The toplevel is gone, and so is what the compositor did to it.
-    [self endMinimized];
-    _levelParent = nil;
     _configureUpdatePending = NO;
     _configured = NO;
     // The compositor moves the focus away from a window that is unmapped without telling the client,
@@ -848,12 +812,12 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
             [delegate platformWindowDeactivated: self checkForAppDeactivation: NO];
         }];
     }
-    _pendingSuspended = _suspended = NO;
     // The tracker survives hiding: _frame keeps the fullscreen size, so the size
     // from before fullscreen would be lost if the next map saved it again.
-    _fullscreenRequested = _pendingFullscreen = _fullscreenRecheckPending = NO;
+    _pendingFullscreen = _fullscreenRecheckPending = NO;
     _fullscreenReported = NO;
-    _fullscreenSettling = NO;
+    [self updateShortcutsInhibitor];
+    [self updateContentType];
     [_display windowUnmapped: self];
     [_display flush];
 }
@@ -884,6 +848,7 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     _unmapPending = YES;
     _shouldBeMapped = NO;
     _keyRequested = NO;
+    [self syncHeldBack];
     [_display performAfterRunLoopPass: ^{
         if (self->_unmapPending)
             [self unmap];
@@ -913,6 +878,8 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 // Reports to the NSWindow that this window is the compositor's focus (or the key window of a window
 // that is never shown). The NSWindow decides whether that makes it key.
 - (void) reportActivationDisplayingIfNeeded: (BOOL) displayIfNeeded {
+    // The text input focus follows the keyboard focus: what the first responder takes is told before it arrives.
+    [self updateInputMethodSpot];
     _reportingActivation = YES;
     [_delegate platformWindowActivated: self displayIfNeeded: displayIfNeeded];
     _reportingActivation = NO;
@@ -946,67 +913,31 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 - (void) captureEvents {
 }
 
-// xdg-shell has no request to undo set_minimized and no event that says a toplevel is minimized,
-// so the window keeps the state itself. GUESS: the compositor minimizes the window when asked (it
-// may ignore the request, and then the window is reported miniaturized until it is shown again).
-// The state is kept only when something can bring the window back (xdg-activation) and the
-// compositor advertised that it minimizes (a compositor that did not ignores the request, so the
-// window would be reported miniaturized while it stays on screen). Otherwise the request is sent as
-// before and the window keeps being reported as not miniaturized. GUESS: a compositor that
-// predates the capabilities event (xdg_toplevel before version 5) minimizes.
-- (BOOL) compositorMinimizes {
-    return WL.wl_proxy_get_version(_toplevel) < 5 || _minimizeAdvertised;
-}
-
+// The window system window asks the compositor to minimize the window, and keeps the state xdg-shell does not tell, and
+// asks for the activation that shows the window again (see -[CGSWindow miniaturizeToplevel]).
 - (void) miniaturize {
-    if (_toplevel == NULL || _minimized)
-        return;
-    sendRequest(_toplevel, WP_TOPLEVEL_SET_MINIMIZED, 0);
-    [_display flush];
-    if (_display->_activation == NULL || ![self compositorMinimizes])
-        return;
-    _minimized = YES;
-    [_display performAfterDispatch: ^{
-        if (self->_minimized && !self->_invalidated)
-            [self->_delegate platformWindowMiniaturized: self];
-    }];
+    [_cgsWindow miniaturizeToplevel];
 }
 
-// The only client-side way to bring a minimized toplevel back is to ask for its activation
-// (xdg-activation-v1); the compositor decides, and may only mark the window as wanting attention.
-// The window counts as shown again from the request on. If no request could be made (one is waiting
-// for its token) the state stays, and asking again later works. A restore the compositor does itself
-// (its task bar) ends the state when a configure changes the window to activated (see
-// -applyConfigure); a compositor that never reports the window deactivated cannot be told.
 - (void) deminiaturize {
-    if (_minimized && [_display requestActivationOfWindow: self])
-        [self endMinimized];
+    [_cgsWindow deminiaturizeToplevel];
     [self ensureMapped];
 }
 
-- (BOOL) isMiniaturized {
-    return _minimized;
+// Whether the compositor advertised that it minimizes windows.
+- (BOOL) compositorMinimizes {
+    return [(CGSWindowWayland *) _cgsWindow compositorMinimizes];
 }
 
-// The window is shown again (activated by the compositor, or mapped anew): tell the NSWindow.
-- (void) endMinimized {
-    if (!_minimized)
-        return;
-    _minimized = NO;
-    // A window being invalidated (-dealloc does it) has no NSWindow to tell, and must not be retained.
-    if (_invalidated)
-        return;
-    [_display performAfterDispatch: ^{
-        if (!self->_minimized && !self->_invalidated)
-            [self->_delegate platformWindowDeminiaturized: self];
-    }];
+- (BOOL) isMiniaturized {
+    return [_cgsWindow toplevelIsMiniaturized];
 }
 
 // What xdg-shell offers of occlusion is the suspended state, sent by compositors that stop repainting a
 // toplevel they do not show (version 6 of xdg_wm_base). A compositor that never sends it leaves the
 // window seen whenever it is mapped.
 - (BOOL) isOccluded {
-    return _mapped && _suspended;
+    return _mapped && [_cgsWindow toplevelIsOccluded];
 }
 
 - (void) flashWindow {
@@ -1018,8 +949,7 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     return _styleMask;
 }
 
-// Whether the window has a title bar for the platform to draw (see -[NSWindow
-// _hasTitlebarForStyleMask:]).
+// Whether the window has a title bar (see -setTitlebarKind:).
 - (BOOL) hasTitlebar {
     // A sheet is drawn over its window on macOS, but xdg-shell lets the compositor place every toplevel and
     // gives a client no way to put one at a position over its parent. A sheet left without a frame then
@@ -1028,17 +958,14 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     // -updateLevelParent) with the compositor's frame.
     if ([_delegate respondsToSelector: @selector(isSheet)] && [(NSWindow *) _delegate isSheet])
         return YES;
-    if ([_delegate respondsToSelector: @selector(_hasTitlebarForStyleMask:)])
-        return [(NSWindow *) _delegate _hasTitlebarForStyleMask: _styleMask];
-    return (_styleMask & NSWindowStyleMaskTitled) != 0;
+    return _titlebarKind != kCGSToplevelTitlebarNone;
 }
 
 // A window that shows nothing of a title bar of its own (see NSWindow) leaves nothing for the
 // platform to draw as a title bar: the application draws its own header. Such a window gets no
 // frame, neither from the compositor nor from the client-side fallback.
 - (BOOL) wantsChromeless {
-    return [_delegate respondsToSelector: @selector(_hasInvisibleTitlebarForStyleMask:)] &&
-           [(NSWindow *) _delegate _hasInvisibleTitlebarForStyleMask: _styleMask];
+    return _titlebarKind == kCGSToplevelTitlebarHidden;
 }
 
 // Whether this window should draw the client-side frame, given what the compositor asked for.
@@ -1047,41 +974,32 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
             _pendingClientDecorated && !_pendingFullscreen;
 }
 
-// Tells the compositor which side draws the frame. A chromeless window declares client-side
-// decorations explicitly because compositors differ on the default for a window that says nothing.
+// What the window shows of a title bar is the window system's window's to carry out: the compositor draws the frame, unless
+// the frame is the client's own choice (a chromeless window declares client-side decorations explicitly because
+// compositors differ on the default for a window that says nothing).
 - (void) updateDecorationMode {
-    if (_toplevel == NULL || _display->_decorationManager == NULL)
+    if (_toplevel == NULL)
         return;
-    union wl_argument args[2];
-    if (![self hasTitlebar]) {
-        if (_decoration != NULL)
-            sendRequest(_decoration, WP_TOPLEVEL_DECORATION_UNSET_MODE, 0);
-        return;
-    }
-    if (_decoration == NULL) {
-        args[0].o = NULL;
-        args[1].o = (struct wl_object *) _toplevel;
-        _decoration = WaylandCreateObject(
-                _display->_decorationManager,
-                WP_DECORATION_MANAGER_GET_TOPLEVEL_DECORATION,
-                &zxdg_toplevel_decoration_v1_interface, args,
-                WaylandObjectDecoration, self);
-    }
-    args[0].u = (_decorationForcedClient || [self wantsChromeless])
-            ? WP_TOPLEVEL_DECORATION_MODE_CLIENT_SIDE
-            : WP_TOPLEVEL_DECORATION_MODE_SERVER_SIDE;
-    WaylandMarshal(_decoration, WP_TOPLEVEL_DECORATION_SET_MODE, NULL, 0, args);
+    int kind = [self hasTitlebar] ? (_titlebarKind == kCGSToplevelTitlebarHidden ? kCGSToplevelTitlebarHidden
+                                                                                 : kCGSToplevelTitlebarStandard)
+                                  : kCGSToplevelTitlebarNone;
+    [_cgsWindow setToplevelPrefersClientDecoration: _decorationForcedClient];
+    [_cgsWindow setToplevelTitlebarKind: kind];
 }
 
-// Called when the style mask, the title bar transparency or the title visibility of a window
-// change, and when it is shown (its standard buttons may have been hidden). On a mapped window
-// the mode is updated and the client-side frame switched on or off right away, keeping the
-// content size.
+- (void) setTitlebarKind: (int) kind {
+    _titlebarKind = kind;
+    [self updateDecorationsForStyleMask: _styleMask];
+}
+
+// Called when the style mask or the title bar kind of a window change, and when it is shown. On a mapped window
+// the mode is updated and the client-side frame switched on or off right away, keeping the content size.
 - (void) updateDecorationsForStyleMask: (NSUInteger) mask {
     _styleMask = mask;
     if (_toplevel == NULL)
         return;
     [self updateDecorationMode];
+    [self updateClientDecorationLayout];
     if (!_configured || [self wantsClientDecoration] == _clientDecorated) {
         [_display flush];
         return;
@@ -1135,35 +1053,11 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
         return;
     struct wl_proxy *output;
     BOOL wanted = [self wantsFullscreenOn: &output];
-    if (wanted == _fullscreenRequested)
+    if (wanted == [_cgsWindow toplevelFullscreenRequested])
         return;
-    _fullscreenRequested = wanted;
-    if (wanted)
-        WaylandToplevelSetFullscreen(_toplevel, output);
-    else
-        WaylandToplevelUnsetFullscreen(_toplevel);
-    if (_configured)
-        [self beginFullscreenSettle];
-    [_display flush];
-}
-
-// After set_fullscreen or unset_fullscreen the client waits for the configure that
-// answers it before it commits again: the compositor decides the size. A commit
-// sent before the answer arrives has the size the window gets from the
-// application's own side of the change (the title bar goes away, for instance),
-// and a compositor that lets a client's size count for a floating window (sway)
-// then sends one more configure with that size and the fullscreen state, which
-// wins over the real fullscreen size. Drawing resumes when a configure brings the
-// requested state, or after a second when the compositor answers nothing.
-- (void) beginFullscreenSettle {
-    _fullscreenSettling = YES;
-    NSUInteger token = ++_fullscreenSettleToken;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        if (self->_fullscreenSettleToken != token || !self->_fullscreenSettling)
-            return;
-        self->_fullscreenSettling = NO;
-        [self presentIfPossible];
-    });
+    // The window system window asks the compositor, and holds the drawing back until the compositor has answered (see
+    // -toplevelFullscreenSettling).
+    [(CGSWindowWayland *) _cgsWindow setToplevelFullscreen: wanted onOutput: output force: NO];
 }
 
 - (void) outputsChanged {
@@ -1202,23 +1096,22 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     if (_toplevel == NULL)
         return;
 
-    WaylandWindow *parent = nil;
-    // A window of a raised level, and any window that is not an application window (a panel, a
-    // child window, a window that cannot become main: see DarlingWindowPresentation.h), is related
-    // to the window it belongs to, which keeps it in front of that window and out of the task bar.
+    // A window of a raised level, and any window that is not an application window (a panel, a child window, a window that
+    // cannot become main: see DarlingWindowPresentation.h), is related to the window it belongs to, which keeps it in front
+    // of that window and out of the task bar. The window system window refuses a parent that would make the window its own
+    // ancestor, and then the next candidate is tried.
     BOOL auxiliary = [_delegate respondsToSelector: @selector(_windowPresentation)] &&
                      [(NSWindow *) _delegate _windowPresentation] != DarlingWindowPresentationApplication;
-    if (DarlingWindowRoleForLevel(_level) == DarlingWindowRoleTransient || auxiliary)
-        parent = [_display levelParentForWindow: self];
-    if (parent == _levelParent || (parent != nil && parent->_toplevel == NULL))
-        return;
-    _levelParent = parent;
-    WaylandToplevelSetParent(_toplevel, parent != nil ? parent->_toplevel : NULL);
-    [_display flush];
-}
-
-- (WaylandWindow *) levelParent {
-    return _levelParent;
+    if (DarlingWindowRoleForLevel(_level) == DarlingWindowRoleTransient || auxiliary) {
+        CGSWindow *current = [_cgsWindow toplevelParent];
+        for (WaylandWindow *candidate in [_display levelParentCandidatesForWindow: self]) {
+            if (candidate->_cgsWindow == current)
+                return;
+            if ([_cgsWindow setToplevelParent: candidate->_cgsWindow] == kCGSErrorSuccess)
+                return;
+        }
+    }
+    [_cgsWindow setToplevelParent: nil];
 }
 
 // Sheets and windows in an application modal session are the dialogs AppKit has. xdg-shell can relate
@@ -1233,8 +1126,7 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 
 - (void) updateDialogForToplevel {
     BOOL dialog = _toplevel != NULL && [self isDialogToplevel] &&
-                  _display->_dialogManager != NULL && _levelParent != nil &&
-                  _levelParent->_toplevel != NULL;
+                  _display->_dialogManager != NULL && [_cgsWindow toplevelParent] != nil;
     if (!dialog) {
         if (_dialog != NULL) {
             sendRequest(_dialog, XDG_DIALOG_DESTROY, WL_MARSHAL_FLAG_DESTROY);
@@ -1260,12 +1152,6 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 }
 
 - (void) dialogManagerAvailable {
-    [self updateDialogForToplevel];
-}
-
-// The compositor drops the relation when the parent unmaps.
-- (void) levelParentUnmapped {
-    _levelParent = nil;
     [self updateDialogForToplevel];
 }
 
@@ -1296,7 +1182,7 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
 // a compositor ignores it when the surface is unmapped or occluded, so it is dropped as soon as either
 // happens.
 - (void) updateIdleInhibitor {
-    BOOL inhibit = !_invalidated && _mapped && !_suspended && !_fullyTransparent &&
+    BOOL inhibit = !_invalidated && _mapped && ![_cgsWindow toplevelIsOccluded] && !_fullyTransparent &&
                    _surface != NULL && _display->_idleInhibitManager != NULL &&
                    _CGSNativeConnectionDisplaySleepPrevented();
     if (inhibit && _idleInhibitor == NULL) {
@@ -1310,12 +1196,60 @@ static void sendRequest(struct wl_proxy *proxy, uint32_t opcode, uint32_t flags)
     }
 }
 
+// wp_content_type_v1 lets the compositor optimize for the kind of content a surface shows. The
+// frameworks have no macOS API for this, so the backend derives it from the state it already knows:
+// a fullscreen window is a game, a window visible while the process holds a display sleep assertion
+// is showing video, and everything else says none.
+- (void) updateContentType {
+    if (_surface == NULL || _display->_contentTypeManager == NULL)
+        return;
+    uint32_t type = WP_CONTENT_TYPE_NONE;
+    if (_fullscreenReported)
+        type = WP_CONTENT_TYPE_GAME;
+    else if (_mapped && ![_cgsWindow toplevelIsOccluded] && !_fullyTransparent && _CGSNativeConnectionDisplaySleepPrevented())
+        type = WP_CONTENT_TYPE_VIDEO;
+    if (_contentType == NULL) {
+        union wl_argument args[2] = {{.o = NULL}, {.o = (struct wl_object *) _surface}};
+        _contentType = WaylandCreateObject(_display->_contentTypeManager,
+                                           WP_CONTENT_TYPE_MANAGER_GET_SURFACE_CONTENT_TYPE,
+                                           &wp_content_type_v1_interface, args, 0, nil);
+        if (_contentType == NULL)
+            return;
+    }
+    if (type == _contentTypeValue)
+        return;
+    union wl_argument value[1] = {{.u = type}};
+    WaylandMarshal(_contentType, WP_CONTENT_TYPE_SET_CONTENT_TYPE, NULL, 0, value);
+    _contentTypeValue = type;
+    if (_mapped && _configured) {
+        [self commitSurface];
+        [_display flush];
+    }
+}
+
+// The compositor's own shortcuts (switching workspaces, for instance) must not take keys away from a
+// fullscreen game; the protocol needs both the surface and the seat.
+- (void) updateShortcutsInhibitor {
+    BOOL inhibit = !_invalidated && _mapped && _fullscreenReported && _surface != NULL &&
+                   _display->_shortcutsInhibitManager != NULL && [_display seat] != NULL;
+    if (inhibit && _shortcutsInhibitor == NULL) {
+        union wl_argument args[3] = {{.o = NULL}, {.o = (struct wl_object *) _surface},
+                                     {.o = (struct wl_object *) [_display seat]}};
+        _shortcutsInhibitor = WaylandCreateObject(_display->_shortcutsInhibitManager,
+                                                  ZWP_KEYBOARD_SHORTCUTS_INHIBIT_MANAGER_INHIBIT_SHORTCUTS,
+                                                  &zwp_keyboard_shortcuts_inhibitor_v1_interface,
+                                                  args, 0, nil);
+    } else if (!inhibit && _shortcutsInhibitor != NULL) {
+        sendRequest(_shortcutsInhibitor, ZWP_KEYBOARD_SHORTCUTS_INHIBITOR_DESTROY,
+                    WL_MARSHAL_FLAG_DESTROY);
+        _shortcutsInhibitor = NULL;
+    }
+}
+
 - (void) updateTitle {
+    [_cgsWindow setProperty: kCGSWindowTitle value: (CFTypeRef) _title];
     if (_toplevel == NULL)
         return;
-    const char *title = [_title UTF8String];
-    union wl_argument args[1] = {{.s = title ? title : ""}};
-    WaylandMarshal(_toplevel, WP_TOPLEVEL_SET_TITLE, NULL, 0, args);
     [self updateToplevelTags];
 }
 
@@ -1338,10 +1272,7 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
 }
 
 - (void) updateSizeLimits {
-    if (_layerSurface != NULL) {
-        [self updateLayerSize];
-        return;
-    }
+    // A layer surface is as tall as its frame, which the window system window follows.
     if (_toplevel == NULL)
         return;
 
@@ -1365,8 +1296,7 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
                 max[i].i = min[i].i;
     }
     // Double buffered: the compositor sees them with the surface's next commit.
-    WaylandMarshal(_toplevel, WP_TOPLEVEL_SET_MIN_SIZE, NULL, 0, min);
-    WaylandMarshal(_toplevel, WP_TOPLEVEL_SET_MAX_SIZE, NULL, 0, max);
+    [_cgsWindow setToplevelMinimumSize: CGSizeMake(min[0].i, min[1].i) maximumSize: CGSizeMake(max[0].i, max[1].i)];
 }
 
 // The NSWindow's minSize, maxSize, contentMinSize or contentMaxSize changed.
@@ -1391,6 +1321,7 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
             BOOL ordered = _shouldBeMapped;
             [self unmap];
             _shouldBeMapped = ordered;
+            [self syncHeldBack];
         } else if (_shouldBeMapped)
             [self ensureMapped];
     }
@@ -1437,14 +1368,10 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
         WaylandFullscreenApplicationResized(&_fullscreenTracker,
                                             WaylandFullscreenRound(frame.size.width),
                                             WaylandFullscreenRound(frame.size.height));
-    if (_popup != NULL && (moved || sized) && WL.wl_proxy_get_version(_popup) >= 3) {
-        struct wl_proxy *positioner = [self newPopupPositioner];
-        union wl_argument args[2] = {{.o = (struct wl_object *) positioner},
-                                     {.u = ++_repositionToken}};
-        WaylandMarshal(_popup, WP_POPUP_REPOSITION, NULL, 0, args);
-        sendRequest(positioner, WP_POSITIONER_DESTROY, WL_MARSHAL_FLAG_DESTROY);
+    // A pop-up is placed again, a menu bar surface sized again.
+    [_cgsWindow setToplevelFrame: NSRectToCGRect(_frame)];
+    if (_popup != NULL && (moved || sized))
         [_display flush];
-    }
     [self updateSubwindows];
     if (sized) {
         [self updateSizeLimits];
@@ -1462,62 +1389,44 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
     return _clientDecorated ? NSMakePoint(WaylandBorder, WaylandBorder + WaylandTitleHeight) : NSZeroPoint;
 }
 
+// Whether a point of the surface is on the client-side frame: the window system's window answers (see
+// -updateClientDecorationLayout).
 - (BOOL) isDecorationPoint: (CGPoint) point {
-    if (!_clientDecorated)
-        return NO;
-    NSPoint offset = [self contentOffset];
-    return point.x < offset.x || point.y < offset.y ||
-           point.x >= offset.x + _frame.size.width || point.y >= offset.y + _frame.size.height;
+    return _clientDecorated && [_cgsWindow toplevelClientDecorationContainsPoint: point];
 }
 
-- (BOOL) decorationButton: (uint32_t) button pressed: (BOOL) pressed
-                   serial: (uint32_t) serial atPoint: (CGPoint) point
-{
-    if (![self isDecorationPoint: point])
-        return NO;
-    if (!pressed || button != WP_BTN_LEFT || _toplevel == NULL || [_display seat] == NULL)
-        return YES;
-    CGFloat width = _frame.size.width + 2 * WaylandBorder;
-    CGFloat height = _frame.size.height + 2 * WaylandBorder + WaylandTitleHeight;
-    uint32_t edge = 0;
-    if (point.y < WaylandBorder) edge |= 1;
-    if (point.y >= height - WaylandBorder) edge |= 2;
-    if (point.x < WaylandBorder) edge |= 4;
-    if (point.x >= width - WaylandBorder) edge |= 8;
-    union wl_argument args[3] = {{.o = (struct wl_object *) [_display seat]},
-                                 {.u = serial}, {.u = edge}};
-    if (edge != 0) {
-        if (_styleMask & NSWindowStyleMaskResizable)
-            WaylandMarshal(_toplevel, WP_TOPLEVEL_RESIZE, NULL, 0, args);
-    } else if (point.y < WaylandBorder + WaylandTitleHeight) {
-        CGFloat x = point.x - WaylandBorder;
-        if (x >= 4 && x < 22 && (_styleMask & NSWindowStyleMaskClosable))
-            [self closeRequested];
-        else if (x >= 24 && x < 42 && (_styleMask & NSWindowStyleMaskMiniaturizable))
-            [self miniaturize];
-        else if (x >= 44 && x < 62 && (_styleMask & NSWindowStyleMaskResizable))
-            sendRequest(_toplevel, _maximized ? WP_TOPLEVEL_UNSET_MAXIMIZED : WP_TOPLEVEL_SET_MAXIMIZED, 0);
-        else
-            WaylandMarshal(_toplevel, WP_TOPLEVEL_MOVE, NULL, 0, args);
+// The client-side frame AppKit draws (-drawDecorations) is hit-tested by the window system's window: the edges that
+// resize, the title bar that moves, and the buttons. It is told where they are.
+- (void) updateClientDecorationLayout {
+    if (!_clientDecorated || _toplevel == NULL) {
+        [_cgsWindow setToplevelClientDecorationLayout: NULL];
+        return;
     }
-    [_display flush];
-    return YES;
+    NSSize size = [self logicalSurfaceSize];
+    CGRect none = CGRectNull;
+    CGSToplevelDecorationLayout layout = {
+        .border = WaylandBorder,
+        .titleHeight = WaylandTitleHeight,
+        .size = NSSizeToCGSize(size),
+        .resizable = (_styleMask & NSWindowStyleMaskResizable) != 0,
+        .closeButton = none,
+        .miniaturizeButton = none,
+        .zoomButton = none,
+    };
+    CGRect *buttons[] = {&layout.closeButton, &layout.miniaturizeButton, &layout.zoomButton};
+    NSUInteger masks[] = {NSWindowStyleMaskClosable, NSWindowStyleMaskMiniaturizable, NSWindowStyleMaskResizable};
+    for (int i = 0; i < 3; ++i)
+        if (_styleMask & masks[i])
+            *buttons[i] = CGRectMake(WaylandBorder + 4 + i * 20, WaylandBorder, 18, WaylandTitleHeight);
+    [_cgsWindow setToplevelClientDecorationLayout: &layout];
 }
 
-// -[NSWindow performWindowDragWithEvent:]: a client cannot place a toplevel, so
-// the compositor moves it, for the press the event stands for (xdg_toplevel.move
-// with that press's serial). NO for a popup, or when the event is not the
-// press being dispatched.
-- (BOOL) moveByWindowManagerForEvent: (NSEvent *) event {
-    if (_toplevel == NULL || [_display seat] == NULL)
+// -[NSWindow performWindowDragWithEvent:]: a client cannot place a toplevel, so the compositor moves it, for the
+// press that is held (xdg_toplevel.move with that press's serial). NO for a popup, or when no button is down.
+- (BOOL) moveByWindowSystem {
+    if (_toplevel == NULL)
         return NO;
-    uint32_t serial = [_display dragSerialForEvent: event];
-    if (serial == 0)
-        return NO;
-    union wl_argument args[2] = {{.o = (struct wl_object *) [_display seat]}, {.u = serial}};
-    WaylandMarshal(_toplevel, WP_TOPLEVEL_MOVE, NULL, 0, args);
-    [_display flush];
-    return YES;
+    return [_cgsWindow beginToplevelMoveByWindowSystem] == kCGSErrorSuccess;
 }
 
 - (void) setLastKnownCursorPosition: (CGPoint) point {
@@ -1587,7 +1496,6 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
         // Expose only posts a notification in Cocotron. A new backing surface
         // needs a full redraw, even when no view has invalidated its contents.
         [self->_delegate display];
-        [self->_display windowScaleChanged: self];
     }];
 }
 
@@ -1627,6 +1535,7 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
 - (void) invalidateContextWithNewSize: (NSSize) size {
     if (!NSEqualSizes(_frame.size, size)) {
         _frame.size = size;
+        [self updateClientDecorationLayout];
         [_context release];
         _context = nil;
         [_delegate platformWindowDidInvalidateCGContext: self];
@@ -1681,10 +1590,19 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
 {
     struct WaylandBuffer *reusable = NULL;
 
+    WaylandRenderManager *render = [_display renderManager];
     for (int i = 0; i < 2; i++) {
         struct WaylandBuffer *buffer = &_buffers[i];
-        if (buffer->busy)
-            continue;
+        // A dma-buf the compositor rejected cannot be attached again; rebuild it as shm.
+        if (buffer->buffer != NULL && [render bufferCreationFailed: buffer->buffer])
+            [self discardBuffer: buffer];
+        if (buffer->busy) {
+            // With explicit synchronization there is no wl_buffer.release event.
+            if ([render releasePointSignalledForBuffer: buffer->buffer])
+                buffer->busy = NO;
+            else
+                continue;
+        }
         if (buffer->buffer != NULL && buffer->width == width &&
             buffer->height == height && buffer->format == format)
             return buffer;
@@ -1699,14 +1617,77 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
         height > INT32_MAX / (width * 4))
         return NULL;
 
-    if (reusable->buffer != NULL)
-        sendRequest(reusable->buffer, WP_BUFFER_DESTROY, WL_MARSHAL_FLAG_DESTROY);
-    if (reusable->data != NULL)
-        munmap(reusable->data, reusable->size);
-    memset(reusable, 0, sizeof(*reusable));
+    [self discardBuffer: reusable];
 
     int32_t stride = width * 4;
     size_t size = (size_t) stride * (size_t) height;
+
+    // When the compositor advertised a format/modifier we can import, keep the pixels in an
+    // IOSurface and let the host export its memory as a dma-buf. The same IOSurface backs every
+    // frame in this slot, so GPU contents survive between commits and the CPU view below stays
+    // coherent. Fall back to wl_shm whenever any step is unavailable.
+    uint32_t drmFormat = 0;
+    uint64_t modifier = 0;
+    BOOL needsAlpha = format == WP_SHM_FORMAT_ARGB8888;
+    // Onyx2D produces premultiplied 8-bit ARGB pixels. Request a wide format only when the
+    // producer supplies half-float pixels; a plain window buffer must stay 8-bit.
+    if ([render preferredFormat: &drmFormat modifier: &modifier forSurface: _surface
+                      needsAlpha: needsAlpha
+                     pixelFormat: WaylandRenderPixelFormat8Bit]) {
+        // GPU drivers that import a linear dma-buf need its rows to start at a multiple of the
+        // hardware pitch alignment (up to 256 bytes); a compositor that samples the buffer with
+        // a GPU shows a window sheared when its row length is not so aligned. Pad the rows of
+        // the surface: the compositor is given the real stride of the surface, and the pixel
+        // copy below already honours it.
+        size_t pitch = ((size_t) stride + 255) & ~(size_t) 255;
+        size_t surfaceSize = pitch * (size_t) height;
+        size_t pageSize = (size_t) getpagesize();
+        size_t allocSize = (size_t) ((surfaceSize + pageSize - 1) / pageSize) * pageSize;
+        if (allocSize >= surfaceSize) {
+            NSMutableDictionary *properties = [NSMutableDictionary dictionary];
+            [properties setObject: [NSNumber numberWithInt: width] forKey: (id) kIOSurfaceWidth];
+            [properties setObject: [NSNumber numberWithInt: height] forKey: (id) kIOSurfaceHeight];
+            [properties setObject: [NSNumber numberWithUnsignedInt: 4]
+                           forKey: (id) kIOSurfaceBytesPerElement];
+            [properties setObject: [NSNumber numberWithUnsignedLong: pitch]
+                           forKey: (id) kIOSurfaceBytesPerRow];
+            [properties setObject: [NSNumber numberWithUnsignedLongLong: allocSize]
+                           forKey: (id) kIOSurfaceAllocSize];
+            [properties setObject: [NSNumber numberWithUnsignedInt: 'BGRA']
+                           forKey: (id) kIOSurfacePixelFormat];
+
+            IOSurfaceRef surface = IOSurfaceCreate((CFDictionaryRef) properties);
+            if (surface != NULL) {
+                struct wl_proxy *proxy =
+                        [render newBufferForIOSurface: surface
+                                               format: drmFormat
+                                             modifier: modifier
+                                            forSurface: _surface
+                                                width: width
+                                               height: height
+                                               offset: 0
+                                               stride: (uint32_t) pitch];
+                if (proxy != NULL) {
+                    // create_immed has no dispatcher of its own. Without explicit synchronization
+                    // the compositor still sends wl_buffer.release, which frees this slot.
+                    WL.wl_proxy_add_dispatcher(proxy, WaylandDispatch,
+                                               (void *) (uintptr_t) WaylandObjectBuffer, self);
+                    reusable->buffer = proxy;
+                    reusable->surface = surface;
+                    reusable->width = width;
+                    reusable->height = height;
+                    reusable->format = format;
+                    reusable->drmFormat = drmFormat;
+                    reusable->modifier = modifier;
+                    return reusable;
+                }
+                CFRelease(surface);
+            }
+        }
+    }
+
+    if (_display->_shm == NULL)
+        return NULL;
     int fd = WaylandCreateAnonymousFile(size);
     if (fd < 0) {
         NSLog(@"Wayland backend: cannot allocate a %dx%d window buffer", width,
@@ -1750,7 +1731,7 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
 // per frame callback.
 - (void) presentIfPossible {
     if (!_needsPresent || !_mapped || !_configured || _configureUpdatePending || _frameCallback != NULL ||
-        _fullscreenSettling || _context == nil)
+        [_cgsWindow toplevelFullscreenSettling] || _context == nil)
         return;
 
     O2Surface *surface = [_context surface];
@@ -1766,13 +1747,41 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
     struct WaylandBuffer *buffer = [self bufferWithWidth: (int32_t) width
                                                   height: (int32_t) height
                                                   format: format];
-    if (buffer == NULL)
+    if (buffer == NULL) {
+        // An explicitly synchronized buffer has no wl_buffer.release event. When its timeline has
+        // not been signalled yet, ask for another frame callback instead of waiting forever for an
+        // event the compositor will not send.
+        BOOL waitingForExplicitRelease = NO;
+        for (int i = 0; i < 2; i++)
+            if (_buffers[i].busy && _buffers[i].surface != NULL)
+                waitingForExplicitRelease = YES;
+        if (waitingForExplicitRelease && _frameCallback == NULL) {
+            union wl_argument args[1] = {{.o = NULL}};
+            _frameCallback = WaylandCreateObject(_surface, WP_SURFACE_FRAME,
+                                                 &wl_callback_interface, args,
+                                                 WaylandObjectFrameCallback, self);
+            [_display flush];
+        }
         return;
+    }
 
-    // Both start with the top row.
-    for (size_t row = 0; row < height; row++)
-        memcpy((uint8_t *) buffer->data + row * width * 4,
-               pixels + row * sourceStride, width * 4);
+    // Both start with the top row. An IOSurface's stride can differ from the tight shm stride.
+    if (buffer->surface != NULL) {
+        if (IOSurfaceLock(buffer->surface, 0, NULL) != kIOSurfaceSuccess)
+            return;
+        uint8_t *destination = (uint8_t *) IOSurfaceGetBaseAddressOfPlane(buffer->surface, 0);
+        size_t destinationStride = IOSurfaceGetBytesPerRowOfPlane(buffer->surface, 0);
+        if (destination != NULL && destinationStride >= width * 4) {
+            for (size_t row = 0; row < height; row++)
+                memcpy(destination + row * destinationStride,
+                       pixels + row * sourceStride, width * 4);
+        }
+        IOSurfaceUnlock(buffer->surface, 0, NULL);
+    } else {
+        for (size_t row = 0; row < height; row++)
+            memcpy((uint8_t *) buffer->data + row * width * 4,
+                   pixels + row * sourceStride, width * 4);
+    }
 
     union wl_argument args[4] = {{.o = (struct wl_object *) buffer->buffer},
                                  {.i = 0},
@@ -1802,6 +1811,8 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
                                          &wl_callback_interface, args,
                                          WaylandObjectFrameCallback, self);
 
+    // fifo (and explicit sync for a dma-buf buffer, if one was attached) must be set before commit.
+    [[_display renderManager] beginFrameForSurface: _surface buffer: buffer->buffer];
     [self commitSurface];
     buffer->busy = YES;
     _needsPresent = NO;
@@ -1824,79 +1835,9 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
             [self outputRemoved: (struct wl_proxy *) args[0].o];
         }
         break;
-    case WaylandObjectXdgSurface:
-        if (opcode == WP_XDG_SURFACE_EV_CONFIGURE)
-            [self configure: args[0].u];
-        break;
-
-    case WaylandObjectLayerSurface:
-        if (opcode == WP_LAYER_SURFACE_EV_CONFIGURE) {
-            union wl_argument ack[1] = {{.u = args[0].u}};
-            WaylandMarshal(_layerSurface, WP_LAYER_SURFACE_ACK_CONFIGURE, NULL, 0, ack);
-            // A zero size leaves the choice to the client.
-            _pendingWidth = args[1].u != 0 ? (int32_t) args[1].u : (int32_t) ceil(_frame.size.width);
-            _pendingHeight = args[2].u != 0 ? (int32_t) args[2].u : (int32_t) ceil(_frame.size.height);
-            _pendingActivated = NO;
-            _pendingMaximized = _pendingFullscreen = NO;
-            [self scheduleConfigureApply];
-        } else if (opcode == WP_LAYER_SURFACE_EV_CLOSED) {
-            // The compositor took the bar away (its output is gone): it is not a window the
-            // user closed, so the bar is only hidden.
-            NSUInteger generation = _surfaceGeneration;
-            [_display performAfterDispatch: ^{
-                if (!self->_mapped || self->_surfaceGeneration != generation)
-                    return;
-                [self unmap];
-                [self->_delegate orderOut: nil];
-            }];
-        }
-        break;
-
-    case WaylandObjectToplevel:
-        if (opcode == WP_TOPLEVEL_EV_CONFIGURE) {
-            _pendingWidth = args[0].i;
-            _pendingHeight = args[1].i;
-            struct wl_array *states = args[2].a;
-            _pendingActivated = WaylandStatesContain(states, WP_TOPLEVEL_STATE_ACTIVATED);
-            _pendingMaximized = WaylandStatesContain(states, WP_TOPLEVEL_STATE_MAXIMIZED);
-            _pendingFullscreen = WaylandStatesContain(states, WP_TOPLEVEL_STATE_FULLSCREEN);
-            _pendingSuspended = WaylandStatesContain(states, WP_TOPLEVEL_STATE_SUSPENDED);
-        } else if (opcode == WP_TOPLEVEL_EV_CLOSE) {
-            [self closeRequested];
-        } else if (opcode == WP_TOPLEVEL_EV_WM_CAPABILITIES) {
-            _pendingMinimizeAdvertised = WaylandStatesContain(args[0].a, WP_TOPLEVEL_CAPABILITY_MINIMIZE);
-        }
-        break;
-
     case WaylandObjectToplevelSession:
         // The event only says the compositor used the state saved under this name; the state itself
         // arrives with the following configure, which is handled as an ordinary toplevel configure.
-        break;
-
-    case WaylandObjectDecoration:
-        if (opcode == WP_TOPLEVEL_DECORATION_EV_CONFIGURE)
-            _pendingClientDecorated = args[0].u != WP_TOPLEVEL_DECORATION_MODE_SERVER_SIDE;
-        break;
-
-    case WaylandObjectPopup:
-        if (opcode == WP_POPUP_EV_CONFIGURE) {
-            _pendingPopupX = args[0].i;
-            _pendingPopupY = args[1].i;
-            _pendingWidth = args[2].i;
-            _pendingHeight = args[3].i;
-        } else if (opcode == WP_POPUP_EV_DONE) {
-            NSUInteger generation = _surfaceGeneration;
-            BOOL tooltip = [self isTooltip];
-            [_display performAfterDispatch: ^{
-                if (!self->_mapped || self->_surfaceGeneration != generation)
-                    return;
-                // Dismissing a tool tip must not cancel menu tracking.
-                if (tooltip || self->_genericPopup)
-                    [self unmap];
-                else
-                    [self->_display cancelPopupMenus];
-            }];
-        }
         break;
 
     case WaylandObjectFrameCallback:
@@ -1919,11 +1860,151 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
     }
 }
 
-// xdg_surface.configure ends a configure sequence: apply the toplevel state.
-- (void) configure: (uint32_t) serial {
-    union wl_argument args[1] = {{.u = serial}};
-    WaylandMarshal(_xdgSurface, WP_XDG_SURFACE_ACK_CONFIGURE, NULL, 0, args);
+#pragma mark - Window system events
+
+static void WaylandWindowToplevelEvent(CGSWindow *window, const CGSToplevelEvent *event, void *info) {
+    [(WaylandWindow *) info toplevelEvent: event];
+}
+
+// What the window system window says of the window.
+- (void) toplevelEvent: (const CGSToplevelEvent *) event {
+    switch (event->kind) {
+    case kCGSToplevelEventWillShow:
+        [self roleCreated];
+        break;
+    case kCGSToplevelEventCloseRequested:
+        [self closeRequested];
+        break;
+    case kCGSToplevelEventConfigured:
+        [self configured: &event->configure];
+        break;
+    case kCGSToplevelEventDismissed:
+        [self dismissed];
+        break;
+    case kCGSToplevelEventInputMethodPreedit:
+    case kCGSToplevelEventInputMethodCommit:
+    case kCGSToplevelEventInputMethodDeleteSurrounding:
+        [_inputMethod handleToplevelEvent: event];
+        break;
+    case kCGSToplevelEventOcclusionChanged:
+        // Whether the compositor still repaints the window: what depends on it follows.
+        [_display performAfterDispatch: ^{
+          if (self->_invalidated)
+              return;
+          [self updateIdleInhibitor];
+          if ([self->_delegate respondsToSelector: @selector(platformWindowOcclusionChanged:)])
+              [self->_delegate platformWindowOcclusionChanged: self];
+        }];
+        break;
+    case kCGSToplevelEventMiniaturized:
+        if (!_invalidated)
+            [_delegate platformWindowMiniaturized: self];
+        break;
+    case kCGSToplevelEventDeminiaturized:
+        // A window being invalidated (-dealloc does it) has no NSWindow to tell.
+        if (!_invalidated)
+            [_delegate platformWindowDeminiaturized: self];
+        break;
+    case kCGSToplevelEventParentLost:
+        // The compositor dropped the relation with the parent: a dialog needs one.
+        [self updateDialogForToplevel];
+        break;
+    case kCGSToplevelEventFullscreenSettled:
+        // The compositor answered a request for fullscreen: the content can be drawn at the size it chose.
+        [_display performAfterDispatch: ^{
+          if (!self->_invalidated)
+              [self presentIfPossible];
+        }];
+        break;
+    default:
+        break;
+    }
+}
+
+// The window system window made the role, and is about to commit the surface for the first time: what goes to the
+// compositor before that is told now.
+- (void) roleCreated {
+    CGSWindowWayland *window = (CGSWindowWayland *) _cgsWindow;
+    _xdgSurface = [window xdgSurfaceProxy];
+    _toplevel = [window toplevelProxy];
+    _popup = [window popupProxy];
+    _layerSurface = [window layerSurfaceProxy];
+
+    if (_toplevel != NULL) {
+        [self updateTitle];
+        [self updateFullscreen];
+        [self updateSizeLimits];
+        [self updateLevelParent];
+        [self updateDialogForToplevel];
+        [self updateDecorationMode];
+        [self updateApplicationMenu];
+        [self updateTaskbarPresence];
+        _toplevelIconSet = NO;
+        [self updateToplevelIcon];
+        // The session request has to precede the initial commit on the surface.
+        [self joinSessionBeforeCommit];
+    } else if (_popup != NULL && ([self isTooltip] || (_genericPopup && [_delegate ignoresMouseEvents]))) {
+        // No grab, and an empty input region: the pointer keeps its focus on the parent while a tool tip is shown beside it.
+        [_cgsWindow setToplevelIgnoresMouseEvents: YES];
+    }
+    // The multiplier is double-buffered, so it has to be set before the surface's first commit.
+    [self updateAlphaModifier];
+}
+
+// The end of a configure sequence of the compositor: apply the toplevel state.
+- (void) configured: (const CGSToplevelConfigure *) configure {
+    if (_layerSurface != NULL) {
+        // A zero size leaves the choice to the client.
+        _pendingWidth = configure->width != 0 ? configure->width : (int32_t) ceil(_frame.size.width);
+        _pendingHeight = configure->height != 0 ? configure->height : (int32_t) ceil(_frame.size.height);
+        _pendingActivated = NO;
+        _pendingMaximized = _pendingFullscreen = NO;
+        [self scheduleConfigureApply];
+        return;
+    }
+    _pendingWidth = configure->width;
+    _pendingHeight = configure->height;
+    _pendingActivated = configure->activated;
+    _pendingMaximized = configure->maximized;
+    _pendingFullscreen = configure->fullscreen;
+    if (_popup != NULL) {
+        _pendingPopupX = configure->popupX;
+        _pendingPopupY = configure->popupY;
+    }
+    if (configure->decorationReported)
+        _pendingClientDecorated = configure->clientDecorated;
     [self scheduleConfigureApply];
+}
+
+// The compositor took the window away: a pop-up it dismissed, or the menu bar whose output is gone.
+- (void) dismissed {
+    NSUInteger generation = _surfaceGeneration;
+    if (_layerSurface != NULL) {
+        // The bar is not a window the user closed, so it is only hidden.
+        [_display performAfterDispatch: ^{
+            if (!self->_mapped || self->_surfaceGeneration != generation)
+                return;
+            [self unmap];
+            [self->_delegate orderOut: nil];
+        }];
+    } else if (_popup != NULL) {
+        BOOL tooltip = [self isTooltip];
+        [_display performAfterDispatch: ^{
+            if (!self->_mapped || self->_surfaceGeneration != generation)
+                return;
+            // Dismissing a tool tip must not cancel menu tracking.
+            if (tooltip || self->_genericPopup)
+                [self unmap];
+            else
+                [self->_display cancelPopupMenus];
+        }];
+    }
+}
+
+// The window system window follows the frame of this one (a pop-up is placed relative to its parent's, a menu bar sized
+// like its frame); this tells it of a frame the compositor changed.
+- (void) syncCGFrame {
+    [(CGSWindowWayland *) _cgsWindow noteToplevelFrame: NSRectToCGRect(_frame)];
 }
 
 - (void) scheduleConfigureApply {
@@ -1969,8 +2050,8 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
     // Tell the delegate when the compositor's fullscreen state changes.
     BOOL fullscreenChanged = _pendingFullscreen != _fullscreenReported;
     _fullscreenReported = _pendingFullscreen;
-    if (_fullscreenSettling && _fullscreenReported == _fullscreenRequested)
-        _fullscreenSettling = NO;
+    [self updateShortcutsInhibitor];
+    [self updateContentType];
 
     BOOL sized = NO;
     BOOL moved = NO;
@@ -1981,6 +2062,7 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
                 NSMaxY(parent) - _pendingPopupY + offset.y - _pendingHeight);
         moved = !NSEqualPoints(_frame.origin, origin);
         _frame.origin = origin;
+        [self syncCGFrame];
     }
     if (width > 0 && height > 0 &&
         (width != WaylandFullscreenRound(_frame.size.width) ||
@@ -1993,7 +2075,19 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
         frame.size = NSMakeSize(width, height);
         [self invalidateContextWithNewSize: frame.size];
         _frame = frame;
+        [self syncCGFrame];
         sized = YES;
+    }
+
+    // A fullscreen window is the screen's frame; the compositor places it, a client has no position of its own.
+    NSRect screenFrame;
+    if (_pendingFullscreen && _popupParent == nil &&
+        [_display fullscreenScreenFrameForSize: _frame.size entered: _surfaceOutputs frame: &screenFrame] &&
+        !NSEqualPoints(_frame.origin, screenFrame.origin))
+    {
+        _frame.origin = screenFrame.origin;
+        [self syncCGFrame];
+        moved = YES;
     }
 
     [self updateSubwindows];
@@ -2007,24 +2101,12 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
         }];
     }
 
+    [(CGSWindowWayland *) _cgsWindow setToplevelContentOffset: NSPointToCGPoint([self contentOffset])];
+    [self updateClientDecorationLayout];
+
     BOOL activationChanged = _pendingActivated != _activated;
     BOOL activated = _pendingActivated;
     _activated = activated;
-    _minimizeAdvertised = _pendingMinimizeAdvertised;
-    // Only the change to activated shows a restore: a configure that repeats the state of a window
-    // that was active when it was minimized may already be on its way.
-    if (activationChanged && activated)
-        [self endMinimized];
-
-    BOOL suspendedChanged = _pendingSuspended != _suspended;
-    _suspended = _pendingSuspended;
-    if (suspendedChanged) {
-        [self updateIdleInhibitor];
-        [_display performAfterDispatch: ^{
-          if ([self->_delegate respondsToSelector: @selector(platformWindowOcclusionChanged:)])
-              [self->_delegate platformWindowOcclusionChanged: self];
-        }];
-    }
 
     if (firstConfigure || sized || moved || activationChanged || decorationChanged) {
         [_display performAfterDispatch: ^{
@@ -2063,7 +2145,7 @@ static int32_t WaylandToplevelLimit(CGFloat limit, CGFloat decoration) {
 
 // Whether the compositor currently holds the window fullscreen.
 - (BOOL) isFullScreen {
-    return _mapped && _fullscreenReported;
+    return _mapped && [_cgsWindow toplevelIsFullscreen];
 }
 
 - (void) closeRequested {

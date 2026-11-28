@@ -26,6 +26,7 @@
 #include <stdatomic.h>
 
 @class CGSWindow;
+@class CGSCursor;
 @class CGSScreen;
 @class CGSKeyboardLayout;
 
@@ -47,11 +48,16 @@
 	double _pointerDeltaX, _pointerDeltaY;
 	double _pointerSuppressUntil;
 	BOOL _pointerHiddenUntilMouseMoves;
+	// The cursor the process selected for its windows (nil: the default one). Guarded by @synchronized(self).
+	CGSCursor* _cursor;
 	// The displays the reconfiguration callbacks were last told about (nil until the displays
 	// have been read once). Guarded by @synchronized(self).
 	NSArray<CGSScreen*>* _reportedScreens;
 	// Non-zero while this process changes a mode itself, which it reports itself.
 	_Atomic int _suppressLayoutReports;
+	// Whether the desktop shows application menus, as the framework above said (see -setGlobalMenuAvailable:). Guarded by
+	// @synchronized(self).
+	BOOL _globalMenuAvailable;
 }
 -(instancetype) initWithConnectionID:(CGSConnectionID)connId;
 -(void) dealloc;
@@ -59,10 +65,15 @@
 // A snapshot of the connection's windows (the caller releases it)
 -(NSArray<CGSWindow*>*) copyAllWindows;
 -(CGSWindow*) newWindow:(CGSRegionRef)region;
+// A new window id: a positive number that fits 32 bits and that no window of any process of the system has, like the
+// ids the window server hands out (windows of different processes are told apart by their ids).
+-(CGSWindowID) _allocateWindowID;
 // A toplevel window for the application's UI layer (see CGSWindow.h), or nil when the window system cannot make
 // one, which is the default. The window's id is the number CGWindow gives the UI layer's platform window.
 -(CGSWindow*) newToplevelWindowWithAttributes:(const CGSToplevelAttributes*)attributes;
 -(BOOL) supportsTranslucentToplevels;
+// The ids of the shown toplevel windows, front to back (see _CGSOrderedToplevelWindowIDs()). The default knows of none.
+-(NSArray<NSNumber*>*) orderedToplevelWindowIDs;
 
 // Activates the windows of another process directly through the display server (see
 // _CGSActivateProcess() for the options). Returns kCGErrorSuccess when a request was sent and
@@ -160,6 +171,12 @@
 -(void) unhideCursor;
 -(void) forceShowCursor;
 -(BOOL) cursorIsVisible;
+// The cursor the process shows over its windows (CGSCursorSetCurrent(); nil is the default one). The backend that
+// keeps the pointer gives it to the window system in -cursorChanged, which is called on the thread that set it
+// (the default does nothing). While the cursor is hidden nothing of it is shown, and it is the one shown again.
+-(void) setCursor:(CGSCursor*)cursor;
+-(CGSCursor*) cursor;
+-(void) cursorChanged;
 // NO disconnects the mouse from the cursor: the cursor stays where it is and the mouse only makes deltas.
 -(void) setMouseAssociatedWithCursor:(BOOL)associated;
 // The mouse motion since the previous call in whole points, and the way for a framework that makes mouse events
@@ -178,6 +195,12 @@
 // Whether the mouse is disassociated from the cursor with the cursor held (the frozen position in
 // *frozenRoot, window system pixels), and whether the application wants that; for the framework above.
 -(BOOL) relativeMouseState:(BOOL*)requested frozenRoot:(CGPoint*)frozenRoot;
+// What the window system does for the application's menu (see _CGSNativeConnectionCarriesApplicationMenuAddress() and
+// the ones that follow it). The defaults are for a window system that does neither.
+-(BOOL) carriesApplicationMenuAddress;
+-(BOOL) placesMenuBar;
+-(BOOL) globalMenuAvailable;
+-(void) setGlobalMenuAvailable:(BOOL) available;
 // The windows the pointer could be confined to changed.
 -(void) pointerWindowsChanged;
 -(void) selectTouchInputOnNativeWindow:(unsigned long)window;
@@ -203,6 +226,12 @@
 // shares for the color management of its windows instead of binding the compositor's globals again.
 // The default is nil.
 -(id) waylandColorManager;
+// The WaylandRenderManager (see WaylandRender.h) of a Wayland connection: the dma-buf, explicit
+// synchronization and fifo client. The framework above shares it, because a wl_surface takes only one
+// syncobj surface and one fifo object. The default is nil.
+-(id) waylandRenderManager;
+// Whether a display of this connection reports luminance above its reference white. The default is NO.
+-(BOOL) extendedDynamicRangeAvailable;
 
 // Implementations should also emit kTISNotifySelectedKeyboardInputSourceChanged via NSDistributedNotificationCenter
 // if layout changes.

@@ -41,7 +41,7 @@ typedef enum {
 @protocol CGSNativeConnectionObserver <NSObject>
 @optional
 // X11: an event read from the connection that CoreGraphics did not handle itself (an XEvent*). The
-// observer calls XFilterEvent() as Xlib requires.
+// input method has seen it already (XFilterEvent(), as Xlib requires).
 - (void) nativeConnectionEvent: (void *) event;
 // The pending events have been read and dispatched (on Wayland the listeners of every object on the
 // connection have run). The observer sends what it queued meanwhile.
@@ -56,8 +56,17 @@ typedef enum {
 // Another process asked for the windows of this one to be activated and the window system offers
 // no request for that, so only the process can do it (Wayland). Called on the main thread.
 - (void) nativeConnectionActivationRequested;
+// The window system's input focus moved to a window of another client (not to a window of this process, and
+// not to none). Called on the main thread by a backend whose window system tells (X11: the active window).
+- (void) nativeConnectionFocusMovedToAnotherClient;
 // The compositor's color management or color representation global arrived after the windows were made.
 - (void) nativeConnectionColorManagerAvailable;
+// The compositor's dma-buf, explicit synchronization or fifo global arrived after the windows were made.
+- (void) nativeConnectionRenderManagerAvailable;
+// The compositor's preferred image description for a surface changed. The pointer identifies the
+// wp_color_management_surface_feedback_v1 proxy CoreGraphics made for that surface; the framework
+// above reads the new description with WaylandColorManager's -preferredInfoForFeedback:.
+- (void) nativeConnectionSurfaceColorPreferenceChanged: (void *) feedback;
 // The process took or dropped its last power assertion that keeps the display awake.
 - (void) nativeConnectionDisplaySleepPreventionChanged;
 // The keyboard focus moved to a window system object of the process (the wl_surface on Wayland), or
@@ -68,17 +77,6 @@ typedef enum {
 // Called before CoreGraphics posts the events a keyboard event of the window system makes, so that
 // the observer can send what it holds back from earlier input first (the order of the events).
 - (void) nativeConnectionWillPostKeyboardEvent;
-// X11: the text a key press (an XKeyEvent*) makes after the input method of the window it is for has
-// composed it. The input contexts belong to the framework that owns the windows (the input method
-// stays in the application); nil when the observer has no input context for the window, which makes
-// CoreGraphics look the key up in the keymap. The keysym is set when the lookup gives one (NoSymbol,
-// 0, otherwise).
-- (NSString *) nativeConnectionComposedTextForKeyEvent: (void *) event keySym: (unsigned long *) keySym;
-// X11: whether an input method of the application (XMODIFIERS names one) composes dead keys and Compose
-// sequences, filtering the key events (XFilterEvent) and returning the text. Without one (the observer does not
-// answer, or answers NO; Xlib's built-in input method only composes) CoreGraphics composes them itself, and does
-// not pass the key events to Xlib's compose filter, which drops a sequence that no table entry continues.
-- (BOOL) nativeConnectionInputMethodComposes;
 // X11: CoreGraphics has decoded a pointer event (an XEvent*) into the CGEvent and is about to post it.
 // The observer may add what only it knows (kCGSMouseEventWindowKeyState). Returns whether the process'
 // event stream gets the event: NO when the window it is for does not take it (a mouse moved event for a
@@ -127,11 +125,6 @@ typedef enum {
 // The seat gained or lost its pointer. The compositor objects that need it (cursor, locked pointer)
 // are reached through _CGSNativeConnectionPointer().
 - (void) nativeConnectionPointerAvailabilityChanged: (BOOL) available;
-// X11 and Wayland: the process' cursor became hidden or shown (CGDisplayHideCursor() and the calls that undo
-// it). The windows the observer created show a blank cursor while it is hidden (Wayland: CoreGraphics has
-// given the pointer no image, and the observer, which has the cursor images, applies its own again when the
-// cursor is shown, and keeps the cursor hidden while _CGSNativeConnectionCursorHidden()). Main thread.
-- (void) nativeConnectionCursorHiddenChanged: (BOOL) hidden;
 // X11: the window (an X window) the pointer is to be grabbed for when the mouse is disassociated from the
 // cursor (CGAssociateMouseAndMouseCursorPosition(false)): the one the observer prefers (the key window). A
 // display overlay comes first, whatever the observer says. 0 for none, which leaves the choice to CoreGraphics (the window of the connection with the focus).
@@ -139,6 +132,10 @@ typedef enum {
 // X11: the pointer grab of the disassociated mouse was taken (active) on a window, with the frozen cursor in
 // root pixels, or released. The observer forgets the pointer position it knew.
 - (void) nativeConnectionRelativeMouseGrabChanged: (BOOL) active window: (unsigned long) window rootX: (int) x rootY: (int) y;
+// X11: the pointer was grabbed for the window of a menu that is being tracked (active), or the grab ended (see
+// -[CGSWindow setToplevelHoldsInputForMenu:]). Another grab of the observer's (the confinement of the pointer to a window)
+// is replaced by it and has to be taken again when it ends.
+- (void) nativeConnectionMenuGrabChanged: (BOOL) active;
 @end
 
 // The kind of the process' connection to the window system, opening it if needed.
@@ -164,6 +161,17 @@ extern void _CGSNativeConnectionFlushPendingKeyboardEvents(void);
 // then *frozenRoot is the frozen cursor in root pixels. *requested says whether the application wants it
 // (the grab is held only while the focus is). Either may be NULL.
 extern BOOL _CGSNativeConnectionRelativeMouseState(BOOL *requested, CGPoint *frozenRoot);
+// The desktop's application menu. Whether the window system can carry the address of a window's application menu (a
+// property of the window on X11, KDE's appmenu protocol on Wayland), for a desktop that shows application menus outside
+// the application (see -[CGSWindow setToplevelApplicationMenuServiceName:objectPath:]).
+extern BOOL _CGSNativeConnectionCarriesApplicationMenuAddress(void);
+// Whether the window system places a menu bar window of the application along the top of the screen (X11: the window
+// manager handles dock windows; Wayland: the compositor has a layer shell).
+extern BOOL _CGSNativeConnectionPlacesMenuBar(void);
+// Whether the session has a desktop that shows application menus, as the framework above found out (a registrar of
+// application menus on the session bus: CoreGraphics has no bus connection of its own). NO until it says.
+extern BOOL _CGSNativeConnectionGlobalMenuAvailable(void);
+extern void _CGSNativeConnectionSetGlobalMenuAvailable(BOOL available);
 // X11: the windows the pointer can be grabbed for changed (a display overlay appeared or went): a wanted
 // grab that is not held is retried.
 extern void _CGSNativeConnectionPointerWindowsChanged(void);
@@ -183,9 +191,6 @@ extern void *_CGSNativeConnectionPointer(void);
 extern void _CGSNativeConnectionSetPointerSurfacePoint(double x, double y);
 
 
-// The cursor of the process is hidden by the connection (Wayland): the framework that sets the cursor image
-// keeps it hidden. False without a connection or when the backend leaves the state to the framework.
-extern bool _CGSNativeConnectionCursorHidden(void);
 // +[NSCursor setHiddenUntilMouseMoves:] for a connection that keeps the flag; false when it does not, and
 // nothing was done.
 extern bool _CGSSetCursorHiddenUntilMouseMoves(bool flag);
@@ -193,6 +198,11 @@ extern bool _CGSSetCursorHiddenUntilMouseMoves(bool flag);
 extern bool _CGSNativeConnectionPointerLocked(void);
 // The color manager of a Wayland connection (see WaylandColor.h), nil without one.
 extern id _CGSNativeConnectionWaylandColorManager(void);
+// The render-protocol manager of a Wayland connection (see WaylandRender.h), nil without one.
+extern id _CGSNativeConnectionWaylandRenderManager(void);
+// Whether any connected output reports luminance headroom above its reference white. False on a
+// connection without color management; CAEDRMetadata.isAvailable asks this.
+extern bool _CGSExtendedDynamicRangeAvailable(void);
 // This process holds a power assertion that keeps the display awake; false without a backend that tracks it.
 extern bool _CGSNativeConnectionDisplaySleepPrevented(void);
 // The surface the lock should be made on may be another one (a window was mapped, unmapped or activated).

@@ -17,20 +17,25 @@
  SOFTWARE. */
 
 #import <CoreGraphics/CGWindowPrivate.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <Onyx2D/O2Geometry.h>
 #include <wayland-util.h>
 
+#import <CoreGraphics/CGSWindow.h>
 #import "WaylandDisplay.h"
 #import "WaylandFullscreen.h"
 
-@class NSWindow, O2Context, WaylandSubWindow;
+@class NSWindow, NSColorSpace, O2Context, WaylandSubWindow, NSCGSInputMethod;
 
 struct WaylandBuffer {
     struct wl_proxy *buffer;
-    void *data;
+    void *data;         // wl_shm mapping; NULL for a dma-buf buffer
     size_t size;
+    IOSurfaceRef surface; // retained while the buffer is attached
     int32_t width, height;
-    uint32_t format;
+    uint32_t format;    // wl_shm format, used to reuse a matching buffer
+    uint32_t drmFormat; // DRM format of a dma-buf attachment
+    uint64_t modifier;
     BOOL busy; // attached and not yet released by the compositor
 };
 
@@ -46,6 +51,12 @@ typedef enum {
 // copied into wl_shm buffers.
 @interface WaylandWindow : CGWindow {
     NSWindow *_delegate;
+    // The window system's window: it owns the wl_surface and the xdg-shell and layer-shell objects of the window (the
+    // role), which it makes when the window is shown, and tells what the compositor says of them. _surface and the
+    // other proxies below are its objects, which this window draws into and extends.
+    CGSWindow *_cgsWindow;
+    // The window's use of the window system's input method, which CoreGraphics runs (see NSCGSInputMethod).
+    NSCGSInputMethod *_inputMethod;
     WaylandDisplay *_display;
     BOOL _invalidated;
     NSMutableArray *_subwindows; // nonretained pointers; children retain their parent
@@ -69,8 +80,6 @@ typedef enum {
     struct wl_proxy *_toplevel;
     // The menu bar, when the compositor has wlr-layer-shell: it has this role instead of the xdg ones.
     struct wl_proxy *_layerSurface;
-    // org_kde_kwin_appmenu of the toplevel, while the main menu is exported.
-    struct wl_proxy *_appMenu;
     // org_kde_plasma_surface of the toplevel while it is not an application window (see
     // -updateTaskbarPresence).
     struct wl_proxy *_plasmaSurface;
@@ -79,17 +88,22 @@ typedef enum {
     uint32_t _popupGrabSerial;
     uint32_t _repositionToken;
     int32_t _pendingPopupX, _pendingPopupY;
-    struct wl_proxy *_decoration;
     struct wl_proxy *_frameCallback;
     // Per-surface color objects and the compositor session this toplevel belongs to.
-    struct wl_proxy *_colorSurface, *_representationSurface, *_toplevelSession;
-    // alpha-modifier-v1: how much of the surface alpha the compositor keeps (NSWindow.alphaValue).
-    struct wl_proxy *_alphaModifier;
+    struct wl_proxy *_colorSurface, *_representationSurface, *_surfaceFeedback, *_toplevelSession;
+    // The compositor's preferred content description, when the application has not chosen one.
+    NSColorSpace *_preferredColorSpace;
     // xdg-dialog-v1: the dialog role of a sheet or modal panel, and its current modal hint.
     struct wl_proxy *_dialog;
     BOOL _dialogModal;
     // idle-inhibit-unstable-v1: held while this toplevel is mapped and visible.
     struct wl_proxy *_idleInhibitor;
+    // wp_content_type_v1: fullscreen windows are games, a visible window while the process holds a
+    // display sleep assertion is showing video, and every other window says none.
+    struct wl_proxy *_contentType;
+    uint32_t _contentTypeValue;
+    // keyboard-shortcuts-inhibit-unstable-v1: fullscreen windows take the compositor's shortcuts.
+    struct wl_proxy *_shortcutsInhibitor;
     NSString *_sessionName;
     BOOL _restoringSessionToplevel;
     // Once a surface has committed, a saved session state can no longer be restored on it.
@@ -97,17 +111,7 @@ typedef enum {
     struct WaylandBuffer _buffers[2];
     int32_t _pendingWidth, _pendingHeight;
     BOOL _pendingActivated;
-    // The compositor's xdg_toplevel suspended state (version 6): the surface is not being repainted,
-    // for instance because it is covered or its workspace is not shown.
-    BOOL _pendingSuspended, _suspended;
     BOOL _mapped;
-    // The window was sent -miniaturize (xdg_toplevel.set_minimized) and has not been shown again
-    // since; xdg-shell cannot tell a client whether a toplevel is minimized (see -miniaturize).
-    BOOL _minimized;
-    // Whether the compositor advertised that it minimizes toplevels (xdg_toplevel wm_capabilities,
-    // version 5): one that did not ignores set_minimized. The event applies with the configure that
-    // follows it.
-    BOOL _minimizeAdvertised, _pendingMinimizeAdvertised;
     // The window has been ordered in, whether or not it is mapped (a window with alpha 0 is not).
     BOOL _shouldBeMapped;
     BOOL _fullyTransparent;
@@ -136,17 +140,14 @@ typedef enum {
     struct wl_proxy *_fractionalScale, *_viewport;
     BOOL _scaleUpdatePending, _subwindowRedrawPending, _subwindowRedrawNeeded;
     BOOL _clientDecorated, _pendingClientDecorated, _decorationForcedClient;
+    int _titlebarKind; // the CGSToplevelTitlebarKind NSWindow asked for
     BOOL _maximized, _pendingMaximized;
-    // Whether the current xdg_toplevel was asked for fullscreen, what the last
-    // configure said, and the size to go back to.
-    BOOL _fullscreenRequested, _pendingFullscreen, _fullscreenRecheckPending;
-    BOOL _fullscreenReported; // what the last configure said, told to the delegate
-    BOOL _fullscreenSettling; // a fullscreen change was requested and not yet answered
-    NSUInteger _fullscreenSettleToken;
+    // What the configure being applied said of fullscreen, what the last one applied said (told to the delegate), and the
+    // size to go back to. Asking the compositor for fullscreen, the wait for its answer and the state the compositor holds
+    // are the window system window's (see -[CGSWindow setToplevelFullscreen:force:]).
+    BOOL _pendingFullscreen, _fullscreenRecheckPending;
+    BOOL _fullscreenReported;
     WaylandFullscreenTracker _fullscreenTracker;
-    // The window this one is transient for because of its level, if any (not retained: the
-    // display clears it when that window goes away).
-    WaylandWindow *_levelParent;
     BOOL _configureUpdatePending;
     NSUInteger _surfaceGeneration;
 }
@@ -167,6 +168,9 @@ typedef enum {
 - (BOOL) isInvalidated;
 - (BOOL) isMapped;
 - (BOOL) isFullyTransparent;
+// Tells the window system window whether the window is ordered in without being mapped (see -isOrderedIn).
+- (void) syncHeldBack;
+- (void) activatedInWindowSystem;
 - (BOOL) isOrderedIn;
 - (void) keyboardFocusLeft;
 - (BOOL) isActivatedByCompositor;
@@ -192,9 +196,7 @@ typedef enum {
 // ungrabbed popup of its parent window; it is not part of menu tracking.
 - (BOOL) isGenericPopup;
 - (WaylandWindow *) popupParent;
-- (WaylandWindow *) levelParent;
 - (void) updateLevelParent;
-- (void) levelParentUnmapped;
 - (uint32_t) popupGrabSerial;
 - (struct wl_proxy *) xdgSurface;
 - (void) unmap;
@@ -202,14 +204,18 @@ typedef enum {
 // protocol), or takes the address back when there is no menu or no toplevel.
 - (void) updateApplicationMenu;
 - (NSPoint) contentOffset;
+// The first responder or the caret changed: the input method is told whether the window takes text and where.
+- (void) updateInputMethodSpot;
 - (BOOL) isDecorationPoint: (CGPoint) point;
-- (BOOL) decorationButton: (uint32_t) button pressed: (BOOL) pressed
-                   serial: (uint32_t) serial atPoint: (CGPoint) point;
+// Tells the window system's window where the client-side frame's edges, title bar and buttons are.
+- (void) updateClientDecorationLayout;
 
 // Converts a surface-local point (origin top left) to window coordinates.
 - (NSPoint) transformPoint: (CGPoint) surfacePoint;
 - (void) setLastKnownCursorPosition: (CGPoint) point;
 
+// What the window system window says of the window (see CGSToplevelEvent).
+- (void) toplevelEvent: (const CGSToplevelEvent *) event;
 - (void) handleEvent: (uint32_t) opcode
                 kind: (WaylandObjectKind) kind
                proxy: (struct wl_proxy *) proxy
@@ -218,6 +224,8 @@ typedef enum {
 // Gives the toplevel the application icon (xdg-toplevel-icon), when the compositor has the protocol.
 - (void) updateToplevelIcon;
 
+// The color space of the window's content, or sRGB when neither the window nor a screen reports one.
+- (NSColorSpace *) contentColorSpace;
 // Describes the surface's content color to the compositor, when it supports color management.
 - (void) updateSurfaceColor;
 // Creates the color objects once a surface exists and the manager has been bound.
@@ -227,15 +235,22 @@ typedef enum {
 - (void) joinSessionBeforeCommit;
 // Callbacks from the display when the color manager or session manager arrives later than the window.
 - (void) colorManagerAvailable;
+- (void) preferredColorInfoChanged;
+// Routes a preferred-description change to a subwindow or one of its Metal surfaces.
+- (BOOL) preferredSubwindowColorInfoChangedForFeedback: (struct wl_proxy *) feedback;
+// A dma-buf, syncobj or fifo global arrived after this surface was made.
+- (void) renderGlobalsAvailable;
 - (void) sessionManagerAvailable;
 // Called when the dialog manager arrives later than the window.
 - (void) dialogManagerAvailable;
-// Applies NSWindow.alphaValue to the surface when alpha-modifier-v1 is available.
-- (void) alphaModifierAvailable;
 // Sends the toplevel's stable tag and localized description when xdg-toplevel-tag-v1 is available.
 - (void) updateToplevelTags;
 // Creates or destroys the idle inhibitor as this toplevel becomes visible or occluded.
 - (void) updateIdleInhibitor;
+// Tells the compositor what the surface shows when wp_content_type_v1 is available.
+- (void) updateContentType;
+// Takes or drops the compositor's keyboard shortcuts when the toplevel is fullscreen.
+- (void) updateShortcutsInhibitor;
 
 // Overrides of CGWindow's window-system session hooks (see CGWindowPrivate.h).
 - (NSString *) ensureSessionToplevelName;
@@ -244,6 +259,7 @@ typedef enum {
 - (BOOL) hasCommittedSurface;
 // Commits the surface and records that a session restore request is now too late.
 - (void) commitSurface;
+- (struct wl_proxy *) surfaceFeedback;
 - (struct wl_proxy *) toplevelSession;
 - (void) setToplevelSession: (struct wl_proxy *) proxy;
 

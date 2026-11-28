@@ -221,12 +221,13 @@ bool CAMetalDrawableGLImportsSemaphores() {
 	return false;
 };
 
-CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat pixelFormat, bool framebufferOnly, bool exportsSemaphore, std::shared_ptr<Indium::PrivateDevice> privateDevice):
+CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat pixelFormat, bool linearLight, bool framebufferOnly, bool exportsSemaphore, std::shared_ptr<Indium::PrivateDevice> privateDevice):
 	Indium::PrivateTexture(privateDevice),
 	_size(size),
 	_pixelFormat(pixelFormat),
 	_framebufferOnly(framebufferOnly),
-	_exportsSemaphore(exportsSemaphore)
+	_exportsSemaphore(exportsSemaphore),
+	_linearLight(linearLight)
 {
 	//
 	// create the images
@@ -237,7 +238,12 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat 
 
 	imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	imgInfo.imageType = VK_IMAGE_TYPE_2D;
-	imgInfo.format = Indium::pixelFormatToVkFormat(_pixelFormat);
+	// an extended-range pixel format has no Vulkan format; the image holds the values the shader sees (see Indium's
+	// extended-range.private.hpp), and the copy into the internal image below shows them as an 8-bit surface does
+	imgInfo.format = _device->textureVkFormat(_pixelFormat);
+	if (imgInfo.format == VK_FORMAT_UNDEFINED) {
+		throw std::runtime_error("The device cannot hold a drawable of this pixel format");
+	}
 	imgInfo.extent.width = _size.width;
 	imgInfo.extent.height = _size.height;
 	imgInfo.extent.depth = 1;
@@ -258,6 +264,13 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat 
 
 	// now create the internal image (with exportable memory)
 	imgInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+	if ((Indium::pixelFormatIsExtendedRange(_pixelFormat) && Indium::ExtendedRange::isSRGB(_pixelFormat)) || _linearLight) {
+		// The values of the sRGB variants of the extended-range formats are linear, and so are those of a layer whose
+		// colorspace is a linear one; the copy into the image applies the sRGB curve to them (and clamps them to 0 to 1)
+		// when it is an sRGB image. OpenGL still reads the encoded bytes as RGBA8. Such an image cannot be a storage image.
+		imgInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+		imgInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	}
 
 	// see glAcceptsLinearTiling(); the GL texture below uses the same tiling
 	const bool linearTiling = glAcceptsLinearTiling();
@@ -431,7 +444,7 @@ CAMetalDrawableTexture::CAMetalDrawableTexture(CGSize size, Indium::PixelFormat 
 	imgViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
 	imgViewInfo.image = _image;
 	imgViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-	imgViewInfo.format = Indium::pixelFormatToVkFormat(_pixelFormat);
+	imgViewInfo.format = _device->textureVkFormat(_pixelFormat);
 	imgViewInfo.components.r = VK_COMPONENT_SWIZZLE_R;
 	imgViewInfo.components.g = VK_COMPONENT_SWIZZLE_G;
 	imgViewInfo.components.b = VK_COMPONENT_SWIZZLE_B;
@@ -709,12 +722,12 @@ bool CAMetalDrawableTexture::waitForRendering() {
 // drawable
 //
 
-CAMetalDrawableActual::CAMetalDrawableActual(CAMetalLayerInternal* layer, CGSize size, NSUInteger drawableID, Indium::PixelFormat pixelFormat, std::shared_ptr<Indium::Device> device, CGLContextObj glContext, bool glImportsSemaphores):
+CAMetalDrawableActual::CAMetalDrawableActual(CAMetalLayerInternal* layer, CGSize size, NSUInteger drawableID, Indium::PixelFormat pixelFormat, bool linearLight, std::shared_ptr<Indium::Device> device, CGLContextObj glContext, bool glImportsSemaphores):
 	_drawableID(drawableID),
 	_glContext(CGLRetainContext(glContext)),
 	_glImportsSemaphores(glImportsSemaphores)
 {
-	_texture = std::make_shared<CAMetalDrawableTexture>(size, pixelFormat, layer.framebufferOnly, glImportsSemaphores, std::dynamic_pointer_cast<Indium::PrivateDevice>(device));
+	_texture = std::make_shared<CAMetalDrawableTexture>(size, pixelFormat, linearLight, layer.framebufferOnly, glImportsSemaphores, std::dynamic_pointer_cast<Indium::PrivateDevice>(device));
 	objc_storeWeak(&_layer, layer);
 };
 

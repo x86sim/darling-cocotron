@@ -39,6 +39,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
     // The screens, made from CoreGraphics' displays and dropped when they change. Guarded by
     // @synchronized(self).
     NSArray *_screens;
+    // Whether -_desktopShowsMainMenu looked for a desktop that shows application menus.
+    BOOL _desktopMenuProbed;
 }
 
 + (NSDisplay *) currentDisplay;
@@ -63,8 +65,6 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (void) _addSystemColor: (NSColor *) result forName: (NSString *) colorName;
 
 - (NSTimeInterval) textCaretBlinkInterval;
-
-- (BOOL) activateProcessIdentifier: (pid_t) processIdentifier;
 
 - (void) hideCursor;
 - (void) unhideCursor;
@@ -121,11 +121,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (void) discardEventsMatchingMask: (NSUInteger) mask
                        beforeEvent: (NSEvent *) event;
 
-// What the backends post: the input of the window system, which goes through the CoreGraphics
-// event taps and stream (where mouse motion is coalesced) into the queue. Any thread. With atStart,
-// the event is not input but a notice the application must see before anything else: it is put in
-// front of the queue as it is.
-- (void) postEvent: (NSEvent *) event atStart: (BOOL) atStart;
+// The input of the window system is not posted through the display: the backends of CoreGraphics
+// post it as CGEvents, which go through the CoreGraphics event taps and stream (where mouse motion
+// is coalesced) into the queue.
 // What the application posts (-[NSApplication postEvent:atStart:])
 - (void) _postEventWithoutCoalescing: (NSEvent *) event atStart: (BOOL) atStart;
 

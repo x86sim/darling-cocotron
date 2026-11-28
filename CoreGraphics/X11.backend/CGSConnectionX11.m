@@ -18,9 +18,11 @@
 */
 #import "CGSConnectionX11.h"
 #import "CGSWindowX11.h"
+#import "X11DockSupport.h"
 #import "CGSX11Keyboard.h"
 #import "CGSX11Pointer.h"
 #import "CGSX11Selection.h"
+#import "CGSX11Drag.h"
 #import <CoreGraphics/CGSKeyboardLayout.h>
 #import <CoreGraphics/CGSScreen.h>
 #import <CoreGraphics/CGSNativeConnection.h>
@@ -36,13 +38,17 @@
 #include <poll.h>
 #include <pthread.h>
 #import <X11/Xutil.h>
-#import <X11/extensions/Xrandr.h>
+#import "X11Xrandr.h"
 #import <X11/XKBlib.h>
 #import <X11/extensions/XKBrules.h>
 // The main-monitor model and conversions shared with AppKit's X11 backend.
 #import "X11Monitors.h"
+#import "X11LevelStacking.h"
+#import "X11Occlusion.h"
+#import "X11WindowManager.h"
 #import "X11RandR.h"
 #import "X11WindowOwner.h"
+#import "X11CursorTheme.h"
 #import "X11HotKey.h"
 #import <CoreGraphics/CGWindowPrivate.h>
 #import <CoreGraphics/CGWindowLevel.h>
@@ -141,6 +147,8 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer, CFRunLoopActivi
 		XSynchronize(_display, True);
 
 	XSetErrorHandler(errorHandler);
+	// The windows are judged for being covered once, when the first batch of events has been read.
+	_occlusionDirty = YES;
 
 	pthread_mutex_lock(&g_processConnectionLock);
 	if (g_processConnection == nil)
@@ -205,6 +213,70 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer, CFRunLoopActivi
 	return self;
 }
 
+#pragma mark - Menu grabs
+
+// Holds the pointer for the application while a menu is open, on the newest menu window. Relative mouse mode holds the
+// pointer already; it is not disturbed, an open menu then only sees the pointer inside its windows. The observer's grab
+// of its own (the pointer confined to a fullscreen window) is replaced, which it is told.
+-(void) grabPointerForMenus
+{
+	if ([_openMenuWindows count] == 0 || _CGSNativeConnectionRelativeMouseState(NULL, NULL))
+		return;
+	Window target = ((CGSWindowX11*) [_openMenuWindows lastObject])->_window;
+	if (target == None)
+		return;
+	id<CGSNativeConnectionObserver> observer = [CGSConnection nativeObserver];
+	if ([observer respondsToSelector: @selector(nativeConnectionMenuGrabChanged:)])
+		[observer nativeConnectionMenuGrabChanged: YES];
+	XGrabPointer(_display, target, True, ButtonPressMask | ButtonReleaseMask | PointerMotionMask, GrabModeAsync, GrabModeAsync,
+		None, None, CurrentTime);
+}
+
+// Holds the keyboard for the application while a menu is open, so that its keys reach the menu whichever client has the
+// input focus (an application that only owns the menu bar has none). The keys still go to the application's own windows
+// while one has the focus (owner_events), and the focus events the grab causes are not taken for the focus moving.
+-(void) grabKeyboardForMenus
+{
+	if ([_openMenuWindows count] == 0)
+		return;
+	Window target = ((CGSWindowX11*) [_openMenuWindows lastObject])->_window;
+	if (target == None)
+		return;
+	XGrabKeyboard(_display, target, True, GrabModeAsync, GrabModeAsync, CurrentTime);
+}
+
+-(void) menuWindowShown:(CGSWindowX11*) window
+{
+	if (_openMenuWindows == nil)
+		_openMenuWindows = [NSMutableArray new];
+	[_openMenuWindows removeObjectIdenticalTo: window];
+	[_openMenuWindows addObject: window];
+	[self grabPointerForMenus];
+	[self grabKeyboardForMenus];
+	XFlush(_display);
+}
+
+-(void) menuWindowHidden:(CGSWindowX11*) window
+{
+	if ([_openMenuWindows indexOfObjectIdenticalTo: window] == NSNotFound)
+		return;
+	[_openMenuWindows removeObjectIdenticalTo: window];
+	if ([_openMenuWindows count] > 0)
+	{
+		[self grabPointerForMenus];
+		[self grabKeyboardForMenus];
+		XFlush(_display);
+		return;
+	}
+	XUngrabKeyboard(_display, CurrentTime);
+	if (!_CGSNativeConnectionRelativeMouseState(NULL, NULL))
+		XUngrabPointer(_display, CurrentTime);
+	id<CGSNativeConnectionObserver> observer = [CGSConnection nativeObserver];
+	if ([observer respondsToSelector: @selector(nativeConnectionMenuGrabChanged:)])
+		[observer nativeConnectionMenuGrabChanged: NO];
+	XFlush(_display);
+}
+
 -(void) dealloc
 {
 	pthread_mutex_lock(&g_processConnectionLock);
@@ -218,7 +290,10 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer, CFRunLoopActivi
 	{
 		[_windows removeAllObjects];
 	}
+	// The input contexts of the windows are gone with them; the input method goes before XCloseDisplay().
+	[_inputMethodSupport release];
 	// Closing the display releases the grabs
+	[_openMenuWindows release];
 	[_hotKeys release];
 	[_grabbedHotKeys release];
 	[_pressedHotKeys release];
@@ -231,7 +306,11 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer, CFRunLoopActivi
 	}
 
 	if (_display)
+	{
+		if (_defaultArrow != None)
+			XFreeCursor(_display, _defaultArrow);
 		XCloseDisplay(_display);
+	}
 
 	CFRunLoopRemoveSource(CFRunLoopGetMain(), _source, kCFRunLoopCommonModes);
 
@@ -243,6 +322,7 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer, CFRunLoopActivi
 	[_keyboardLayout release];
 	[_pointer release];
 	[_keyboard release];
+	[_dragSupport release];
 
 	[super dealloc];
 }
@@ -567,10 +647,11 @@ static double windowOpacity(Display* display, Window window)
 		CFDictionaryRef boundsDictionary = CGRectCreateDictionaryRepresentation(bounds);
 		BOOL own = owner == self_pid;
 
-		// A toplevel window of the UI layer is listed under its CGS window id, which is the number the UI layer
-		// gives the window.
+		// A window of a Darling process is listed under its CGS window id, which is the number its owner gives the
+		// window (the UI layer's window number too): the owner published it on the window. A window that does not
+		// say (one of the UI layer's that is not a CGS window, or of another program) has the id of its X window.
 		CGSWindowX11* toplevel = own ? [self _cgsWindowForNativeWindow: client] : nil;
-		NSInteger number = [toplevel isToplevel] ? (NSInteger) toplevel.windowId : 0;
+		NSInteger number = toplevel != nil ? (NSInteger) toplevel.windowId : (NSInteger) X11WindowOwnerWindowID(_display, client);
 		if (number == 0 && own)
 			number = [CGWindow windowNumberForPlatformWindowID: client];
 		if (number == 0)
@@ -645,13 +726,16 @@ static double windowOpacity(Display* display, Window window)
 
 // What the window system says about the CGS windows of this process: repaints (the window's own
 // pixels are put on it again), and the close request, focus and bounds changes, which are reported
-// to whoever asked for them (_CGSSetWindowEventProc).
+// to whoever asked for them (_CGSSetWindowEventProc). A toplevel window of the UI layer draws itself and
+// has its own handler for the repaints, the close request and the changes of its frame (see
+// -[CGSWindow setToplevelEventProc:info:]); its focus is the UI layer's.
 -(void) _windowSystemEvent:(XEvent*) event
 {
 	switch (event->type)
 	{
 		case Expose:
 		case ConfigureNotify:
+		case ReparentNotify:
 		case FocusIn:
 		case FocusOut:
 		case ClientMessage:
@@ -661,12 +745,18 @@ static double windowOpacity(Display* display, Window window)
 	}
 
 	CGSWindowX11* window = [self _cgsWindowForNativeWindow: event->xany.window];
-	// The window of the UI layer, which handles what the window system says about it.
-	if (window == nil || [window isToplevel])
+	if (window == nil)
 		return;
+	BOOL toplevel = [window isToplevel];
 
 	switch (event->type)
 	{
+		case ReparentNotify:
+			// A window manager frame has to point back at a window that takes drops through XdndProxy before a
+			// drag source can find it under the pointer.
+			if (_dragSupport != nil)
+				[_dragSupport windowReparented: window intoParent: event->xreparent.parent];
+			break;
 		case Expose:
 			[window windowSystemDidExpose: &event->xexpose];
 			break;
@@ -674,13 +764,13 @@ static double windowOpacity(Display* display, Window window)
 			[window windowSystemDidConfigure];
 			break;
 		case FocusIn:
-			if (event->xfocus.mode != NotifyGrab && event->xfocus.mode != NotifyUngrab &&
+			if (!toplevel && event->xfocus.mode != NotifyGrab && event->xfocus.mode != NotifyUngrab &&
 				event->xfocus.detail != NotifyPointer && event->xfocus.detail != NotifyPointerRoot &&
 				event->xfocus.detail != NotifyInferior)
 				_CGSPostWindowEvent(kCGSWindowEventActivated, window.windowId, CGRectNull);
 			break;
 		case FocusOut:
-			if (event->xfocus.mode != NotifyGrab && event->xfocus.mode != NotifyUngrab &&
+			if (!toplevel && event->xfocus.mode != NotifyGrab && event->xfocus.mode != NotifyUngrab &&
 				event->xfocus.detail != NotifyPointer && event->xfocus.detail != NotifyPointerRoot &&
 				event->xfocus.detail != NotifyInferior)
 				_CGSPostWindowEvent(kCGSWindowEventDeactivated, window.windowId, CGRectNull);
@@ -690,8 +780,13 @@ static double windowOpacity(Display* display, Window window)
 			Atom deleteWindow = XInternAtom(_display, "WM_DELETE_WINDOW", False);
 			Atom ping = XInternAtom(_display, "_NET_WM_PING", False);
 			if (event->xclient.format == 32 && (Atom) event->xclient.data.l[0] == deleteWindow)
-				_CGSPostWindowEvent(kCGSWindowEventCloseRequested, window.windowId, CGRectNull);
-			else if (event->xclient.format == 32 && (Atom) event->xclient.data.l[0] == ping)
+			{
+				if (toplevel)
+					[window windowSystemDidRequestClose];
+				else
+					_CGSPostWindowEvent(kCGSWindowEventCloseRequested, window.windowId, CGRectNull);
+			}
+			else if (!toplevel && event->xclient.format == 32 && (Atom) event->xclient.data.l[0] == ping)
 			{
 				// The window manager asks whether the window is alive; it answers by getting the message
 				// back on the root window. A window that does not answer is reported as not responding.
@@ -703,6 +798,23 @@ static double windowOpacity(Display* display, Window window)
 			break;
 		}
 	}
+}
+
+// The toplevel windows of the UI layer follow the backing scale the displays have now.
+-(void) _toplevelWindowsLayoutChanged
+{
+	NSMutableArray* toplevels = [NSMutableArray array];
+	@synchronized (_windows)
+	{
+		for (NSNumber* key in _windows)
+		{
+			CGSWindow* window = [_windows objectForKey: key];
+			if ([window isKindOfClass: [CGSWindowX11 class]] && [(CGSWindowX11*) window isToplevel])
+				[toplevels addObject: window];
+		}
+	}
+	for (CGSWindowX11* window in toplevels)
+		[window windowSystemLayoutChanged];
 }
 
 // The display overlay shown last, nil when there is none. Window ids grow with creation.
@@ -847,7 +959,16 @@ static NSArray<NSNumber*>* rootWindowList(Display* display, const char* name);
 
 	if ([active count] == 0 || [active[0] unsignedLongValue] == None)
 		return;
-	_CGSNativeFocusReport(X11WindowOwnerPID(_display, (Window) [active[0] unsignedLongValue]) == getpid());
+	BOOL ours = X11WindowOwnerPID(_display, (Window) [active[0] unsignedLongValue]) == getpid();
+	_CGSNativeFocusReport(ours);
+	// The application is no longer active when the focus is not in one of its toplevel windows (a
+	// display overlay window of the process is not one).
+	if ([self _toplevelForNativeWindow: (Window) [active[0] unsignedLongValue]] == nil)
+	{
+		id observer = [CGSConnection nativeObserver];
+		if ([observer respondsToSelector: @selector(nativeConnectionFocusMovedToAnotherClient)])
+			[observer nativeConnectionFocusMovedToAnotherClient];
+	}
 }
 
 // Handles an event of this connection. Returns YES when the event was this connection's own business
@@ -860,8 +981,21 @@ static NSArray<NSNumber*>* rootWindowList(Display* display, const char* name);
 	// that pace their transfers, belong to the selections.
 	if (CGSX11SelectionHandleEvent(event))
 		return YES;
+	// XDND is entirely ClientMessage traffic: XdndEnter, XdndPosition, XdndStatus, XdndDrop, XdndFinished and
+	// XdndLeave.
+	if (event->type == ClientMessage && _dragSupport != nil && [_dragSupport handleClientMessage: &event->xclient])
+		return YES;
 	[self _windowSystemEvent: event];
 	[_pointer willHandleEvent: event];
+	// Another client's window may cover one of ours; the events the judgement needs and nothing else is
+	// interested in are not passed on.
+	BOOL occlusionEvent = [self _noteOcclusionEvent: event];
+	BOOL handled = [self _processXEvent: event];
+	return handled || occlusionEvent;
+}
+
+-(BOOL) _processXEvent:(XEvent*) event
+{
 	switch (event->type)
 	{
 		case KeyPress:
@@ -920,6 +1054,8 @@ static NSArray<NSNumber*>* rootWindowList(Display* display, const char* name);
 				_CGSNativeFocusReport(YES);
 			}
 			[_pointer focusEvent: event];
+			[self _inputMethodFocusEvent: event gained: YES];
+			[self _toplevelFocusEvent: event gained: YES];
 			break;
 		case FocusOut:
 			// Like FocusIn: grabs and the pointer entering the window do not move the keyboard focus.
@@ -928,12 +1064,28 @@ static NSArray<NSNumber*>* rootWindowList(Display* display, const char* name);
 				event->xfocus.detail != NotifyInferior)
 				[_keyboard resetComposition];
 			[_pointer focusEvent: event];
+			[self _inputMethodFocusEvent: event gained: NO];
+			[self _toplevelFocusEvent: event gained: NO];
 			break;
 		case PropertyNotify:
-			// The observer is told of the root window's properties too (occlusion).
-			if (event->xproperty.window == DefaultRootWindow(_display) &&
-				event->xproperty.atom == XInternAtom(_display, "_NET_ACTIVE_WINDOW", False))
-				[self _activeWindowChanged];
+			if (event->xproperty.window == DefaultRootWindow(_display))
+			{
+				if (event->xproperty.atom == XInternAtom(_display, "_NET_ACTIVE_WINDOW", False))
+					[self _activeWindowChanged];
+			}
+			else if (event->xproperty.atom == XInternAtom(_display, "_NET_WM_STATE", False))
+			{
+				// The manager hid, restored or fullscreened the window, whoever asked.
+				[[self _toplevelForNativeWindow: event->xproperty.window] windowSystemStateChanged];
+			}
+			break;
+		case MapNotify:
+			// The manager has framed and stacked the window by now.
+			[[self _toplevelForNativeWindow: event->xany.window] windowSystemDidMap];
+			break;
+		case ReparentNotify:
+			// A new frame is stacked by the manager as it sees fit.
+			[[self _toplevelForNativeWindow: event->xany.window] windowSystemDidReparent];
 			break;
 		case KeymapNotify:
 			break;
@@ -992,6 +1144,344 @@ static NSArray<NSNumber*>* rootWindowList(Display* display, const char* name);
 		}
 	}
 	return NO;
+}
+
+#pragma mark - Ordering, levels and occlusion of the toplevel windows
+
+-(NSArray<CGSWindowX11*>*) _toplevelWindows
+{
+	NSMutableArray<CGSWindowX11*>* toplevels = [NSMutableArray array];
+	@synchronized (_windows)
+	{
+		for (NSNumber* key in _windows)
+		{
+			CGSWindow* window = [_windows objectForKey: key];
+			if ([window isKindOfClass: [CGSWindowX11 class]] && [(CGSWindowX11*) window isToplevel])
+				[toplevels addObject: (CGSWindowX11*) window];
+		}
+	}
+	return toplevels;
+}
+
+-(void) _toplevelWindowCreated
+{
+	_occlusionDirty = YES;
+}
+
+-(CGSWindowX11*) _toplevelForNativeWindow:(Window) native
+{
+	CGSWindowX11* window = [self _cgsWindowForNativeWindow: native];
+	return [window isToplevel] ? window : nil;
+}
+
+// The keyboard focus came to a window of the process or left it (a grab or the pointer passing over the window
+// moves nothing): the window's input method follows it. Windows that are not toplevel windows have one too.
+-(void) _inputMethodFocusEvent:(XEvent*) event gained:(BOOL) gained
+{
+	if (event->xfocus.mode == NotifyGrab || event->xfocus.mode == NotifyUngrab ||
+		event->xfocus.detail == NotifyPointer || event->xfocus.detail == NotifyPointerRoot ||
+		event->xfocus.detail == NotifyInferior)
+		return;
+	[[self _cgsWindowForNativeWindow: event->xfocus.window] inputMethodFocusChanged: gained];
+}
+
+// The window system's focus moved to or from a toplevel window; a grab or the pointer passing over the window
+// moves nothing.
+-(void) _toplevelFocusEvent:(XEvent*) event gained:(BOOL) gained
+{
+	if (event->xfocus.mode == NotifyGrab || event->xfocus.mode == NotifyUngrab ||
+		event->xfocus.detail == NotifyPointer || event->xfocus.detail == NotifyPointerRoot ||
+		event->xfocus.detail == NotifyInferior)
+		return;
+	[[self _toplevelForNativeWindow: event->xfocus.window] windowSystemFocusChanged: gained];
+}
+
+// Windows (a window manager's frame, when a window closes) can be destroyed while the tree is walked: XQueryTree
+// then fails with BadWindow, which is no error there. Any other error goes to the handler that was installed
+// before. The handler is swapped through the process-wide XSetErrorHandler and a file-scope variable, which is
+// safe only because the connection and these methods are used from the main thread alone.
+static XErrorHandler previousOrderingErrorHandler;
+
+static int ignoreBadWindowWhileOrdering(Display* display, XErrorEvent* errorEvent)
+{
+	if (errorEvent->error_code == BadWindow)
+		return 0;
+	return previousOrderingErrorHandler != NULL ? previousOrderingErrorHandler(display, errorEvent) : 0;
+}
+
+// With a reparenting window manager the top-level windows are children of frame windows, so each root child is
+// matched against our windows and their ancestors.
+-(NSArray<NSNumber*>*) orderedToplevelWindowIDs
+{
+	NSMutableArray<NSNumber*>* result = [NSMutableArray array];
+	NSMutableDictionary<NSNumber*, CGSWindowX11*>* byTopLevel = [NSMutableDictionary dictionary];
+	Window root = DefaultRootWindow(_display);
+
+	XErrorHandler previousHandler = XSetErrorHandler(ignoreBadWindowWhileOrdering);
+	previousOrderingErrorHandler = previousHandler;
+	@try
+	{
+		for (CGSWindowX11* window in [self _toplevelWindows])
+		{
+			Window w = window->_window;
+			if (w == None)
+				continue;
+			Window rootRet, parent, *children = NULL;
+			unsigned int count;
+
+			// Walk up to the root's direct child that contains this window.
+			while (XQueryTree(_display, w, &rootRet, &parent, &children, &count))
+			{
+				if (children)
+					XFree(children);
+				children = NULL;
+				if (parent == root || parent == None)
+					break;
+				w = parent;
+			}
+			byTopLevel[@((unsigned long) w)] = window;
+		}
+
+		Window rootRet, parent, *children = NULL;
+		unsigned int count = 0;
+		if (XQueryTree(_display, root, &rootRet, &parent, &children, &count))
+		{
+			for (unsigned int i = count; i > 0; i--)
+			{
+				CGSWindowX11* window = byTopLevel[@((unsigned long) children[i - 1])];
+				if (window != nil)
+					[result addObject: @(window.windowId)];
+			}
+			if (children)
+				XFree(children);
+		}
+	}
+	@finally
+	{
+		XSetErrorHandler(previousHandler);
+		previousOrderingErrorHandler = NULL;
+	}
+	return result;
+}
+
+// Called from the window code after it made its own request, and again when the window manager has framed and
+// mapped a window (ReparentNotify, MapNotify), because it stacks a new frame by itself.
+-(void) _restackToplevelWindowsForLevelsAround:(CGSWindowX11*) anchor
+{
+	if (![anchor takesPartInLevelStacking])
+		return;
+
+	XErrorHandler previousHandler = XSetErrorHandler(ignoreBadWindowWhileOrdering);
+	previousOrderingErrorHandler = previousHandler;
+	@try
+	{
+		BOOL anchorUnmanaged = [anchor isUnmanaged];
+		Window anchorTop = X11TopLevelAncestor(_display, anchor->_window);
+
+		for (CGSWindowX11* other in [self _toplevelWindows])
+		{
+			if (other == anchor || ![other takesPartInLevelStacking])
+				continue;
+
+			if (anchorUnmanaged && [other isUnmanaged])
+			{
+				// Two override-redirect windows (the menu bar and a borderless window that cannot become
+				// key): the server stacks them in the order they were raised, so the level is applied here.
+				Window otherTop = X11TopLevelAncestor(_display, other->_window);
+				if (anchorTop == None || otherTop == None)
+					continue;
+				if (X11UnmanagedBelowUnmanaged([anchor stackingLevel], [other stackingLevel]))
+					X11StackBelowIfAbove(_display, anchorTop, otherTop);
+				else if (X11UnmanagedBelowUnmanaged([other stackingLevel], [anchor stackingLevel]))
+					X11StackBelowIfAbove(_display, otherTop, anchorTop);
+				continue;
+			}
+			if ([other isUnmanaged] == anchorUnmanaged)
+				continue;
+
+			CGSWindowX11* unmanaged = anchorUnmanaged ? anchor : other;
+			CGSWindowX11* managed = anchorUnmanaged ? other : anchor;
+			Window otherTop = X11TopLevelAncestor(_display, other->_window);
+			Window unmanagedTop = anchorUnmanaged ? anchorTop : otherTop;
+			Window managedTop = anchorUnmanaged ? otherTop : anchorTop;
+			if (unmanagedTop == None || managedTop == None)
+				continue;
+			if (X11UnmanagedBelowManaged(anchorUnmanaged, [unmanaged stackingLevel], [managed stackingLevel]))
+				X11StackBelowIfAbove(_display, unmanagedTop, managedTop);
+			else if (!anchorUnmanaged && X11UnmanagedAboveManaged([unmanaged stackingLevel], [managed stackingLevel]))
+				X11StackAboveIfBelow(_display, unmanagedTop, managedTop);
+		}
+	}
+	@finally
+	{
+		XSetErrorHandler(previousHandler);
+		previousOrderingErrorHandler = NULL;
+	}
+}
+
+// Marks the occlusion state for a new judgement when the event can change it. Returns YES for the root window's
+// and the watched foreign window's events, which nothing else is interested in. A ConfigureNotify that repeats
+// the geometry of the previous one for the same window changes nothing, so it does not ask for a new judgement:
+// a window manager may send one for every request that leaves the geometry as it was.
+-(BOOL) _noteOcclusionEvent:(XEvent*) ev
+{
+	switch (ev->type)
+	{
+		case MapNotify:
+		case UnmapNotify:
+		case ConfigureNotify:
+		case DestroyNotify:
+		case PropertyNotify:
+		case ReparentNotify:
+		case GravityNotify:
+		case CirculateNotify:
+			break;
+		default:
+			return NO;
+	}
+	Window target = ev->xany.window;
+	if (target == DefaultRootWindow(_display))
+	{
+		if (ev->type != PropertyNotify)
+			return NO; // RandR notifications
+		Atom atom = ev->xproperty.atom;
+		if (atom == XInternAtom(_display, "_NET_ACTIVE_WINDOW", False))
+		{
+			_occlusionActiveKnown = NO;
+			_occlusionDirty = YES;
+		}
+		else if (atom == XInternAtom(_display, "_NET_CLIENT_LIST_STACKING", False))
+		{
+			_occlusionDirty = YES;
+		}
+		return YES;
+	}
+	CGSWindowX11* window = [self _cgsWindowForNativeWindow: target];
+	if (![window isToplevel])
+		window = nil;
+	if (window == nil)
+	{
+		if (target == None || target != _occlusionWatchWindow)
+			return NO;
+		if (ev->type == DestroyNotify)
+		{
+			_occlusionWatchWindow = None;
+			_occlusionActiveKnown = NO;
+		}
+		if (ev->type == ConfigureNotify)
+		{
+			XConfigureEvent* c = &ev->xconfigure;
+			if (_occlusionWatchGeometryKnown && c->x == _occlusionWatchX && c->y == _occlusionWatchY &&
+				c->width == _occlusionWatchWidth && c->height == _occlusionWatchHeight)
+				return YES;
+			_occlusionWatchGeometryKnown = YES;
+			_occlusionWatchX = c->x;
+			_occlusionWatchY = c->y;
+			_occlusionWatchWidth = c->width;
+			_occlusionWatchHeight = c->height;
+		}
+		_occlusionCoverValid = NO;
+		_occlusionDirty = YES;
+		// A property deleted on that window may be the end of a transfer another part is waiting for.
+		return !(ev->type == PropertyNotify && ev->xproperty.state == PropertyDelete);
+	}
+	switch (ev->type)
+	{
+		case MapNotify:
+		case UnmapNotify:
+			_occlusionDirty = YES;
+			break;
+		case ConfigureNotify:
+			if ([window noteConfigureGeometryChanged: &ev->xconfigure])
+				_occlusionDirty = YES;
+			break;
+	}
+	return NO;
+}
+
+// Judges every toplevel window against the focused foreign window and tells the ones whose state changed.
+-(void) _updateOcclusion
+{
+	_occlusionDirty = NO;
+	Window root = DefaultRootWindow(_display);
+	NSArray<CGSWindowX11*>* windows = [self _toplevelWindows];
+
+	// The focused window and its geometry are read again only after an event that can change them.
+	if (!_occlusionActiveKnown)
+	{
+		Window focused = X11OcclusionActiveWindow(_display);
+		// The application's own windows never cover each other here. A window of the process that is none of
+		// the UI layer's toplevel windows (a display overlay) is judged like another client's, but is never
+		// watched (see below), which would replace its own selection of input.
+		if ([self _toplevelForNativeWindow: focused] != nil)
+			focused = None;
+		else if ([self _cgsWindowForNativeWindow: focused] != nil && ![[self _cgsWindowForNativeWindow: focused] isDisplayOverlay])
+			focused = None; // a window another framework made (CGSNewWindow)
+		_occlusionActive = focused;
+		_occlusionActiveKnown = YES;
+		_occlusionCoverValid = NO;
+		_occlusionWatchGeometryKnown = NO;
+	}
+	Window active = _occlusionActive;
+
+	// Watch the focused foreign window for size, fullscreen and unmap changes. Selecting input replaces
+	// this client's earlier selection on that window.
+	if (active != _occlusionWatchWindow)
+	{
+		X11OcclusionStopWatching(_display, _occlusionWatchWindow, [self _cgsWindowForNativeWindow: _occlusionWatchWindow] != nil);
+		_occlusionWatchWindow = active;
+		if (active != None && [self _cgsWindowForNativeWindow: active] == nil)
+			XSelectInput(_display, active, StructureNotifyMask | PropertyChangeMask);
+	}
+
+	X11FullscreenRect cover = {0};
+	bool coverFullscreen = false, coverOpaque = false;
+	unsigned long* stack = NULL;
+	unsigned long stackCount = 0;
+	if (active != None && [windows count] > 0)
+	{
+		if (!_occlusionCoverValid)
+		{
+			X11FullscreenRect info = {0};
+			bool fullscreen = false, opaque = false;
+			_occlusionCoverOK = X11OcclusionCoverInfo(_display, active, &info, &fullscreen, &opaque);
+			_occlusionCoverX = info.x;
+			_occlusionCoverY = info.y;
+			_occlusionCoverWidth = info.width;
+			_occlusionCoverHeight = info.height;
+			_occlusionCoverFullscreen = fullscreen;
+			_occlusionCoverOpaque = opaque;
+			_occlusionCoverValid = YES;
+		}
+		cover = (X11FullscreenRect){_occlusionCoverX, _occlusionCoverY, _occlusionCoverWidth, _occlusionCoverHeight};
+		coverFullscreen = _occlusionCoverFullscreen;
+		coverOpaque = _occlusionCoverOpaque;
+		if (_occlusionCoverOK && coverFullscreen && coverOpaque)
+			stack = X11OcclusionStackingList(_display, &stackCount);
+	}
+
+	for (CGSWindowX11* window in windows)
+	{
+		Window handle = window->_window;
+		BOOL occluded = NO;
+		if (stack != NULL && handle != None)
+		{
+			XWindowAttributes attributes;
+			Window child;
+			int x, y;
+			if (XGetWindowAttributes(_display, handle, &attributes) && attributes.map_state == IsViewable &&
+				XTranslateCoordinates(_display, handle, root, 0, 0, &x, &y, &child))
+			{
+				X11FullscreenRect own = {x, y, (unsigned int) attributes.width, (unsigned int) attributes.height};
+				occluded = X11OcclusionCovers(own, cover, coverFullscreen, coverOpaque,
+					X11OcclusionStackIndex(stack, stackCount, handle),
+					X11OcclusionStackIndex(stack, stackCount, active));
+			}
+		}
+		[window setOccludedByWindowSystem: occluded];
+	}
+	if (stack != NULL)
+		XFree(stack);
 }
 
 // A hot key reports while it is enabled and hot keys are not switched off
@@ -1219,19 +1709,33 @@ static NSArray<NSNumber*>* rootWindowList(Display* display, const char* name);
 
 		if (XNextEvent(_display, &event) != Success)
 			continue;
-		if (![self processXEvent: &event] && observesEvents)
+		if ([self processXEvent: &event])
+			continue;
+		// An input method's reply (Xlib: every event goes through XFilterEvent()); key events are filtered by
+		// the keyboard, where the input method's decision is used.
+		if (event.type != KeyPress && event.type != KeyRelease && XFilterEvent(&event, None))
+			continue;
+		if (observesEvents)
 			[observer nativeConnectionEvent: &event];
 	}
 
 	if (_layoutChanged)
 	{
 		_layoutChanged = NO;
+		// Whether the focused window covers a monitor depends on the layout.
+		_occlusionCoverValid = NO;
+		_occlusionDirty = YES;
 		// Reports the change to the display reconfiguration callbacks.
 		[self displayLayoutChanged];
 		[_pointer displayLayoutChanged];
 		if ([observer respondsToSelector: @selector(nativeConnectionDisplayLayoutChanged)])
 			[observer nativeConnectionDisplayLayoutChanged];
+		// After the observer has taken the new layout into what it derives from it: the windows report the
+		// new scale to the UI layer then.
+		[self _toplevelWindowsLayoutChanged];
 	}
+	if (_occlusionDirty)
+		[self _updateOcclusion];
 	if ([observer respondsToSelector: @selector(nativeConnectionDidProcessEvents)])
 		[observer nativeConnectionDidProcessEvents];
 }
@@ -1296,6 +1800,8 @@ static NSDictionary* modeInfoToDictionary(const XRRModeInfo* mi, int depth, CGFl
 	cgScreen.displayID = 1;
 	cgScreen.bounds = CGRectMake(0, 0, width / scale, height / scale);
 	cgScreen.backingScale = scale;
+	cgScreen.nativeFrame = CGRectMake(0, 0, width, height);
+	cgScreen.hasNativeFrame = YES;
 	cgScreen.modes = @[ @{
 		@"Width": @((unsigned) lround(width / scale)),
 		@"Height": @((unsigned) lround(height / scale)),
@@ -1351,6 +1857,8 @@ static NSDictionary* modeInfoToDictionary(const XRRModeInfo* mi, int depth, CGFl
 		cgScreen.bounds = CGRectMake((monitors[i].x - monitors[primary].x) / scale,
 			(monitors[i].y - monitors[primary].y) / scale, monitors[i].width / scale, monitors[i].height / scale);
 		cgScreen.backingScale = scale;
+		cgScreen.nativeFrame = CGRectMake(monitors[i].x, monitors[i].y, monitors[i].width, monitors[i].height);
+		cgScreen.hasNativeFrame = YES;
 
 		NSMutableArray<NSDictionary*>* modes = [NSMutableArray array];
 		CFIndex currentMode = -1;
@@ -1587,6 +2095,19 @@ static void crtcBoundingBox(Display* display, XRRScreenResources* resources, RRC
 	return [_pointer relativeMouseRequested: requested frozenRoot: frozenRoot];
 }
 
+// The address of an application menu is a property of the window.
+-(BOOL) carriesApplicationMenuAddress
+{
+	return YES;
+}
+
+// The menu bar of an application is a dock window, which only a window manager that handles docks places at the top of the
+// screen (see X11DockSupport.h).
+-(BOOL) placesMenuBar
+{
+	return X11WindowManagerPlacesDocks(_display);
+}
+
 -(void) pointerWindowsChanged
 {
 	[_pointer windowsChanged];
@@ -1616,10 +2137,73 @@ static void crtcBoundingBox(Display* display, XRRScreenResources* resources, RRC
 	return _blankCursor;
 }
 
-// The windows go back to their parent's cursor when the blank one is not wanted.
--(void) _setBlankCursorOnWindows:(BOOL)blank
+// The cursor the process shows now: the blank one while it is hidden, else the selected cursor at the display's
+// scale (the arrow when none is selected). None when the window system could not make it.
+-(Cursor) _cursorToShow
 {
-	Cursor cursor = blank ? [self _blankCursorMade] : None;
+	if (![self cursorIsVisible])
+		return [self _blankCursorMade];
+	CGFloat scale = backingScaleFactor();
+	CGSCursor* cursor = [self cursor];
+	if (cursor != nil)
+		return (Cursor) (uintptr_t) [cursor nativeCursorFor: self scale: scale];
+	if (_defaultArrow == None || _defaultArrowScale != scale)
+	{
+		if (_defaultArrow != None)
+			XFreeCursor(_display, _defaultArrow);
+		_defaultArrow = X11LoadThemedCursor(_display, "left_ptr", scale);
+		_defaultArrowScale = scale;
+	}
+	return _defaultArrow;
+}
+
+-(void*) createNativeCursor:(CGSCursor*)cursor scale:(double)scale
+{
+	Cursor native = [cursor isImage] ? X11CreateImageCursor(_display, cursor, scale)
+		: X11CreateShapeCursor(_display, cursor, scale);
+	if (native == None)
+		native = XcursorLibraryLoadCursor(_display, "left_ptr");
+	return (void*) (uintptr_t) native;
+}
+
+-(void) destroyNativeCursor:(void*)native
+{
+	if (native != NULL)
+		XFreeCursor(_display, (Cursor) (uintptr_t) native);
+}
+
+// Whether the window, or a window inside it (the client of a window manager's frame), is one of this process'.
+static BOOL windowBelongsToProcess(Display* display, Window window, int depth)
+{
+	if (window == None)
+		return NO;
+	if (X11WindowOwnerPID(display, window) == getpid())
+		return YES;
+	if (depth <= 0)
+		return NO;
+
+	Window root, parent, *children = NULL;
+	unsigned int count = 0;
+	BOOL found = NO;
+	if (XQueryTree(display, window, &root, &parent, &children, &count))
+	{
+		for (unsigned int i = 0; i < count && !found; i++)
+			found = windowBelongsToProcess(display, children[i], depth - 1);
+		if (children != NULL)
+			XFree(children);
+	}
+	return found;
+}
+
+// The windows the connection made show the cursor; so does the process' window under the pointer that is not one of
+// them (a framework above that made its own X windows; it asks again as the pointer enters one), and the cursor
+// stays the process' while the pointer is over it. A window of another process is left alone.
+-(void) _applyCursor
+{
+	Cursor cursor = [self _cursorToShow];
+	if (cursor == None)
+		return;
+	BOOL undefine = [self cursorIsVisible] && [self cursor] == nil;
 
 	@synchronized (_windows)
 	{
@@ -1628,20 +2212,49 @@ static void crtcBoundingBox(Display* display, XRRScreenResources* resources, RRC
 			CGSWindow* window = [_windows objectForKey: key];
 
 			// A window of the UI layer shows the cursor the UI layer gives it.
-			if (![window isKindOfClass: [CGSWindowX11 class]] || [(CGSWindowX11*) window isToplevel])
+			if (![window isKindOfClass: [CGSWindowX11 class]])
 				continue;
-			if (blank)
-				XDefineCursor(_display, ((CGSWindowX11*) window)->_window, cursor);
-			else
+			if (undefine)
 				XUndefineCursor(_display, ((CGSWindowX11*) window)->_window);
+			else
+				XDefineCursor(_display, ((CGSWindowX11*) window)->_window, cursor);
 		}
 	}
+
+	Window root = DefaultRootWindow(_display), returnedRoot = None, child = None;
+	int rootX, rootY, windowX, windowY;
+	unsigned int mask;
+	if (XQueryPointer(_display, root, &returnedRoot, &child, &rootX, &rootY, &windowX, &windowY, &mask) &&
+		child != None && windowBelongsToProcess(_display, child, 2))
+		XDefineCursor(_display, child, cursor);
 	XFlush(_display);
+}
+
+// A window made while the cursor is hidden shows the blank cursor like the others, and one made after a cursor
+// was selected shows it.
+-(void) _applyCursorToNewWindow:(CGSWindowX11*)window
+{
+	if ([self cursorIsVisible] && [self cursor] == nil)
+		return;
+	Cursor cursor = [self _cursorToShow];
+	if (cursor != None)
+	{
+		XDefineCursor(_display, window->_window, cursor);
+		XFlush(_display);
+	}
+}
+
+-(void) cursorChanged
+{
+	if ([NSThread isMainThread])
+		[self _applyCursor];
+	else
+		[self performSelectorOnMainThread: @selector(_applyCursor) withObject: nil waitUntilDone: NO];
 }
 
 -(CGSWindow*) newToplevelWindowWithAttributes:(const CGSToplevelAttributes*)attributes
 {
-	CGSWindowID windowID = _nextWindowId++;
+	CGSWindowID windowID = [self _allocateWindowID];
 	CGSWindowX11* window = [[CGSWindowX11 alloc] initToplevelWithAttributes: attributes
 		connection: self
 		windowID: windowID];
@@ -1652,6 +2265,7 @@ static void crtcBoundingBox(Display* display, XRRScreenResources* resources, RRC
 	{
 		[_windows setObject: window forKey: [NSNumber numberWithInt: windowID]];
 	}
+	[self _applyCursorToNewWindow: window];
 	[window release];
 	return window;
 }
@@ -1663,7 +2277,7 @@ static void crtcBoundingBox(Display* display, XRRScreenResources* resources, RRC
 
 -(CGSWindow*) newWindow:(CGSRegionRef)region
 {
-	CGSWindowID windowID = _nextWindowId++;
+	CGSWindowID windowID = [self _allocateWindowID];
 	CGSWindowX11* window = [[CGSWindowX11 alloc] initWithRegion: region
 		connection: self
 		windowID: windowID];
@@ -1676,12 +2290,7 @@ static void crtcBoundingBox(Display* display, XRRScreenResources* resources, RRC
 	{
 		[_windows setObject: window forKey: [NSNumber numberWithInt: windowID]];
 	}
-	// A window made while the cursor is hidden shows the blank cursor like the others
-	if (![self cursorIsVisible])
-	{
-		XDefineCursor(_display, window->_window, [self _blankCursorMade]);
-		XFlush(_display);
-	}
+	[self _applyCursorToNewWindow: window];
 	[window release];
 	return window;
 }
@@ -1750,6 +2359,16 @@ static Time currentServerTime(Display* display)
 		return kCGErrorCannotComplete;
 	BOOL owned = shared == nil;
 	CGError result = kCGErrorSuccess;
+
+	// The window manager decides, and may refuse to steal the focus; without one nothing can be activated, and
+	// the properties a manager that exited left behind name windows it no longer manages.
+	if (!X11WindowManagerIsRunning(display))
+	{
+		if (owned)
+			XCloseDisplay(display);
+		[shared release];
+		return kCGErrorCannotComplete;
+	}
 
 	// EWMH: the clients are listed in the order of mapping, and, bottom to top, by stacking
 	// order. Without a window manager that supports them there is nothing to ask.

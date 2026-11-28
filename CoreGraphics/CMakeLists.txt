@@ -66,6 +66,8 @@ set_property(SOURCE
 	CGSServerSPI.m
 	CGSSymbolicHotKeys.m
 	CGSSelection.m
+	CGSDrag.m
+	CGSInputMethod.m
 
 	APPEND PROPERTY COMPILE_FLAGS "-include Foundation/Foundation.h"
 )
@@ -80,6 +82,11 @@ include_directories(
 
 	${PC_CAIRO_INCLUDE_DIRS}
 )
+
+if (HAVE_PIPEWIRE)
+	include_directories(${CMAKE_SOURCE_DIR}/src/libpipewire/include)
+	add_compile_definitions(HAVE_PIPEWIRE=1)
+endif ()
 
 set(CoreGraphics_sources
 	CGAffineTransform.m
@@ -137,12 +144,16 @@ set(CoreGraphics_sources
 	CGSServerSPI.m
 	CGSSymbolicHotKeys.m
 	CGSSelection.m
+	CGSDrag.m
+	CGSInputMethod.m
+	CGSCursor.m
 	DarlingFileURIList.m
 	CGEvent.m
 	CGEventKeyboardCharacters.m
 	CGEventSource.m
 	CGEventTap.m
 	CGEventStream.m
+	CGSTabletEvent.m
 	CGEventObjC.m
 	# KTFont+PDF.m 'KGPDFArray.h' file not found
 )
@@ -176,6 +187,14 @@ add_separated_framework(CoreGraphics
 		IOSurface
 		ColorSync
 )
+
+# CGDisplayStream uses the same ScreenCast/PipeWire session as the higher-level
+# capture frameworks. The static client is linked per architecture slice.
+if (HAVE_PIPEWIRE)
+	foreach (arch IN LISTS DARLING_ARCHS)
+		target_link_libraries(CoreGraphics_${arch} PRIVATE darling_pipewire_client)
+	endforeach ()
+endif ()
 
 # NSBundle finds the backends through the framework's Resources link.
 InstallSymlink("Versions/Current/Resources" "${CMAKE_INSTALL_PREFIX}/libexec/darling/System/Library/Frameworks/CoreGraphics.framework/Resources")

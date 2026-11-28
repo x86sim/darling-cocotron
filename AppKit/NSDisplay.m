@@ -27,6 +27,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <CoreGraphics/CGDisplayConfiguration.h>
 #import <CoreGraphics/CGSPointerController.h>
 #import <CoreGraphics/CoreGraphicsPrivate.h>
+#import <CoreGraphics/CGSCursor.h>
+#import <CoreGraphics/CGSNativeConnection.h>
+#import <AppKit/NSGraphicsContext.h>
+#import <AppKit/NSImage.h>
 #import "NSEventQueue.h"
 #import "NSWindow-Private.h"
 
@@ -246,12 +250,32 @@ static void displaysReconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
 - (void) _mainMenuDidChange: (NSMenu *) menu {
 }
 
-- (BOOL) _showsMainMenuOutsideWindows {
-    return YES;
+// Whether the session has a desktop that shows application menus: something on the session bus registered for them (the
+// bus is the application's, not CoreGraphics', so the display that exports the menu looks). The backends answer.
+- (BOOL) _probeGlobalMenuRegistrar {
+    return NO;
 }
 
+// Asked once, because the answer decides whether the application exports its menu at all. The window system carries
+// the address of a window's menu only where it can (CoreGraphics says), and the answer is a flag of its connection
+// (see _CGSNativeConnectionGlobalMenuAvailable()).
 - (BOOL) _desktopShowsMainMenu {
-    return NO;
+    if (!_desktopMenuProbed) {
+        _desktopMenuProbed = YES;
+        if (_CGSNativeConnectionCarriesApplicationMenuAddress())
+            _CGSNativeConnectionSetGlobalMenuAvailable([self _probeGlobalMenuRegistrar]);
+    }
+    return _CGSNativeConnectionGlobalMenuAvailable();
+}
+
+// The menu is outside the windows when the window system places a menu bar window of the application at the top of the
+// screen (a window manager that handles docks, a compositor with a layer shell), or the desktop shows it itself. Under
+// a window manager that does not handle docks the bar would float over the windows of the application, so the windows
+// draw the menu themselves unless the desktop has a global menu.
+- (BOOL) _showsMainMenuOutsideWindows {
+    if (_CGSNativeConnectionKind() == CGSNativeConnectionKindNone)
+        return YES;
+    return _CGSNativeConnectionPlacesMenuBar() || [self _desktopShowsMainMenu];
 }
 
 // The screens are the displays of CoreGraphics (this framework sits above it): the frame is the
@@ -344,12 +368,6 @@ static void displaysReconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     return 1;
 }
 
-// Brings the windows of the given process to the front. Backends that can
-// do so override this; the default reports that nothing was activated.
-- (BOOL) activateProcessIdentifier: (pid_t) processIdentifier {
-    return NO;
-}
-
 // Whether the pointer functions of CoreGraphics reach this display (see CGSPointerController.h).
 - (BOOL) usesPointerController {
     return YES;
@@ -423,14 +441,105 @@ static void displaysReconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     }
 }
 
-// Arrow, IBeam, HorizontalResize, VerticalResize
+// The cursors are CoreGraphics' (see CGSCursor.h): a cursor is a CGSCursorRef, which is an Objective-C object, and the
+// one the process shows is selected with CGSCursorSetCurrent(). CoreGraphics gives it to the window system for the
+// pointer's focus at the scale of each output, and keeps it through a hide and a show.
+
+// The shape of each name of NSCursor's standard cursors (an unknown name is the arrow).
+static CGSCursorShape CursorShapeForName(NSString *name) {
+    static NSDictionary *shapes;
+
+    if (shapes == nil) {
+        shapes = [[NSDictionary alloc] initWithObjectsAndKeys:
+            [NSNumber numberWithInt: kCGSCursorShapeArrow], @"arrowCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeClosedHand], @"closedHandCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeCrosshair], @"crosshairCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeIBeam], @"IBeamCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeVerticalIBeam], @"IBeamCursorForVerticalLayout",
+            [NSNumber numberWithInt: kCGSCursorShapeZoomIn], @"zoomInCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeZoomOut], @"zoomOutCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeOpenHand], @"openHandCursor",
+            [NSNumber numberWithInt: kCGSCursorShapePointingHand], @"pointingHandCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeDown], @"resizeDownCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeLeft], @"resizeLeftCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeLeftRight], @"resizeLeftRightCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeRight], @"resizeRightCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeUp], @"resizeUpCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeUpDown], @"resizeUpDownCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeNorthWest], @"frameResizeNorthWestCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeNorthEast], @"frameResizeNorthEastCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeSouthEast], @"frameResizeSouthEastCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeSouthWest], @"frameResizeSouthWestCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeNorthWestSouthEast], @"frameResizeNorthWestSouthEastCursor",
+            [NSNumber numberWithInt: kCGSCursorShapeResizeNorthEastSouthWest], @"frameResizeNorthEastSouthWestCursor",
+            nil];
+    }
+    NSNumber *shape = [shapes objectForKey: name];
+    return shape != nil ? (CGSCursorShape) [shape intValue] : kCGSCursorShapeArrow;
+}
+
 - (id) cursorWithName: (NSString *) name {
-    NSInvalidAbstractInvocation();
-    return nil;
+    return [(id) CGSCursorCreateWithShape(CursorShapeForName(name)) autorelease];
+}
+
+// The pixels per point an image cursor is drawn at: the densest display's whole scale, from which CoreGraphics
+// scales down to the display the pointer is on.
+static CGFloat CursorRenderScale(void) {
+    CGDirectDisplayID displays[16];
+    uint32_t count = 0;
+    double scale = 1;
+
+    if (CGGetActiveDisplayList(16, displays, &count) == kCGErrorSuccess) {
+        for (uint32_t i = 0; i < count; i++)
+            scale = MAX(scale, _CGSDisplayBackingScaleFactor(displays[i]));
+    }
+    return MIN(ceil(scale), 4.0);
+}
+
+- (id) cursorWithImage: (NSImage *) image hotSpot: (NSPoint) hotSpot {
+    NSSize size = [image size];
+    double logicalWidth = ceil(size.width), logicalHeight = ceil(size.height);
+    CGFloat scale = CursorRenderScale();
+
+    if (isfinite(logicalWidth) && isfinite(logicalHeight) && logicalWidth >= 1 && logicalHeight >= 1 &&
+        logicalWidth * scale <= 0x7FFF && logicalHeight * scale <= 0x7FFF) {
+        size_t width = (size_t) (logicalWidth * scale), height = (size_t) (logicalHeight * scale);
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGContextRef context = CGBitmapContextCreate(NULL, width, height, 8, 0, colorSpace,
+                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host);
+        CGColorSpaceRelease(colorSpace);
+
+        if (context != NULL) {
+            @autoreleasepool {
+                NSGraphicsContext *graphicsContext = [NSGraphicsContext graphicsContextWithGraphicsPort: context
+                                                                                                flipped: NO];
+
+                [NSGraphicsContext saveGraphicsState];
+                [NSGraphicsContext setCurrentContext: graphicsContext];
+                CGContextScaleCTM(context, width / size.width, height / size.height);
+                [image drawInRect: NSMakeRect(0, 0, size.width, size.height)
+                         fromRect: NSZeroRect
+                        operation: NSCompositeCopy
+                         fraction: 1.0];
+                [NSGraphicsContext restoreGraphicsState];
+            }
+            CGImageRef rendered = CGBitmapContextCreateImage(context);
+            CGContextRelease(context);
+            if (rendered != NULL) {
+                CGSCursorRef cursor = CGSCursorCreateWithImage(rendered, CGSizeMake(logicalWidth, logicalHeight),
+                                                               CGPointMake(hotSpot.x, hotSpot.y));
+                CGImageRelease(rendered);
+                if (cursor != NULL)
+                    return [(id) cursor autorelease];
+            }
+        }
+    }
+    // Nothing a window system could show: the arrow.
+    return [self cursorWithName: @"arrowCursor"];
 }
 
 - (void) setCursor: (id) cursor {
-    NSInvalidAbstractInvocation();
+    CGSCursorSetCurrent((CGSCursorRef) cursor);
 }
 
 - (NSEvent *) nextEventMatchingMask: (NSUInteger) mask
@@ -505,13 +614,6 @@ static void displaysReconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
         *dx = (int32_t) wholeX;
     if (dy != NULL)
         *dy = (int32_t) wholeY;
-}
-
-- (void) postEvent: (NSEvent *) event atStart: (BOOL) atStart {
-    if (atStart)
-        _NSEventQueuePost(event, YES);
-    else
-        _NSEventQueuePostWindowSystemEvent(event, [self _mainScreenMaxY]);
 }
 
 // QUIRK: what an application posts with -[NSApplication postEvent:atStart:] is queued as it is: posted drags are
@@ -627,17 +729,18 @@ static void displaysReconfigured(CGDirectDisplayID display, CGDisplayChangeSumma
     return nil;
 }
 
+// The native border of a window is outside the frame the framework works with on every backend: the window
+// manager's decorations are the window system's, and a window the framework decorates itself is drawn inside its
+// frame. So the content and the frame rectangles are the same ones.
 - (CGRect) insetRect: (CGRect) frame
         forNativeWindowBorderWithStyle: (NSUInteger) styleMask
 {
-    NSInvalidAbstractInvocation();
     return frame;
 }
 
 - (CGRect) outsetRect: (CGRect) frame
         forNativeWindowBorderWithStyle: (NSUInteger) styleMask
 {
-    NSInvalidAbstractInvocation();
     return frame;
 }
 

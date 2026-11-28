@@ -55,6 +55,7 @@ const CGFloat NSTableViewDefaultRowHeight = 17.0f;
 - (void) _sizeColumnToFit: (NSInteger) columnIndex;
 - (void) _moveColumn: (NSInteger) columnIndex toColumn: (NSInteger) newIndex notify: (BOOL) notify;
 - (void) _noteColumnDidMoveFrom: (NSInteger) oldIndex to: (NSInteger) newIndex;
+- (void) _sendActionForClickInHeaderOfColumn: (NSInteger) column clickCount: (NSInteger) clickCount;
 - (void) _recycleView: (NSView *) view;
 - (void) _recycleCellViewsOutsideRows: (NSRange) rows;
 - (NSView *) _cellViewAtColumn: (NSInteger) column row: (NSInteger) row make: (BOOL) make;
@@ -147,6 +148,14 @@ const CGFloat NSTableViewDefaultRowHeight = 17.0f;
 static void forgetClickedCell(NSTableView *table) {
     NS_EXTRA(NSTableView, table)->_clickedColumn = -1;
     NS_EXTRA(NSTableView, table)->_clickedRow = -1;
+}
+
+// The first click of a click sequence sends the action, the second the double action.
+static void sendClickAction(NSTableView *table, NSInteger clickCount) {
+    if (clickCount < 2)
+        [table sendAction: [table action] to: [table target]];
+    else if (clickCount == 2)
+        [table sendAction: [table doubleAction] to: [table target]];
 }
 
 - initWithCoder: (NSCoder *) coder {
@@ -988,9 +997,25 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     [self setNeedsDisplay: YES];
 }
 
+// The row views of a view-based table follow the selection state of the table: they draw the highlight in the
+// style it has, and hand their cell views the interior background style that goes with it.
+- (void) _syncRowViewsEmphasisWithState: (BOOL) emphasized {
+    NSTableViewSelectionHighlightStyle style = [self selectionHighlightStyle];
+
+    for (NSTableRowView *rowView in [NS_EXTRA(NSTableView, self)->_rowViews allValues]) {
+        [rowView setEmphasized: emphasized];
+        [rowView setSelectionHighlightStyle: style];
+    }
+}
+
+- (void) _syncRowViewsEmphasis {
+    [self _syncRowViewsEmphasisWithState: [self _selectionIsEmphasized]];
+}
+
 - (void) setSelectionHighlightStyle: (NSTableViewSelectionHighlightStyle) value
 {
     NS_EXTRA(NSTableView, self)->_selectionHighlightStyle = value;
+    [self _syncRowViewsEmphasis];
     [self setNeedsDisplay: YES];
 }
 
@@ -1726,6 +1751,7 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 }
 
 - (void) _keyStateChanged: (NSNotification *) note {
+    [self _syncRowViewsEmphasis];
     [self setNeedsDisplay: YES];
 }
 
@@ -1736,8 +1762,14 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 }
 
 - (BOOL) becomeFirstResponder {
-    [self setNeedsDisplay: YES];
-    return [super becomeFirstResponder];
+    BOOL accepted = [super becomeFirstResponder];
+
+    if (accepted) {
+        // The window has not recorded the new first responder yet.
+        [self _syncRowViewsEmphasisWithState: [[self window] isKeyWindow]];
+        [self setNeedsDisplay: YES];
+    }
+    return accepted;
 }
 
 // A table gives way to the field editor of the cell it edits. NSControl checks its selected cell while it has an
@@ -1746,7 +1778,12 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     [self setNeedsDisplay: YES];
     if (NS_EXTRA(NSControl, self)->_currentEditor != nil)
         return _editingCell == nil || [_editingCell hasValidObjectValue];
-    return [super resignFirstResponder];
+
+    BOOL resigned = [super resignFirstResponder];
+
+    if (resigned)
+        [self _syncRowViewsEmphasisWithState: NO];
+    return resigned;
 }
 
 - (void) drawHighlightedSelectionForColumn: (NSInteger) column
@@ -1894,16 +1931,35 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     }
 }
 
+static BOOL tableColorIsOpaque(NSColor *color) {
+    if (color == nil)
+        return NO;
+    NSColor *resolved = [(id)color _resolvedColor];
+    return resolved != nil && [resolved type] != NSColorTypePattern &&
+           [resolved alphaComponent] >= 1.0;
+}
+
+static void fillBackgroundRect(NSColor *color, NSRect rect) {
+    if (NSIsEmptyRect(rect))
+        return;
+    [color setFill];
+    if (tableColorIsOpaque(color))
+        NSRectFill(rect);
+    else
+        NSRectFillUsingOperation(rect, NSCompositeSourceOver);
+}
+
 - (void) drawBackgroundInClipRect: (NSRect) clipRect {
     NSArray *rowColors = [NSColor controlAlternatingRowBackgroundColors];
     NSInteger colorCount = [rowColors count];
 
     if (colorCount == 0 || !NS_EXTRA(NSTableView, self)->_alternatingRowBackground) {
-        [_backgroundColor setFill];
-        NSRectFill(clipRect);
+        if (_backgroundColor != nil) {
+            [_backgroundColor setFill];
+            NSRectFillUsingOperation(clipRect, NSCompositeSourceOver);
+        }
     } else if (colorCount == 1) {
-        [(NSColor *) [rowColors objectAtIndex: 0] setFill];
-        NSRectFill(clipRect);
+        fillBackgroundRect([rowColors objectAtIndex: 0], clipRect);
     } else {
         NSInteger numberOfRows = [self numberOfRows];
         NSRange rangeOfRows = [self rowsInRect: clipRect];
@@ -1914,8 +1970,8 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 
             rectToFill.origin.x = clipRect.origin.x;
             rectToFill.size.width = clipRect.size.width;
-            [(NSColor *) [rowColors objectAtIndex: i % colorCount] setFill];
-            NSRectFill(NSIntersectionRect(rectToFill, clipRect));
+            fillBackgroundRect([rowColors objectAtIndex: i % colorCount],
+                               NSIntersectionRect(rectToFill, clipRect));
         }
 
         // The stripes carry on below the last row at the height of a row, the colors
@@ -1934,8 +1990,8 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
             for (; y < NSMaxY(clipRect); y += pitch, index++) {
                 NSRect rectToFill = NSMakeRect(clipRect.origin.x, y, clipRect.size.width, pitch);
 
-                [(NSColor *) [rowColors objectAtIndex: index % colorCount] setFill];
-                NSRectFill(NSIntersectionRect(rectToFill, clipRect));
+                fillBackgroundRect([rowColors objectAtIndex: index % colorCount],
+                                   NSIntersectionRect(rectToFill, clipRect));
             }
         }
     }
@@ -2154,6 +2210,28 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 
 - (BOOL) isFlipped {
     return YES;
+}
+
+- (BOOL) isOpaque {
+    if (NS_EXTRA(NSTableView, self)->_alternatingRowBackground) {
+        NSArray *rowColors = [NSColor controlAlternatingRowBackgroundColors];
+        NSUInteger count = [rowColors count];
+        if (count > 0) {
+            if (count > 1) {
+                NSInteger numberOfRows = [self numberOfRows];
+                CGFloat pitch = numberOfRows > 0 ? [self rectOfRow: 0].size.height
+                                                 : [self _effectiveRowHeight] + _intercellSpacing.height;
+                if (pitch <= 0.)
+                    return NO;
+            }
+            for (NSColor *color in rowColors) {
+                if (!tableColorIsOpaque(color))
+                    return NO;
+            }
+            return YES;
+        }
+    }
+    return tableColorIsOpaque(_backgroundColor);
 }
 
 - (BOOL) delegateShouldSelectTableColumn: (NSTableColumn *) tableColumn {
@@ -2472,10 +2550,23 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     NS_EXTRA(NSTableView, self)->_clickedRow = [self rowAtPoint: location];
 
     if (NS_EXTRA(NSTableView, self)->_clickedRow < 0) { // click beyond the end of the table
+        // QUIRK: a click below the last row still sends the action (the double action on a double click), and
+        // clickedColumn is -1 in it as well as clickedRow, even over column 0. The clickedRow documentation says
+        // -1 for a click where no rows are, and the clickedColumn documentation says -1 only where the point is not
+        // occupied by a column; the observed clickedColumn == -1 over column 0 contradicts that page, and the
+        // action send is not documented.
+        // Observed on macOS 26.1 (build 25B78) arm64 (probe 659, "below the last row, inside column 0"):
+        // `action(clickedRow=-1,clickedColumn=-1,selectedRow=-1)`, then on click count 2
+        // `doubleAction(clickedRow=-1,clickedColumn=-1,selectedRow=-1)`.
+        // Test: test_a_click_below_the_rows_sends_the_action in tests/appkit-table-click-beside-columns.m
+        // Both are reset first so that the delegate's selection and editing notifications below see -1 and -1 too.
+        forgetClickedCell(self);
         if (_editingCell != nil)
             [self _finishEditingWithTextMovement: NSIllegalTextMovement];
         [self selectRowIndexes: [NSIndexSet indexSet] byExtendingSelection: NO];
         [NS_EXTRA(NSTableView, self)->_selectedColumns removeAllObjects];
+
+        sendClickAction(self, [event clickCount]);
         forgetClickedCell(self);
         return;
     }
@@ -2708,10 +2799,18 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     } else if ([event clickCount] == 2) {
         // nb this logic was backwards previously
 
-        id binder = [clickedColumnObject _binderForBinding: @"value"
-                                                    create: NO];
         BOOL interpretedAsEdit = NO;
-        if ([clickedColumnObject isEditable]) {
+        // The documentation of doubleAction (https://developer.apple.com/documentation/appkit/nstableview/doubleaction)
+        // says a double click on a cell sends the double action, and that a table without one begins editing the cell.
+        // QUIRK: with one set, a double click on an editable cell starts no edit; the documentation does not say
+        // whether the cell is edited as well. Observed on macOS 26.1 (build 25B78) arm64 with an editable column and a data source
+        // that implements setObjectValue: (probe 659, "editable columns; inside column 0, row 1 (control); click count
+        // 2": `action(clickedRow=1,clickedColumn=0,selectedRow=1)` then
+        // `doubleAction(clickedRow=1,clickedColumn=0,selectedRow=1)`, `editedRow=-1` at 0.1 s and at 0.5 s).
+        // Test: test_double_click_with_a_double_action_starts_no_edit in tests/appkit-table-click-beside-columns.m
+        if ([clickedColumnObject isEditable] && [self doubleAction] == NULL) {
+            id binder = [clickedColumnObject _binderForBinding: @"value"
+                                                        create: NO];
             if ([self dataSourceCanSetObjectValue] ||
                 [binder allowsEditingForRow: NS_EXTRA(NSTableView, self)->_clickedRow]) {
                 if (NS_EXTRA(NSTableView, self)->_clickedColumn != -1 && NS_EXTRA(NSTableView, self)->_clickedRow != -1) {
@@ -2729,6 +2828,15 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
         if (!interpretedAsEdit)
             [self sendAction: [self doubleAction] to: [self target]];
     }
+    forgetClickedCell(self);
+}
+
+// A click on a column header that was not a column drag or a divider grab. The click is in no row, and the
+// action and double action read the column.
+- (void) _sendActionForClickInHeaderOfColumn: (NSInteger) column clickCount: (NSInteger) clickCount {
+    NS_EXTRA(NSTableView, self)->_clickedColumn = column;
+    NS_EXTRA(NSTableView, self)->_clickedRow = -1;
+    sendClickAction(self, clickCount);
     forgetClickedCell(self);
 }
 
@@ -3463,6 +3571,7 @@ static NSNumber *CellViewKey(NSInteger row, NSInteger column, BOOL group) {
     [rowView setFrame: frame];
     [rowView setGroupRowStyle: [self _isGroupRow: row]];
     [rowView setSelectionHighlightStyle: [self selectionHighlightStyle]];
+    [rowView setEmphasized: [self _selectionIsEmphasized]];
     [rowView setSelected: [self isRowSelected: row]];
     [NS_EXTRA(NSTableView, self)->_rowViews setObject: rowView forKey: key];
     [self addSubview: rowView];

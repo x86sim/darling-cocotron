@@ -19,7 +19,9 @@
  SOFTWARE. */
 
 #import "CGSWaylandPointer.h"
+#import "CGSWaylandCursor.h"
 #import "CGSConnectionWayland.h"
+#import "CGSWindowWayland.h"
 #import "WaylandLibrary.h"
 #import "WaylandProtocol.h"
 #import <CoreGraphics/CGEvent.h>
@@ -46,6 +48,12 @@ enum {
 // wl_pointer.axis values are lengths in surface-local coordinates, the space pointer motion uses. A
 // notch of a wheel is this many of them, which is also what a source's pixels per line is by default
 // (CGEventSourceSetPixelsPerLine), so that a line delta and a pixel delta of the same movement agree.
+@interface CGSWaylandPointer ()
+- (void) destroyPinch;
+- (void) destroyHold;
+- (void) endHoldWithPhase: (int64_t) phase;
+@end
+
 static const double AxisUnitsPerLine = 10.0;
 
 // A Linux button code in Cocoa's numbering: the left, right and middle buttons are 0, 1 and 2, the side
@@ -72,6 +80,11 @@ static unsigned maskForCode(uint32_t code) {
 
 @synthesize pointerProxy = _pointer;
 
+- (void) setPendingTimestamp: (uint64_t) timestamp {
+    _pendingTimestamp = timestamp;
+    _hasPendingTimestamp = YES;
+}
+
 - (instancetype) initWithConnection: (CGSConnectionWayland *) connection {
     self = [super init];
     if (self == nil)
@@ -80,11 +93,14 @@ static unsigned maskForCode(uint32_t code) {
     _downClickState = [NSMutableDictionary new];
     // The pointer is hardware: the events it posts change the state the hardware state functions report.
     _source = (void *) CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    _cursorObject = [[CGSWaylandCursor alloc] initWithConnection: connection pointer: self];
     return self;
 }
 
 - (void) dealloc {
     [self stop];
+    [_cursorObject invalidate];
+    [_cursorObject release];
     [_downClickState release];
     if (_source != NULL)
         CFRelease((CFTypeRef) _source);
@@ -107,6 +123,7 @@ static unsigned maskForCode(uint32_t code) {
                                         kind: CGSWaylandObjectPointer
                                       object: self];
         [self pointerGesturesChanged];
+        [_cursorObject objectsChanged];
         id<CGSNativeConnectionObserver> observer = [self observer];
         if ([observer respondsToSelector: @selector(nativeConnectionPointerAvailabilityChanged:)])
             [observer nativeConnectionPointerAvailabilityChanged: YES];
@@ -119,16 +136,28 @@ static unsigned maskForCode(uint32_t code) {
 - (void) pointerGesturesChanged {
     struct wl_proxy *gestures = [_connection pointerGestures];
 
-    if (gestures != NULL && _pointer != NULL && _pinch == NULL) {
+    if (gestures != NULL && _pointer != NULL) {
         union wl_argument args[2] = {{.o = NULL}, {.o = (struct wl_object *) _pointer}};
-        _pinch = [_connection createObject: gestures
-                                    opcode: WP_GESTURES_GET_PINCH
-                                 interface: &zwp_pointer_gesture_pinch_v1_interface
-                                 arguments: args
-                                      kind: CGSWaylandObjectPinchGesture
-                                    object: self];
-    } else if (gestures == NULL || _pointer == NULL) {
+        if (_pinch == NULL) {
+            _pinch = [_connection createObject: gestures
+                                        opcode: WP_GESTURES_GET_PINCH
+                                     interface: &zwp_pointer_gesture_pinch_v1_interface
+                                     arguments: args
+                                          kind: CGSWaylandObjectPinchGesture
+                                        object: self];
+        }
+        // The hold gesture was added in version 3 of the manager.
+        if (_hold == NULL && WL.wl_proxy_get_version(gestures) >= 3) {
+            _hold = [_connection createObject: gestures
+                                       opcode: WP_GESTURES_GET_HOLD
+                                    interface: &zwp_pointer_gesture_hold_v1_interface
+                                    arguments: args
+                                         kind: CGSWaylandObjectHoldGesture
+                                       object: self];
+        }
+    } else {
         [self destroyPinch];
+        [self destroyHold];
     }
 }
 
@@ -140,10 +169,23 @@ static unsigned maskForCode(uint32_t code) {
     _pinch = NULL;
 }
 
+- (void) destroyHold {
+    if (_hold == NULL)
+        return;
+    [self endHoldWithPhase: kCGScrollPhaseCancelled];
+    if (WL.wl_proxy_get_version(_hold) >= 3)
+        WaylandMarshal(_hold, WP_HOLD_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, NULL);
+    else
+        WL.wl_proxy_destroy(_hold);
+    _hold = NULL;
+}
+
 - (void) stop {
     if (_pointer == NULL && _focus == NULL)
         return;
+    _hasPendingTimestamp = NO;
     [self destroyPinch];
+    [self destroyHold];
     [self releasePointerLockObjects];
     id<CGSNativeConnectionObserver> observer = [self observer];
     BOOL had = _pointer != NULL;
@@ -160,6 +202,7 @@ static unsigned maskForCode(uint32_t code) {
             WL.wl_proxy_destroy(_pointer);
         }
         _pointer = NULL;
+        [_cursorObject objectsChanged];
     }
     _focus = NULL;
     _enterSerial = 0;
@@ -181,6 +224,8 @@ static unsigned maskForCode(uint32_t code) {
         [self releasePointerLockObjects];
     if (_pinchSurface == surface)
         [self endPinchWithPhase: CGSGesturePhaseCancelled];
+    if (_holdSurface == surface)
+        [self endHoldWithPhase: kCGScrollPhaseCancelled];
     // A finger scroll on a window that goes away ends as cancelled
     if (_fingerSurface == surface)
         [self cancelFingerScroll];
@@ -190,6 +235,7 @@ static unsigned maskForCode(uint32_t code) {
         _focus = NULL;
         _enterSerial = 0;
         _pressed = 0;
+        _dragSerial = 0;
         [self setPressedNumbers: 0];
         _located = NO;
         [_downClickState removeAllObjects];
@@ -288,6 +334,11 @@ static unsigned maskForCode(uint32_t code) {
 - (void) postEvent: (CGEventRef) event {
     id<CGSNativeConnectionObserver> observer = [self observer];
 
+    if (_hasPendingTimestamp) {
+        CGEventSetTimestamp(event, _pendingTimestamp);
+        _hasPendingTimestamp = NO;
+    }
+
     // The observer is asked even for the events of a display overlay (it keeps the state of the buttons), but
     // no window can refuse them: the overlay's events always go to the process' event stream.
     BOOL overlay = [_connection isDisplayOverlaySurface:
@@ -342,10 +393,9 @@ static unsigned maskForCode(uint32_t code) {
         _lastPoint = _point;
         _remainderX = _remainderY = 0;
         [self noteGlobalLocation];
-        // The cursor of a process that hid it stays hidden over its surfaces (the compositor starts a new
-        // surface with no cursor image of ours).
-        if (![_connection cursorIsVisible])
-            [self sendHiddenCursor];
+        // The compositor starts the pointer in a new surface with no cursor image of ours: the process' cursor
+        // (a blank one while it is hidden) is given again for the serial of this enter.
+        [_cursorObject setNeedsApply];
         if ([observer respondsToSelector: @selector(nativeConnectionPointerEntered:serial:x:y:)])
             [observer nativeConnectionPointerEntered: _focus serial: _enterSerial x: _point.x y: _point.y];
         [self updatePointerLock];
@@ -354,6 +404,7 @@ static unsigned maskForCode(uint32_t code) {
     case WP_POINTER_EV_LEAVE:
         [self cancelFingerScroll];
         _pressed = 0;
+        _dragSerial = 0;
         [self setPressedNumbers: 0];
         [_downClickState removeAllObjects];
         if ([observer respondsToSelector: @selector(nativeConnectionPointerLeft)])
@@ -412,6 +463,9 @@ static unsigned maskForCode(uint32_t code) {
     _point = CGPointMake(x, y);
     BOOL used = [observer respondsToSelector: @selector(nativeConnectionPointerMovedToX:y:)] &&
                 [observer nativeConnectionPointerMovedToX: x y: y];
+    // The pointer over a window's own frame is the frame's, not the content's.
+    if (!used && _focus != NULL && _pressed == 0)
+        used = [[_connection toplevelForSurface: _focus] toplevelClientDecorationContainsPoint: _point];
     if (_focus == NULL)
         return;
     [self noteGlobalLocation];
@@ -490,13 +544,24 @@ static unsigned maskForCode(uint32_t code) {
     return _clickCount;
 }
 
+- (uint32_t) heldLeftPressSerialForSurface: (struct wl_proxy *) surface {
+    return surface != NULL && _focus == surface && (_pressed & 1) != 0 ? _leftPressSerial : 0;
+}
+
 - (void) button: (uint32_t) code pressed: (BOOL) pressed time: (uint32_t) time serial: (uint32_t) serial {
     id<CGSNativeConnectionObserver> observer = [self observer];
 
     if (pressed)
         [_connection inputPressedWithSerial: serial];
 
-    // A window decoration (title bar buttons, resize edges) takes the button for itself.
+    // A window's own frame (title bar buttons, resize edges) takes the button for itself, as long as no other button of
+    // the pointer is down.
+    if (_focus != NULL && _pressed == 0) {
+        CGSWindowWayland *window = [_connection toplevelForSurface: _focus];
+
+        if (window != nil && [window handleToplevelDecorationButton: code pressed: pressed serial: serial atPoint: _point])
+            return;
+    }
     if ([observer respondsToSelector: @selector(nativeConnectionPointerButton:pressed:serial:)] &&
         [observer nativeConnectionPointerButton: code pressed: pressed serial: serial])
         return;
@@ -509,6 +574,8 @@ static unsigned maskForCode(uint32_t code) {
     [self setButtonNumber: button pressed: pressed];
     if (pressed) {
         _pressed |= mask;
+        if (mask == 1)
+            _leftPressSerial = serial;
         if (mask == 8)
             _otherButton = code;
         clickState = _focus != NULL ? [self clickStateForPressOf: code time: time] : 1;
@@ -521,6 +588,10 @@ static unsigned maskForCode(uint32_t code) {
         clickState = held != nil ? [held longLongValue] : 1;
         [_downClickState removeObjectForKey: key];
     }
+    if (pressed && _focus != NULL)
+        _dragSerial = serial;
+    else if (!pressed && _pressed == 0)
+        _dragSerial = 0;
     if (_focus == NULL)
         return;
 
@@ -750,29 +821,28 @@ static const double kNothing = 0;
     return kCGErrorSuccess;
 }
 
-// The cursor is hidden by a request that gives the pointer no image; showing it again is the framework that
-// has the cursor images' to do (the observer), as only it has the image.
-- (void) sendHiddenCursor {
-    if (_pointer == NULL || _enterSerial == 0)
-        return;
-    union wl_argument args[4] = {{.u = _enterSerial}, {.o = NULL}, {.i = 0}, {.i = 0}};
-    WaylandMarshal(_pointer, WP_POINTER_SET_CURSOR, NULL, 0, args);
-    [_connection flush];
+- (void) cursorHiddenChanged {
+    [_cursorObject setNeedsApply];
 }
 
-- (void) cursorHiddenChanged {
-    BOOL hidden = ![_connection cursorIsVisible];
-    id<CGSNativeConnectionObserver> observer = [self observer];
+- (void) cursorChanged {
+    [_cursorObject setNeedsApply];
+}
 
-    // Each hide calls the hook; only a change between hidden and visible is a change here.
-    if (hidden == _cursorHiddenApplied)
-        return;
-    _cursorHiddenApplied = hidden;
+- (void) cursorGlobalsChanged {
+    [_cursorObject objectsChanged];
+}
 
-    if (hidden)
-        [self sendHiddenCursor];
-    if ([observer respondsToSelector: @selector(nativeConnectionCursorHiddenChanged:)])
-        [observer nativeConnectionCursorHiddenChanged: hidden];
+- (uint32_t) enterSerial {
+    return _enterSerial;
+}
+
+- (uint32_t) dragSerial {
+    return _dragSerial;
+}
+
+- (void) consumeDragSerial {
+    _dragSerial = 0;
 }
 
 #pragma mark - Scroll
@@ -1024,6 +1094,46 @@ static int64_t wholeLines(double lines) {
 
     case WP_PINCH_EV_END:
         [self endPinchWithPhase: args[2].i ? CGSGesturePhaseCancelled : CGSGesturePhaseEnded];
+        break;
+    }
+}
+
+// A hold cancels the kinetic scrolling of the scroll view under the fingers. AppKit expresses that
+// with a scroll event of zero delta and a phase, not with a magnification or rotation.
+- (void) postHoldPhase: (int64_t) phase {
+    CGEventRef event = CGEventCreateScrollWheelEvent2((CGEventSourceRef) _source,
+                                                      kCGScrollEventUnitPixel, 2, 0, 0, 0);
+    if (event == NULL)
+        return;
+    CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, phase);
+    CGEventSetLocation(event, [self globalLocationOfSurface: _holdSurface point: _point]);
+    [self addCommonFieldsTo: event surface: _holdSurface point: _point
+                    global: [self globalLocationOfSurface: _holdSurface point: _point]
+                     flags: [_connection modifierFlags]];
+    [self postEvent: event];
+}
+
+- (void) endHoldWithPhase: (int64_t) phase {
+    if (!_holdActive)
+        return;
+    [self postHoldPhase: phase];
+    _holdActive = NO;
+    _holdSurface = NULL;
+}
+
+- (void) holdEvent: (uint32_t) opcode arguments: (union wl_argument *) args {
+    [self postPendingScroll];
+    switch (opcode) {
+    case WP_HOLD_EV_BEGIN:
+        _holdSurface = (struct wl_proxy *) args[2].o;
+        _holdActive = _holdSurface != NULL;
+        if (_holdActive)
+            [self postHoldPhase: kCGScrollPhaseBegan];
+        break;
+    case WP_HOLD_EV_END:
+        [self endHoldWithPhase: args[2].i ? kCGScrollPhaseCancelled : kCGScrollPhaseEnded];
+        break;
+    default:
         break;
     }
 }
