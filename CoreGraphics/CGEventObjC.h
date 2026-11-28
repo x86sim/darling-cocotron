@@ -26,7 +26,7 @@
 
 // A CGEvent keeps its fields in a fixed array indexed by CGEventField: no allocation, no
 // boxing and no hashing per field. Indexes at or above this limit do not exist.
-#define CGEVENT_FIELD_COUNT 192
+#define CGEVENT_FIELD_COUNT 256
 
 // What kind of event a type is, which decides what fields it has.
 typedef enum {
@@ -57,9 +57,14 @@ extern CGEventClass _CGEventClassOfType(CGEventType type);
 	// The Unicode string of a keyboard event (up to 65535 UTF-16 units), NULL when none was set.
 	UniChar* _unicodeString;
 	uint16_t _unicodeLength;
+	// YES while the string is the one derived from the key code at creation, NO once a client set one.
+	BOOL _unicodeDerived;
 
 	CGSEventRecordPtr _eventRecord;
 	uint32_t _eventRecordLength;
+	// The object the event stands for, attached by the framework that made the event from it
+	// (_CGSEventSetClientData); not part of the event, so copies do not get it.
+	id _clientData;
 }
 -(instancetype) initWithSource:(CGEventSourceRef) source;
 -(instancetype) initWithSource:(CGEventSourceRef) source
@@ -90,6 +95,9 @@ extern CGEventClass _CGEventClassOfType(CGEventType type);
 
 // Replaces the Unicode string; stringLength is limited to 65535.
 -(void) setUnicodeString:(const UniChar*) string length:(UniCharCount) stringLength;
+
+// Whether the other event has the same type, time, flags, location, fields and Unicode string.
+-(BOOL) hasSameContentAs:(CGEvent*) other;
 
 @end
 

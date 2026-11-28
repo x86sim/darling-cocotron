@@ -23,6 +23,7 @@
 #import <Foundation/NSString.h>
 #include <elfcalls.h>
 #include <errno.h>
+#include <sys/mman.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -164,6 +165,10 @@ bool WaylandCheckOpcodes(void) {
             {&zwp_pointer_gesture_pinch_v1_interface, true, WP_PINCH_EV_BEGIN, "begin"},
             {&zwp_pointer_gesture_pinch_v1_interface, true, WP_PINCH_EV_UPDATE, "update"},
             {&zwp_pointer_gesture_pinch_v1_interface, true, WP_PINCH_EV_END, "end"},
+            {&zwp_pointer_gestures_v1_interface, false, WP_GESTURES_GET_HOLD, "get_hold_gesture"},
+            {&zwp_pointer_gesture_hold_v1_interface, false, WP_HOLD_DESTROY, "destroy"},
+            {&zwp_pointer_gesture_hold_v1_interface, true, WP_HOLD_EV_BEGIN, "begin"},
+            {&zwp_pointer_gesture_hold_v1_interface, true, WP_HOLD_EV_END, "end"},
             {&zwp_text_input_manager_v3_interface, false, WP_TEXT_INPUT_MANAGER_DESTROY, "destroy"},
             {&zwp_text_input_manager_v3_interface, false, WP_TEXT_INPUT_MANAGER_GET_TEXT_INPUT, "get_text_input"},
             {&zwp_text_input_v3_interface, false, WP_TEXT_INPUT_DESTROY, "destroy"},
@@ -196,6 +201,100 @@ bool WaylandCheckOpcodes(void) {
             {&zwp_locked_pointer_v1_interface, false, WP_LOCKED_POINTER_SET_CURSOR_POSITION_HINT, "set_cursor_position_hint"},
             {&zwp_locked_pointer_v1_interface, true, WP_LOCKED_POINTER_EV_LOCKED, "locked"},
             {&zwp_locked_pointer_v1_interface, true, WP_LOCKED_POINTER_EV_UNLOCKED, "unlocked"},
+            {&wp_pointer_warp_v1_interface, false, WP_POINTER_WARP_DESTROY, "destroy"},
+            {&wp_pointer_warp_v1_interface, false, WP_POINTER_WARP_WARP_POINTER, "warp_pointer"},
+            {&wp_cursor_shape_manager_v1_interface, false, WP_CURSOR_SHAPE_MANAGER_DESTROY, "destroy"},
+            {&wp_cursor_shape_manager_v1_interface, false, WP_CURSOR_SHAPE_MANAGER_GET_POINTER, "get_pointer"},
+            {&wp_cursor_shape_manager_v1_interface, false,
+             WP_CURSOR_SHAPE_MANAGER_GET_TABLET_TOOL_V2, "get_tablet_tool_v2"},
+            {&wp_cursor_shape_device_v1_interface, false, WP_CURSOR_SHAPE_DEVICE_DESTROY, "destroy"},
+            {&wp_cursor_shape_device_v1_interface, false, WP_CURSOR_SHAPE_DEVICE_SET_SHAPE, "set_shape"},
+            {&xdg_wm_dialog_v1_interface, false, XDG_WM_DIALOG_DESTROY, "destroy"},
+            {&xdg_wm_dialog_v1_interface, false, XDG_WM_DIALOG_GET_XDG_DIALOG, "get_xdg_dialog"},
+            {&xdg_dialog_v1_interface, false, XDG_DIALOG_DESTROY, "destroy"},
+            {&xdg_dialog_v1_interface, false, XDG_DIALOG_SET_MODAL, "set_modal"},
+            {&xdg_dialog_v1_interface, false, XDG_DIALOG_UNSET_MODAL, "unset_modal"},
+            {&xdg_system_bell_v1_interface, false, XDG_SYSTEM_BELL_DESTROY, "destroy"},
+            {&xdg_system_bell_v1_interface, false, XDG_SYSTEM_BELL_RING, "ring"},
+            {&wp_alpha_modifier_v1_interface, false, WP_ALPHA_MODIFIER_DESTROY, "destroy"},
+            {&wp_alpha_modifier_v1_interface, false, WP_ALPHA_MODIFIER_GET_SURFACE, "get_surface"},
+            {&wp_alpha_modifier_surface_v1_interface, false,
+             WP_ALPHA_MODIFIER_SURFACE_DESTROY, "destroy"},
+            {&wp_alpha_modifier_surface_v1_interface, false,
+             WP_ALPHA_MODIFIER_SURFACE_SET_MULTIPLIER, "set_multiplier"},
+            {&xdg_toplevel_tag_manager_v1_interface, false,
+             XDG_TOPLEVEL_TAG_MANAGER_DESTROY, "destroy"},
+            {&xdg_toplevel_tag_manager_v1_interface, false,
+             XDG_TOPLEVEL_TAG_MANAGER_SET_TOPLEVEL_TAG, "set_toplevel_tag"},
+            {&xdg_toplevel_tag_manager_v1_interface, false,
+             XDG_TOPLEVEL_TAG_MANAGER_SET_TOPLEVEL_DESCRIPTION, "set_toplevel_description"},
+            {&zwp_idle_inhibit_manager_v1_interface, false,
+             ZWP_IDLE_INHIBIT_MANAGER_DESTROY, "destroy"},
+            {&zwp_idle_inhibit_manager_v1_interface, false,
+             ZWP_IDLE_INHIBIT_MANAGER_CREATE_INHIBITOR, "create_inhibitor"},
+            {&zwp_idle_inhibitor_v1_interface, false, ZWP_IDLE_INHIBITOR_DESTROY, "destroy"},
+
+            {&zwp_tablet_manager_v2_interface, false, ZWP_TABLET_MANAGER_GET_TABLET_SEAT, "get_tablet_seat"},
+            {&zwp_tablet_manager_v2_interface, false, ZWP_TABLET_MANAGER_DESTROY, "destroy"},
+            {&zwp_tablet_seat_v2_interface, false, ZWP_TABLET_SEAT_DESTROY, "destroy"},
+            {&zwp_tablet_seat_v2_interface, true, ZWP_TABLET_SEAT_EV_TABLET_ADDED, "tablet_added"},
+            {&zwp_tablet_seat_v2_interface, true, ZWP_TABLET_SEAT_EV_TOOL_ADDED, "tool_added"},
+            {&zwp_tablet_seat_v2_interface, true, ZWP_TABLET_SEAT_EV_PAD_ADDED, "pad_added"},
+            {&zwp_tablet_v2_interface, false, ZWP_TABLET_DESTROY, "destroy"},
+            {&zwp_tablet_v2_interface, true, ZWP_TABLET_EV_NAME, "name"},
+            {&zwp_tablet_v2_interface, true, ZWP_TABLET_EV_ID, "id"},
+            {&zwp_tablet_v2_interface, true, ZWP_TABLET_EV_PATH, "path"},
+            {&zwp_tablet_v2_interface, true, ZWP_TABLET_EV_DONE, "done"},
+            {&zwp_tablet_v2_interface, true, ZWP_TABLET_EV_REMOVED, "removed"},
+            {&zwp_tablet_tool_v2_interface, false, ZWP_TABLET_TOOL_SET_CURSOR, "set_cursor"},
+            {&zwp_tablet_tool_v2_interface, false, ZWP_TABLET_TOOL_DESTROY, "destroy"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_TYPE, "type"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_HARDWARE_SERIAL, "hardware_serial"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_HARDWARE_ID_WACOM, "hardware_id_wacom"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_CAPABILITY, "capability"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_DONE, "done"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_REMOVED, "removed"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_PROXIMITY_IN, "proximity_in"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_PROXIMITY_OUT, "proximity_out"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_DOWN, "down"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_UP, "up"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_MOTION, "motion"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_PRESSURE, "pressure"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_DISTANCE, "distance"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_TILT, "tilt"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_ROTATION, "rotation"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_SLIDER, "slider"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_WHEEL, "wheel"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_BUTTON, "button"},
+            {&zwp_tablet_tool_v2_interface, true, ZWP_TABLET_TOOL_EV_FRAME, "frame"},
+
+            {&wp_content_type_manager_v1_interface, false, WP_CONTENT_TYPE_MANAGER_DESTROY, "destroy"},
+            {&wp_content_type_manager_v1_interface, false,
+             WP_CONTENT_TYPE_MANAGER_GET_SURFACE_CONTENT_TYPE, "get_surface_content_type"},
+            {&wp_content_type_v1_interface, false, WP_CONTENT_TYPE_DESTROY, "destroy"},
+            {&wp_content_type_v1_interface, false, WP_CONTENT_TYPE_SET_CONTENT_TYPE, "set_content_type"},
+
+            {&zwp_input_timestamps_manager_v1_interface, false,
+             WP_INPUT_TIMESTAMPS_MANAGER_DESTROY, "destroy"},
+            {&zwp_input_timestamps_manager_v1_interface, false,
+             WP_INPUT_TIMESTAMPS_MANAGER_GET_KEYBOARD_TIMESTAMPS, "get_keyboard_timestamps"},
+            {&zwp_input_timestamps_manager_v1_interface, false,
+             WP_INPUT_TIMESTAMPS_MANAGER_GET_POINTER_TIMESTAMPS, "get_pointer_timestamps"},
+            {&zwp_input_timestamps_manager_v1_interface, false,
+             WP_INPUT_TIMESTAMPS_MANAGER_GET_TOUCH_TIMESTAMPS, "get_touch_timestamps"},
+            {&zwp_input_timestamps_v1_interface, false, WP_INPUT_TIMESTAMPS_DESTROY, "destroy"},
+            {&zwp_input_timestamps_v1_interface, true, WP_INPUT_TIMESTAMPS_EV_TIMESTAMP, "timestamp"},
+
+            {&zwp_keyboard_shortcuts_inhibit_manager_v1_interface, false,
+             ZWP_KEYBOARD_SHORTCUTS_INHIBIT_MANAGER_DESTROY, "destroy"},
+            {&zwp_keyboard_shortcuts_inhibit_manager_v1_interface, false,
+             ZWP_KEYBOARD_SHORTCUTS_INHIBIT_MANAGER_INHIBIT_SHORTCUTS, "inhibit_shortcuts"},
+            {&zwp_keyboard_shortcuts_inhibitor_v1_interface, false,
+             ZWP_KEYBOARD_SHORTCUTS_INHIBITOR_DESTROY, "destroy"},
+            {&zwp_keyboard_shortcuts_inhibitor_v1_interface, true,
+             ZWP_KEYBOARD_SHORTCUTS_INHIBITOR_EV_ACTIVE, "active"},
+            {&zwp_keyboard_shortcuts_inhibitor_v1_interface, true,
+             ZWP_KEYBOARD_SHORTCUTS_INHIBITOR_EV_INACTIVE, "inactive"},
             {&wp_fractional_scale_manager_v1_interface, false, WP_FRACTIONAL_MANAGER_DESTROY, "destroy"},
             {&wp_fractional_scale_manager_v1_interface, false, WP_FRACTIONAL_MANAGER_GET_SCALE, "get_fractional_scale"},
             {&wp_fractional_scale_v1_interface, false, WP_FRACTIONAL_DESTROY, "destroy"},
@@ -228,6 +327,7 @@ bool WaylandCheckOpcodes(void) {
 
             {&org_kde_plasma_shell_interface, false, WP_PLASMA_SHELL_GET_SURFACE, "get_surface"},
             {&org_kde_plasma_surface_interface, false, WP_PLASMA_SURFACE_DESTROY, "destroy"},
+            {&org_kde_plasma_surface_interface, false, WP_PLASMA_SURFACE_SET_POSITION, "set_position"},
             {&org_kde_plasma_surface_interface, false, WP_PLASMA_SURFACE_SET_SKIP_TASKBAR, "set_skip_taskbar"},
             {&org_kde_plasma_surface_interface, false, WP_PLASMA_SURFACE_SET_SKIP_SWITCHER, "set_skip_switcher"},
             {&xdg_toplevel_icon_manager_v1_interface, false, WP_ICON_MANAGER_DESTROY, "destroy"},
@@ -405,6 +505,146 @@ bool WaylandCheckOpcodes(void) {
              WP_TOPLEVEL_DECORATION_SET_MODE, "set_mode"},
             {&zxdg_toplevel_decoration_v1_interface, false,
              WP_TOPLEVEL_DECORATION_UNSET_MODE, "unset_mode"},
+
+            {&wp_color_manager_v1_interface, false, WP_COLOR_MANAGER_DESTROY, "destroy"},
+            {&wp_color_manager_v1_interface, false, WP_COLOR_MANAGER_GET_OUTPUT, "get_output"},
+            {&wp_color_manager_v1_interface, false, WP_COLOR_MANAGER_GET_SURFACE, "get_surface"},
+            {&wp_color_manager_v1_interface, false, WP_COLOR_MANAGER_GET_SURFACE_FEEDBACK, "get_surface_feedback"},
+            {&wp_color_manager_v1_interface, false, WP_COLOR_MANAGER_CREATE_ICC_CREATOR, "create_icc_creator"},
+            {&wp_color_manager_v1_interface, false, WP_COLOR_MANAGER_CREATE_PARAMETRIC_CREATOR, "create_parametric_creator"},
+            {&wp_color_manager_v1_interface, false, WP_COLOR_MANAGER_CREATE_WINDOWS_SCRGB, "create_windows_scrgb"},
+            {&wp_color_manager_v1_interface, false, WP_COLOR_MANAGER_GET_IMAGE_DESCRIPTION, "get_image_description"},
+            {&wp_color_manager_v1_interface, false, WP_COLOR_MANAGER_CREATE_WINDOWS_BT2100, "create_windows_bt2100"},
+            {&wp_color_manager_v1_interface, true, WP_COLOR_MANAGER_EV_SUPPORTED_INTENT, "supported_intent"},
+            {&wp_color_manager_v1_interface, true, WP_COLOR_MANAGER_EV_SUPPORTED_FEATURE, "supported_feature"},
+            {&wp_color_manager_v1_interface, true, WP_COLOR_MANAGER_EV_SUPPORTED_TF_NAMED, "supported_tf_named"},
+            {&wp_color_manager_v1_interface, true, WP_COLOR_MANAGER_EV_SUPPORTED_PRIMARIES_NAMED, "supported_primaries_named"},
+            {&wp_color_manager_v1_interface, true, WP_COLOR_MANAGER_EV_DONE, "done"},
+
+            {&wp_color_management_output_v1_interface, false, WP_COLOR_OUTPUT_DESTROY, "destroy"},
+            {&wp_color_management_output_v1_interface, false, WP_COLOR_OUTPUT_GET_IMAGE_DESCRIPTION, "get_image_description"},
+            {&wp_color_management_output_v1_interface, true, WP_COLOR_OUTPUT_EV_IMAGE_DESCRIPTION_CHANGED, "image_description_changed"},
+
+            {&wp_color_management_surface_v1_interface, false, WP_COLOR_SURFACE_DESTROY, "destroy"},
+            {&wp_color_management_surface_v1_interface, false, WP_COLOR_SURFACE_SET_IMAGE_DESCRIPTION, "set_image_description"},
+            {&wp_color_management_surface_v1_interface, false, WP_COLOR_SURFACE_UNSET_IMAGE_DESCRIPTION, "unset_image_description"},
+
+            {&wp_color_management_surface_feedback_v1_interface, false, WP_COLOR_FEEDBACK_DESTROY, "destroy"},
+            {&wp_color_management_surface_feedback_v1_interface, false, WP_COLOR_FEEDBACK_GET_PREFERRED, "get_preferred"},
+            {&wp_color_management_surface_feedback_v1_interface, false, WP_COLOR_FEEDBACK_GET_PREFERRED_PARAMETRIC, "get_preferred_parametric"},
+            {&wp_color_management_surface_feedback_v1_interface, true, WP_COLOR_FEEDBACK_EV_PREFERRED_CHANGED, "preferred_changed"},
+            {&wp_color_management_surface_feedback_v1_interface, true, WP_COLOR_FEEDBACK_EV_PREFERRED_CHANGED2, "preferred_changed2"},
+
+            {&wp_image_description_creator_icc_v1_interface, false, WP_COLOR_ICC_CREATOR_CREATE, "create"},
+            {&wp_image_description_creator_icc_v1_interface, false, WP_COLOR_ICC_CREATOR_SET_ICC_FILE, "set_icc_file"},
+
+            {&wp_image_description_creator_params_v1_interface, false, WP_COLOR_PARAMS_CREATE, "create"},
+            {&wp_image_description_creator_params_v1_interface, false, WP_COLOR_PARAMS_SET_TF_NAMED, "set_tf_named"},
+            {&wp_image_description_creator_params_v1_interface, false, WP_COLOR_PARAMS_SET_TF_POWER, "set_tf_power"},
+            {&wp_image_description_creator_params_v1_interface, false, WP_COLOR_PARAMS_SET_PRIMARIES_NAMED, "set_primaries_named"},
+            {&wp_image_description_creator_params_v1_interface, false, WP_COLOR_PARAMS_SET_PRIMARIES, "set_primaries"},
+            {&wp_image_description_creator_params_v1_interface, false, WP_COLOR_PARAMS_SET_LUMINANCES, "set_luminances"},
+            {&wp_image_description_creator_params_v1_interface, false, WP_COLOR_PARAMS_SET_MASTERING_DISPLAY_PRIMARIES, "set_mastering_display_primaries"},
+            {&wp_image_description_creator_params_v1_interface, false, WP_COLOR_PARAMS_SET_MASTERING_LUMINANCE, "set_mastering_luminance"},
+            {&wp_image_description_creator_params_v1_interface, false, WP_COLOR_PARAMS_SET_MAX_CLL, "set_max_cll"},
+            {&wp_image_description_creator_params_v1_interface, false, WP_COLOR_PARAMS_SET_MAX_FALL, "set_max_fall"},
+
+            {&wp_image_description_v1_interface, false, WP_IMAGE_DESCRIPTION_DESTROY, "destroy"},
+            {&wp_image_description_v1_interface, false, WP_IMAGE_DESCRIPTION_GET_INFORMATION, "get_information"},
+            {&wp_image_description_v1_interface, true, WP_IMAGE_DESCRIPTION_EV_FAILED, "failed"},
+            {&wp_image_description_v1_interface, true, WP_IMAGE_DESCRIPTION_EV_READY, "ready"},
+            {&wp_image_description_v1_interface, true, WP_IMAGE_DESCRIPTION_EV_READY2, "ready2"},
+
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_DONE, "done"},
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_ICC_FILE, "icc_file"},
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_PRIMARIES, "primaries"},
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_PRIMARIES_NAMED, "primaries_named"},
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_TF_POWER, "tf_power"},
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_TF_NAMED, "tf_named"},
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_LUMINANCES, "luminances"},
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_TARGET_PRIMARIES, "target_primaries"},
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_TARGET_LUMINANCE, "target_luminance"},
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_TARGET_MAX_CLL, "target_max_cll"},
+            {&wp_image_description_info_v1_interface, true, WP_IMAGE_DESCRIPTION_INFO_EV_TARGET_MAX_FALL, "target_max_fall"},
+
+            {&wp_image_description_reference_v1_interface, false, WP_IMAGE_DESCRIPTION_REFERENCE_DESTROY, "destroy"},
+
+            {&wp_color_representation_manager_v1_interface, false, WP_COLOR_REP_MANAGER_DESTROY, "destroy"},
+            {&wp_color_representation_manager_v1_interface, false, WP_COLOR_REP_MANAGER_GET_SURFACE, "get_surface"},
+            {&wp_color_representation_manager_v1_interface, true, WP_COLOR_REP_MANAGER_EV_SUPPORTED_ALPHA_MODE, "supported_alpha_mode"},
+            {&wp_color_representation_manager_v1_interface, true, WP_COLOR_REP_MANAGER_EV_SUPPORTED_COEFFICIENTS_AND_RANGES, "supported_coefficients_and_ranges"},
+            {&wp_color_representation_manager_v1_interface, true, WP_COLOR_REP_MANAGER_EV_DONE, "done"},
+
+            {&wp_color_representation_surface_v1_interface, false, WP_COLOR_REP_SURFACE_DESTROY, "destroy"},
+            {&wp_color_representation_surface_v1_interface, false, WP_COLOR_REP_SURFACE_SET_ALPHA_MODE, "set_alpha_mode"},
+            {&wp_color_representation_surface_v1_interface, false, WP_COLOR_REP_SURFACE_SET_COEFFICIENTS_AND_RANGE, "set_coefficients_and_range"},
+            {&wp_color_representation_surface_v1_interface, false, WP_COLOR_REP_SURFACE_SET_CHROMA_LOCATION, "set_chroma_location"},
+
+            {&xdg_session_manager_v1_interface, false, WP_SESSION_MANAGER_DESTROY, "destroy"},
+            {&xdg_session_manager_v1_interface, false, WP_SESSION_MANAGER_GET_SESSION, "get_session"},
+
+            {&xdg_session_v1_interface, false, WP_SESSION_DESTROY, "destroy"},
+            {&xdg_session_v1_interface, false, WP_SESSION_REMOVE, "remove"},
+            {&xdg_session_v1_interface, false, WP_SESSION_ADD_TOPLEVEL, "add_toplevel"},
+            {&xdg_session_v1_interface, false, WP_SESSION_RESTORE_TOPLEVEL, "restore_toplevel"},
+            {&xdg_session_v1_interface, false, WP_SESSION_REMOVE_TOPLEVEL, "remove_toplevel"},
+            {&xdg_session_v1_interface, true, WP_SESSION_EV_CREATED, "created"},
+            {&xdg_session_v1_interface, true, WP_SESSION_EV_RESTORED, "restored"},
+            {&xdg_session_v1_interface, true, WP_SESSION_EV_REPLACED, "replaced"},
+
+            {&xdg_toplevel_session_v1_interface, false, WP_TOPLEVEL_SESSION_DESTROY, "destroy"},
+            {&xdg_toplevel_session_v1_interface, false, WP_TOPLEVEL_SESSION_RENAME, "rename"},
+            {&xdg_toplevel_session_v1_interface, true, WP_TOPLEVEL_SESSION_EV_RESTORED, "restored"},
+
+            {&zwp_linux_dmabuf_v1_interface, false, WP_DMABUF_DESTROY, "destroy"},
+            {&zwp_linux_dmabuf_v1_interface, false, WP_DMABUF_CREATE_PARAMS, "create_params"},
+            {&zwp_linux_dmabuf_v1_interface, false, WP_DMABUF_GET_DEFAULT_FEEDBACK, "get_default_feedback"},
+            {&zwp_linux_dmabuf_v1_interface, false, WP_DMABUF_GET_SURFACE_FEEDBACK, "get_surface_feedback"},
+            {&zwp_linux_dmabuf_v1_interface, true, WP_DMABUF_EV_FORMAT, "format"},
+            {&zwp_linux_dmabuf_v1_interface, true, WP_DMABUF_EV_MODIFIER, "modifier"},
+            {&zwp_linux_buffer_params_v1_interface, false, WP_DMABUF_PARAMS_DESTROY, "destroy"},
+            {&zwp_linux_buffer_params_v1_interface, false, WP_DMABUF_PARAMS_ADD, "add"},
+            {&zwp_linux_buffer_params_v1_interface, false, WP_DMABUF_PARAMS_CREATE, "create"},
+            {&zwp_linux_buffer_params_v1_interface, false, WP_DMABUF_PARAMS_CREATE_IMMED, "create_immed"},
+            {&zwp_linux_buffer_params_v1_interface, false,
+             WP_DMABUF_PARAMS_SET_SAMPLING_DEVICE, "set_sampling_device"},
+            {&zwp_linux_buffer_params_v1_interface, true, WP_DMABUF_PARAMS_EV_CREATED, "created"},
+            {&zwp_linux_buffer_params_v1_interface, true, WP_DMABUF_PARAMS_EV_FAILED, "failed"},
+            {&zwp_linux_dmabuf_feedback_v1_interface, false, WP_DMABUF_FEEDBACK_DESTROY, "destroy"},
+            {&zwp_linux_dmabuf_feedback_v1_interface, true, WP_DMABUF_FEEDBACK_EV_DONE, "done"},
+            {&zwp_linux_dmabuf_feedback_v1_interface, true,
+             WP_DMABUF_FEEDBACK_EV_FORMAT_TABLE, "format_table"},
+            {&zwp_linux_dmabuf_feedback_v1_interface, true,
+             WP_DMABUF_FEEDBACK_EV_MAIN_DEVICE, "main_device"},
+            {&zwp_linux_dmabuf_feedback_v1_interface, true,
+             WP_DMABUF_FEEDBACK_EV_TRANCHE_DONE, "tranche_done"},
+            {&zwp_linux_dmabuf_feedback_v1_interface, true,
+             WP_DMABUF_FEEDBACK_EV_TRANCHE_TARGET_DEVICE, "tranche_target_device"},
+            {&zwp_linux_dmabuf_feedback_v1_interface, true,
+             WP_DMABUF_FEEDBACK_EV_TRANCHE_FORMATS, "tranche_formats"},
+            {&zwp_linux_dmabuf_feedback_v1_interface, true,
+             WP_DMABUF_FEEDBACK_EV_TRANCHE_FLAGS, "tranche_flags"},
+
+            {&wp_linux_drm_syncobj_manager_v1_interface, false,
+             WP_SYNCOBJ_MANAGER_DESTROY, "destroy"},
+            {&wp_linux_drm_syncobj_manager_v1_interface, false,
+             WP_SYNCOBJ_MANAGER_GET_SURFACE, "get_surface"},
+            {&wp_linux_drm_syncobj_manager_v1_interface, false,
+             WP_SYNCOBJ_MANAGER_IMPORT_TIMELINE, "import_timeline"},
+            {&wp_linux_drm_syncobj_timeline_v1_interface, false,
+             WP_SYNCOBJ_TIMELINE_DESTROY, "destroy"},
+            {&wp_linux_drm_syncobj_surface_v1_interface, false,
+             WP_SYNCOBJ_SURFACE_DESTROY, "destroy"},
+            {&wp_linux_drm_syncobj_surface_v1_interface, false,
+             WP_SYNCOBJ_SURFACE_SET_ACQUIRE_POINT, "set_acquire_point"},
+            {&wp_linux_drm_syncobj_surface_v1_interface, false,
+             WP_SYNCOBJ_SURFACE_SET_RELEASE_POINT, "set_release_point"},
+
+            {&wp_fifo_manager_v1_interface, false, WP_FIFO_MANAGER_DESTROY, "destroy"},
+            {&wp_fifo_manager_v1_interface, false, WP_FIFO_MANAGER_GET_FIFO, "get_fifo"},
+            {&wp_fifo_v1_interface, false, WP_FIFO_SET_BARRIER, "set_barrier"},
+            {&wp_fifo_v1_interface, false, WP_FIFO_WAIT_BARRIER, "wait_barrier"},
+            {&wp_fifo_v1_interface, false, WP_FIFO_DESTROY, "destroy"},
     };
 
     for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
@@ -469,4 +709,34 @@ int WaylandCreateAnonymousFile(size_t size) {
         return -1;
     }
     return fd;
+}
+
+struct wl_proxy *WaylandCreateARGBBuffer(struct wl_proxy *shm, const void *pixels, size_t length,
+                                         int32_t width, int32_t height) {
+    if (shm == NULL || pixels == NULL || width < 1 || height < 1 || width > INT32_MAX / 4 ||
+        height > INT32_MAX / (width * 4) || length != (size_t) width * (size_t) height * 4)
+        return NULL;
+    int fd = WaylandCreateAnonymousFile(length);
+    if (fd < 0)
+        return NULL;
+    void *data = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+        close(fd);
+        return NULL;
+    }
+    memcpy(data, pixels, length);
+    // Immutable storage: the queued request owns a duplicate of fd and the compositor keeps its mapping. The
+    // pixels of a buffer in use are never rewritten.
+    munmap(data, length);
+    union wl_argument poolArgs[3] = {{.o = NULL}, {.h = fd}, {.i = (int32_t) length}};
+    struct wl_proxy *pool = WaylandMarshal(shm, WP_SHM_CREATE_POOL, &wl_shm_pool_interface, 0, poolArgs);
+    close(fd);
+    if (pool == NULL)
+        return NULL;
+    union wl_argument bufferArgs[6] = {{.o = NULL}, {.i = 0}, {.i = width}, {.i = height},
+                                       {.i = width * 4}, {.u = WP_SHM_FORMAT_ARGB8888}};
+    struct wl_proxy *buffer = WaylandMarshal(pool, WP_SHM_POOL_CREATE_BUFFER, &wl_buffer_interface, 0, bufferArgs);
+    union wl_argument none[1] = {{.o = NULL}};
+    WaylandMarshal(pool, WP_SHM_POOL_DESTROY, NULL, WL_MARSHAL_FLAG_DESTROY, none);
+    return buffer;
 }

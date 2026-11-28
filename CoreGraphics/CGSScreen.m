@@ -23,24 +23,27 @@
 @synthesize edid = _edid;
 @synthesize modes = _modes;
 @synthesize currentMode = _currentMode;
+@synthesize displayID = _displayID;
+@synthesize bounds = _bounds;
+@synthesize backingScale = _backingScale;
+@synthesize nativeFrame = _nativeFrame;
+@synthesize hasNativeFrame = _hasNativeFrame;
+@synthesize name = _name;
+@synthesize colorInfo = _colorInfo;
 
 -(void) dealloc
 {
 	[_edid release];
 	[_modes release];
+	[_name release];
+	[_colorInfo release];
 	[super dealloc];
 }
 
--(uint32_t) currentModeHeight
+-(NSDictionary*) currentModeDictionary
 {
-	if (!_currentModeHeightCached)
-	{
-		if (_currentMode < 0 || _currentMode >= [_modes count])
-			return 0;
-		NSNumber* height = (NSNumber*) _modes[_currentMode][@"Height"];
-		_currentModeHeightCached = height.intValue;
-	}
-	return _currentModeHeightCached;
+	if (_currentMode < 0 || _currentMode >= (CFIndex) [_modes count])
+		return nil;
+	return [_modes objectAtIndex: _currentMode];
 }
 @end
-

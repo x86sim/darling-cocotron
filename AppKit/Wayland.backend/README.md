@@ -38,11 +38,21 @@ to, such a window is an ordinary toplevel.
 
 - Windows: xdg toplevels, resize, hide and show, compositor close, nested popup menus, client or
   server-side decorations.
+  The windows are CoreGraphics toplevel windows (`CGSWindow.h`, the SPI the X11 backend uses too): CoreGraphics makes the
+  wl_surface and, while a window is shown, its xdg-shell, xdg-decoration and layer-shell objects, and tells the backend
+  the compositor's configure sequences, close requests and dismissed pop-ups; a window's number is its CoreGraphics
+  window's id. CoreGraphics also relates a window to the window the backend names as its parent (`xdg_toplevel.set_parent`),
+  asks for fullscreen and minimizing, keeps the state xdg-shell does not tell (minimized, covered, holding the focus),
+  asks for activation (xdg-activation, also for another process' request, see `_CGSActivateProcess()`) and keeps the order
+  of the windows (`_CGSOrderedToplevelWindowIDs()`: the one activated last first). The backend draws into the surface
+  and decides what a window level, a window's presentation or its size mean for those requests, and adds what the
+  protocol needs beyond that (session, scale, tags).
 - The main menu in Plasma's global menu, or in the windows: see below.
 - Input: pointer with click grouping and scroll frames, keyboard through xkbcommon with the compositor's
   keymap and key repeat, aggregate and left/right modifier changes, touchpad pinch as magnify and rotate
   events.
-- Cursors: themed cursors and `NSImage` cursors with their hotspot.
+- Cursors: themed cursors and `NSImage` cursors with their hotspot. They are CoreGraphics' (the cursor SPI, `CGSCursor.h`):
+  the shape goes to the compositor with cursor-shape-v1, an image or a theme image is the pointer's cursor surface.
 - Clipboard and drag-and-drop, OpenGL and scale, fullscreen and pointer lock: see below.
 - Window icon: with `xdg_toplevel_icon_manager_v1` (KWin 6.1 and later, others), every toplevel gets the application
   icon, `-[NSApplication applicationIconImage]` (the bundle icon or what the program set), as wl_shm buffers at the
@@ -61,24 +71,44 @@ the session bus with the [`com.canonical.dbusmenu`](https://github.com/AyatanaIn
 (`AppKit/NSDBusMenu.m`, shared with the X11 backend) and every toplevel tells the compositor its address with
 `org_kde_kwin_appmenu.set_address`. Plasma owns the registrar name only while a global menu view is in use (the
 Global Menu applet or the application menu button of the title bars), so the name is the sign that the menu will
-be seen. Otherwise titled windows draw the menu in a strip of their own, as with the `DarlingInWindowMenuBar`
-preference: an xdg-shell client cannot put a menu bar window of its own along the top of the screen as the X11
-backend does. The choice is made once, before the first window frame is computed.
+be seen.
+
+Otherwise the windows that can carry it (titled, not panels or sheets, see `+[NSWindow
+hasMainMenuForStyleMask:]`) draw the menu in a strip of their own. A compositor with `zwlr_layer_shell_v1` also
+gets a menu bar surface along the top of the screen (an `NSMenuBarWindow`, see `NSMenuBarController`), shown only
+while the application is active, has a main menu and no visible window carries the strip: an application with
+only borderless or utility windows, or none. An xdg-shell client alone cannot place such a surface, so there the
+strips are all there is. The bar follows the application's activation: it goes away after a moment when another
+client takes the keyboard focus. Closing the last window does not end the activation, because nothing shows
+whether another client has the focus then.
+
+The `DarlingMenuBarStyle` preference (application domain, NSGlobalDomain or `org.darlinghq.AppKit`) changes the
+choice: `window` always uses the strips (the global menu is not used), `screen` never uses them while the menu
+can be shown outside the windows (global menu, or the menu bar surface), and `auto`, the default, is as
+described above. The older boolean `DarlingInWindowMenuBar` means `window` when `DarlingMenuBarStyle` is not set.
+The choice is made once, before the first window frame is computed.
 
 ## Clipboard and drag-and-drop
 
 The general pasteboard is the selection of `wl_data_device` (core protocol, `wl_data_device_manager`
-version 3 for drag actions). Text maps to `text/plain;charset=utf-8`, `text/plain` and `UTF8_STRING`, PNG and
+version 3 for drag actions). CoreGraphics owns that: its connection has a data device of its own and keeps the
+pasteboard in step with the compositor's clipboard (`CoreGraphics/Wayland.backend/CGSWaylandClipboard.m`), so a
+process without windows gets the clipboard too; this backend's data device only handles drag and drop. Text maps to `text/plain;charset=utf-8`, `text/plain` and `UTF8_STRING`, PNG and
 TIFF images to `image/png` and `image/tiff`, file lists (`NSFilenamesPboardType`) to `text/uri-list`; other
 types travel under their own names. Other named pasteboards are process-local. Publishing needs keyboard
-focus and an input serial, so writes made earlier stay local until input arrives. Transfers are limited to
-16 MiB and five seconds, a reader that stalls or an oversized transfer yields nil rather than truncated data.
+focus and an input serial, so writes made earlier stay local until input arrives. A write made while a key or
+click is handled takes that input's serial and is offered at once, even when the focus left in the meantime (a
+virtual keyboard removed right after its key, say; `tests/clipboard-keyboard-removed.sh`). This is verified on
+sway (wlroots) only: a compositor that also requires keyboard focus for `set_selection` may ignore a copy that
+was handled after the window lost the focus. Transfers are
+limited to 16 MiB and five seconds, a reader that stalls or an oversized transfer yields nil rather than truncated
+data.
 
 Incoming drops use AppKit's drag hit testing and the same enter, update, exit and perform sequence as the
 other backends; copy and move are negotiated, the drag pasteboard is separate from the clipboard, and
 callbacks run after native dispatch. Outgoing drags start from a mouse press and show a drag icon at the
 output scale. A drag whose source and target are the same process stays in the process and keeps the
-original Cocoa data. File lists are converted by `AppKit/DarlingFileURIList.m`, shared with the X11 backend:
+original Cocoa data. File lists are converted by `CoreGraphics/DarlingFileURIList.m`, shared with the X11 backend:
 only paths below `/Volumes/SystemRoot` (host paths) are offered to other processes.
 
 ## OpenGL, layers and scale
@@ -93,15 +123,25 @@ on another thread asks through the main run loop. The drawable size in pixels an
 
 Scale follows the output a surface is on: the integer `wl_surface.set_buffer_scale`, or, when the compositor offers
 [wp-fractional-scale-v1](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/fractional-scale/fractional-scale-v1.xml)
-together with viewporter, the preferred scale in 120ths with the buffer cropped and scaled through a viewport. Cursors
-and drag icons use the same scale; a compositor without viewporter gets an integer scale only. Swaps are paced to the
+together with viewporter, the preferred scale in 120ths with the buffer cropped and scaled through a viewport. The cursor
+surface (CoreGraphics') and drag icons use the same scale; a compositor without viewporter gets an integer scale only. Swaps are paced to the
 refresh rate of the window's output (`refreshMillihertz`).
+
+EDR color descriptions and HDR metadata are applied per surface: the toplevel, the OpenGL
+subwindow and each Metal layer's own surface get their own color-management objects and follow
+their own preferred-description changes. The dma-buf path can negotiate either 8-bit ARGB8888
+buffers for CPU-rendered content or half-float ARGB/XRGB16161616F buffers for producers whose
+IOSurface pixels are actually half floats. It never converts an 8-bit surface into a floating-point
+one, so an ordinary window buffer keeps the shm/8-bit fallback. A Metal layer with a float drawable
+uses its Vulkan swapchain format and relies on the compositor's color description for HDR; the
+render manager's float-format negotiation is available to native IOSurface producers.
 
 ## Fullscreen and pointer lock
 
 A window is fullscreen when it has the fullscreen style bit, or is an untitled window that can become key and has
 the size of one output (`DarlingFullscreenPolicy.h`, the rule the X11 backend uses too); it then sends
-`xdg_toplevel.set_fullscreen`, naming the output it is on when that is unambiguous. The size to return to is kept
+`xdg_toplevel.set_fullscreen` (made by the CoreGraphics window, which holds the drawing back until the compositor has
+answered), naming the output it is on when that is unambiguous. The size to return to is kept
 across leaving fullscreen, hiding and showing, and a `setFrame:` made while fullscreen wins over what the compositor
 remembers. The decision is re-made when the outputs change.
 
@@ -131,4 +171,8 @@ wayland-protocols XML and `wayland-scanner`; the backend is skipped when any of 
 needs a compositor and checks screens, scale and window frames through the API.
 `../../tests/appkit-wayland-window-chrome.sh` checks which windows get a frame, on headless sway. The programs in `tests/` here
 are manual fixtures that exercise one feature each against a real or private test compositor; their file
-names say what they cover.
+names say what they cover. `tests/wayland-surface-color.sh` needs no guest: it checks that a compositor
+preference change reaches three independent surfaces (a toplevel, an OpenGL surface and a Metal layer
+surface), each sending its own color description and HDR metadata. `tests/wayland-render-formats.sh`
+also needs no guest: it checks that dma-buf feedback can advertise 8-bit and half-float formats with
+the 16-byte table entries required by the protocol.

@@ -26,9 +26,14 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSEvent_other.h>
 #import <AppKit/NSEvent_periodic.h>
 #import <AppKit/NSWindow.h>
+#import <CoreGraphics/CGEventSource.h>
+#import <CoreGraphics/CoreGraphicsPrivate.h>
 #import <Foundation/NSDate.h>
 #import <Foundation/NSException.h>
 #import "../private-include/AppKit/NSEventTime.h"
+#import "../NSEventQueue.h"
+#import <HIToolbox/CarbonEvents.h>
+#import <HIToolbox/CarbonEventsCore.h>
 #import <Foundation/NSRaise.h>
 
 // The object +addLocalMonitorForEventsMatchingMask:handler: returns.
@@ -92,14 +97,73 @@ NSEvent *NSEventApplyLocalMonitors(NSEvent *event) {
 
 @implementation NSEvent
 
-static BOOL _mouseCoalescingEnabled = YES;
-
+// The mouse motion is coalesced in HIToolbox's event queue, which holds AppKit's events
 + (void) setMouseCoalescingEnabled: (BOOL) flag {
-    _mouseCoalescingEnabled = flag;
+    SetMouseCoalescingEnabled(flag, NULL);
 }
 
 + (BOOL) isMouseCoalescingEnabled {
-    return _mouseCoalescingEnabled;
+    return IsMouseCoalescingEnabled();
+}
+
+- (void) dealloc {
+    if (NS_EXTRA_ALLOCATED(NSEvent, self)) {
+        if (NS_EXTRA(NSEvent, self)->_cgEvent != NULL)
+            CFRelease(NS_EXTRA(NSEvent, self)->_cgEvent);
+        if (NS_EXTRA(NSEvent, self)->_eventRef != NULL)
+            ReleaseEvent((EventRef) NS_EXTRA(NSEvent, self)->_eventRef);
+    }
+    NS_EXTRA_FREE(NSEvent, self);
+    [super dealloc];
+}
+
+// The CGEvent the event was made from or taken from the queue as; any other event gives a new
+// CGEvent each time (as observed on macOS 26.7.3 for events made with the class methods).
+- (CGEventRef) CGEvent {
+    CGEventRef stored = [self _storedCGEvent];
+
+    if (stored != NULL)
+        return stored;
+    return (CGEventRef) CFAutorelease(_NSEventCreateCGEvent(self, _NSEventMainScreenMaxY()));
+}
+
+// Made once, from the event's CGEvent, unless the event came with one
+- (const void *) eventRef {
+    void *stored = __atomic_load_n(&NS_EXTRA(NSEvent, self)->_eventRef, __ATOMIC_ACQUIRE);
+    EventRef carbonEvent = NULL;
+
+    if (stored != NULL)
+        return stored;
+    if (CreateEventWithCGEvent(NULL, [self CGEvent], kEventAttributeNone, &carbonEvent) != noErr)
+        return NULL;
+    [self _setCGEvent: NULL eventRef: carbonEvent];
+    ReleaseEvent(carbonEvent);
+    return NS_EXTRA(NSEvent, self)->_eventRef;
+}
+
++ (NSEvent *) eventWithCGEvent: (CGEventRef) cgEvent {
+    if (cgEvent == NULL)
+        return nil;
+
+    NSEvent *event = _NSEventCreateFromCGEvent(cgEvent);
+    [event _setCGEvent: cgEvent eventRef: NULL];
+    return [event autorelease];
+}
+
+// Only a Carbon event made from a CGEvent becomes an NSEvent (macOS 26.7.3 returns nil for a raw
+// keyboard event made with CreateEvent, and for events of other classes).
++ (NSEvent *) eventWithEventRef: (const void *) eventRef {
+    if (eventRef == NULL)
+        return nil;
+
+    CGEventRef cgEvent = CopyEventCGEvent((EventRef) eventRef);
+    if (cgEvent == NULL)
+        return nil;
+
+    NSEvent *event = _NSEventCreateFromCGEvent(cgEvent);
+    [event _setCGEvent: cgEvent eventRef: (void *) eventRef];
+    CFRelease(cgEvent);
+    return [event autorelease];
 }
 
 - (NSSet *) touchesMatchingPhase: (NSUInteger) phase inView: (NSView *) view {
@@ -118,16 +182,38 @@ static BOOL _mouseCoalescingEnabled = YES;
     return @[];
 }
 
+// The state queries are CoreGraphics', whose decoders of the window system's input hold it: the location of an
+// event made from nothing is where the pointer is, and the hardware state functions of the event source report
+// the modifier flags and the buttons that are held.
 + (NSPoint) mouseLocation {
-    return [[NSDisplay currentDisplay] mouseLocation];
+    CGEventRef event = CGEventCreate(NULL);
+    if (event == NULL)
+        return NSZeroPoint;
+    CGPoint point = CGEventGetLocation(event);
+    CFRelease(event);
+    // A window system that does not say where the pointer is (Wayland outside the process' surfaces, before it has
+    // been over one) gives no position.
+    if (point.x >= CGFLOAT_MAX / 2 || point.y >= CGFLOAT_MAX / 2)
+        return NSZeroPoint;
+    return NSMakePoint(point.x, _NSEventMainScreenMaxY() - point.y);
 }
 
 + (NSEventModifierFlags) modifierFlags {
-    return [[NSDisplay currentDisplay] currentModifierFlags];
+    return (NSEventModifierFlags) CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
 }
 
 + (NSUInteger) pressedMouseButtons {
-    return [[NSDisplay currentDisplay] pressedMouseButtons];
+    NSUInteger buttons = 0;
+    for (unsigned button = 0; button < 32; button++) {
+        if (CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, (CGMouseButton) button))
+            buttons |= (NSUInteger) 1 << button;
+    }
+    return buttons;
+}
+
+// The user's double-click interval, which CoreGraphics reads from the global preferences.
++ (NSTimeInterval) doubleClickInterval {
+    return _CGSDoubleClickInterval();
 }
 
 - (instancetype) initWithType: (NSEventType) type
@@ -352,10 +438,6 @@ static BOOL _mouseCoalescingEnabled = YES;
     return NO;
 }
 
-- (CGEventRef) CGEvent {
-    return NULL;
-}
-
 - (CGFloat) deltaZ {
     return 0;
 }
@@ -364,8 +446,95 @@ static BOOL _mouseCoalescingEnabled = YES;
     return 0;
 }
 
+// No pressure stages: only the mouse (NSEvent_mouse) and tablet (NSEvent_tablet) classes carry
+// pressure. The tablet accessors have neutral values on every other event.
+- (float) pressure {
+    return 0;
+}
+
+- (NSInteger) stage {
+    return 0;
+}
+
+- (CGFloat) stageTransition {
+    return 0;
+}
+
+// The private spelling, which returns the same event.
+- (void *) _eventRef {
+    return (void *) [self eventRef];
+}
+
 - (float) rotation {
     return 0;
+}
+
+- (NSInteger) absoluteX {
+    return 0;
+}
+
+- (NSInteger) absoluteY {
+    return 0;
+}
+
+- (NSInteger) absoluteZ {
+    return 0;
+}
+
+- (NSEventButtonMask) buttonMask {
+    return 0;
+}
+
+- (NSPoint) tilt {
+    return NSZeroPoint;
+}
+
+- (float) tangentialPressure {
+    return 0;
+}
+
+- (NSUInteger) vendorID {
+    return 0;
+}
+
+- (NSUInteger) tabletID {
+    return 0;
+}
+
+- (NSUInteger) pointingDeviceID {
+    return 0;
+}
+
+- (NSUInteger) deviceID {
+    return 0;
+}
+
+- (NSUInteger) systemTabletID {
+    return 0;
+}
+
+- (NSUInteger) vendorPointingDeviceType {
+    return 0;
+}
+
+- (NSUInteger) pointingDeviceSerialNumber {
+    return 0;
+}
+
+- (unsigned long long) uniqueID {
+    return 0;
+}
+
+- (NSUInteger) capabilityMask {
+    return 0;
+}
+
+- (NSPointingDeviceType) pointingDeviceType {
+    return NSPointingDeviceTypeUnknown;
+}
+
+- (BOOL) isEnteringProximity {
+    return NO;
 }
 
 - (NSString *) characters {
@@ -415,9 +584,9 @@ static NSTimer *_periodicTimer = nil;
                                                modifierFlags: 0
                                                       window: nil] autorelease];
 
-    [[NSDisplay currentDisplay] postEvent: event atStart: NO];
-    [[NSDisplay currentDisplay] discardEventsMatchingMask: NSPeriodicMask
-                                              beforeEvent: event];
+    // Only the newest periodic event stays queued
+    _NSEventQueuePost(event, NO);
+    _NSEventQueueDiscard(NSPeriodicMask, event);
 }
 
 + (void) startPeriodicEventsAfterDelay: (NSTimeInterval) delay

@@ -22,8 +22,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSAppearance.h>
 #import <Foundation/Foundation.h>
 #import <AppKit/NSUserInterfaceItemIdentification.h>
+#import <AppKit/NSUserInterfaceLayoutDirection.h>
 
-@class NSScreen, NSMenu, NSMenuItem, NSWindow, NSEvent, NSView;
+@class NSScreen, NSMenu, NSMenuItem, NSWindow, NSEvent, NSView, NSFont;
 
 @protocol NSMenuDelegate;
 
@@ -66,11 +67,22 @@ typedef NS_OPTIONS(NSUInteger, NSMenuProperties) {
         id<NSMenuDelegate> _delegate;
         BOOL _showsStateColumn;
         NSUserInterfaceItemIdentifier _identifier;
+        BOOL _hasExplicitUserInterfaceLayoutDirection;
+        NSUserInterfaceLayoutDirection _userInterfaceLayoutDirection;
         NSAppearance *_appearance;
+        NSFont *_font;
+        BOOL _allowsContextMenuPlugIns;
+        BOOL _automaticallyInsertsWritingToolsItems;
     NS_EXTRA_IVARS_END(NSMenu)
 }
 
 @property BOOL showsStateColumn;
+@property (null_resettable, strong) NSFont *font;
+@property BOOL allowsContextMenuPlugIns;
+@property BOOL automaticallyInsertsWritingToolsItems;
+// the direction the menu's items are laid out in; unless set, the
+// application's
+@property NSUserInterfaceLayoutDirection userInterfaceLayoutDirection;
 
 @property(nullable, strong) NSAppearance *appearance;
 @property(readonly, strong) NSAppearance *effectiveAppearance;
@@ -96,7 +108,8 @@ typedef NS_OPTIONS(NSUInteger, NSMenuProperties) {
 @property(nullable, nonatomic, retain) NSMenu *supermenu;
 @property(nonatomic, copy) NSString *title;
 @property(nonatomic, readonly) NSInteger numberOfItems;
-- (NSArray<NSMenuItem *> *) itemArray;
+// Setting it replaces every item; an item may not be in another menu.
+@property(copy) NSArray<NSMenuItem *> *itemArray;
 @property(nonatomic) BOOL autoenablesItems;
 
 - (nullable NSMenuItem *) itemAtIndex: (NSInteger) index;

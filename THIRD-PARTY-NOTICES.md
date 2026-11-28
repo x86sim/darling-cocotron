@@ -39,6 +39,174 @@ and the licence.
 - Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
   generates the interface tables from it at build time.
 
+## color-management-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/color-management-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/color-management/color-management-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2019 Sebastian Wick, 2019 Erwin Burema, 2020 AMD, 2020-2024 Collabora, Ltd., 2024 Xaver Hugl,
+  2022-2025 Red Hat, Inc.
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## color-representation-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/color-representation-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/color-representation/color-representation-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2022 Simon Ser, 2022 Red Hat, Inc., 2022 Collabora, Ltd., 2022-2025 Red Hat, Inc.
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## xdg-session-management-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/xdg-session-management-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/xdg-session-management/xdg-session-management-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2018 Mike Blumenkrantz, 2018 Samsung Electronics Co., Ltd, 2018 Red Hat Inc.
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## pointer-warp-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/pointer-warp-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/pointer-warp/pointer-warp-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2024 Neal Gompa, 2024 Xaver Hugl, 2024 Matthias Klumpp, 2024 Vlad Zahorodnii
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## cursor-shape-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/cursor-shape-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/cursor-shape/cursor-shape-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2018 The Chromium Authors, 2023 Simon Ser
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## xdg-dialog-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/xdg-dialog-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/xdg-dialog/xdg-dialog-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2023 Carlos Garnacho
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## xdg-system-bell-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/xdg-system-bell-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/xdg-system-bell/xdg-system-bell-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2016, 2023 Red Hat
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## alpha-modifier-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/alpha-modifier-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/alpha-modifier/alpha-modifier-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2024 Xaver Hugl
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## xdg-toplevel-tag-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/xdg-toplevel-tag-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/xdg-toplevel-tag/xdg-toplevel-tag-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2024 Xaver Hugl
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## idle-inhibit-unstable-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/idle-inhibit-unstable-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`unstable/idle-inhibit/idle-inhibit-unstable-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2015 Samsung Electronics Co., Ltd
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## linux-dmabuf-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/linux-dmabuf-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`stable/linux-dmabuf/linux-dmabuf-v1.xml`, wayland-protocols 1.44)
+- Commit: 309f384d8811c424cee01fd91612c0c1b176ae36
+- Copyright: 2014, 2015 Collabora, Ltd.
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## linux-drm-syncobj-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/linux-drm-syncobj-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml`, wayland-protocols 1.44)
+- Commit: 309f384d8811c424cee01fd91612c0c1b176ae36
+- Copyright: 2016 The Chromium Authors, 2017 Intel Corporation, 2018 Collabora, Ltd, 2021 Simon Ser
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## fifo-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/fifo-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/fifo/fifo-v1.xml`, wayland-protocols 1.44)
+- Commit: 309f384d8811c424cee01fd91612c0c1b176ae36
+- Copyright: 2023 Valve Corporation
+## pointer-gestures-unstable-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/pointer-gestures-unstable-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`unstable/pointer-gestures/pointer-gestures-unstable-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2015, 2021 Red Hat Inc.
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## content-type-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/content-type-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`staging/content-type/content-type-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2021 Emmanuel Gil Peyrot, 2022 Xaver Hugl
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## input-timestamps-unstable-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/input-timestamps-unstable-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`unstable/input-timestamps/input-timestamps-unstable-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2017 Collabora, Ltd.
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
+## keyboard-shortcuts-inhibit-unstable-v1.xml
+
+- Location: `CoreGraphics/WaylandSupport/protocols/keyboard-shortcuts-inhibit-unstable-v1.xml`
+- Source: https://gitlab.freedesktop.org/wayland/wayland-protocols
+  (`unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml`, wayland-protocols 1.50)
+- Commit: 3eab2dccf4bfdd85c16d312a6c8c8fbc2a6e73a8
+- Copyright: 2017 Red Hat Inc.
+- Licence: MIT (the permission notice at the top of the file). The file is kept unmodified; `wayland-scanner`
+  generates the interface tables from it at build time.
+
 ## DejaVuSans.ttf
 
 - Location: `tests/fixtures/fonts/DejaVuSans.ttf`, licence text in `tests/fixtures/fonts/DejaVu-LICENSE.txt`

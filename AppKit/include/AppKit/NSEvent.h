@@ -64,7 +64,17 @@ typedef NS_ENUM(NSUInteger, NSEventType) {
 
     NSEventTypeRotate = 18,
 
+    NSEventTypeBeginGesture = 19,
+
+    NSEventTypeEndGesture = 20,
+
     NSEventTypeScrollWheel = 22,
+
+    // Graphics tablets: the CGEvent types of the same number. A pointer event carries the
+    // pressure, tilt, rotation and button state in the tablet accessors below; a proximity event
+    // describes the tool that entered or left the tablet.
+    NSEventTypeTabletPoint = 23,
+    NSEventTypeTabletProximity = 24,
 
     NSEventTypeOtherMouseDown = 25,
 
@@ -72,7 +82,18 @@ typedef NS_ENUM(NSUInteger, NSEventType) {
 
     NSEventTypeOtherMouseDragged = 27,
 
+    NSEventTypeGesture = 29,
+
     NSEventTypeMagnify = 30,
+
+    NSEventTypeSwipe = 31,
+
+    NSEventTypeSmartMagnify = 32,
+
+    NSEventTypeQuickLook = 33,
+
+    // Force Touch trackpads (macOS 10.10.3); see -stage and -pressure.
+    NSEventTypePressure = 34,
 
     // A touch screen; see NSTouch.h.
     NSEventTypeDirectTouch = 37,
@@ -98,6 +119,8 @@ enum {
     NSPeriodic = 16,
     NSCursorUpdate = 17,
     NSScrollWheel = 22,
+    NSTabletPoint = 23,
+    NSTabletProximity = 24,
     NSOtherMouseDown = 25,
     NSOtherMouseUp = 26,
     NSOtherMouseDragged = 27,
@@ -124,13 +147,21 @@ typedef NS_OPTIONS(unsigned long long, NSEventMask) {
     NSEventMaskPeriodic = 1ULL << NSEventTypePeriodic,
     NSEventMaskCursorUpdate = 1ULL << NSEventTypeCursorUpdate,
     NSEventMaskScrollWheel = 1ULL << NSEventTypeScrollWheel,
+    NSEventMaskTabletPoint = 1ULL << NSEventTypeTabletPoint,
+    NSEventMaskTabletProximity = 1ULL << NSEventTypeTabletProximity,
     NSEventMaskApplicationDefined = 1ULL << NSEventTypeApplicationDefined,
     NSEventMaskAppKitDefined = 1ULL << NSEventTypeAppKitDefined,
     NSEventMaskOtherMouseDown = 1ULL << NSEventTypeOtherMouseDown,
     NSEventMaskOtherMouseUp = 1ULL << NSEventTypeOtherMouseUp,
     NSEventMaskOtherMouseDragged = 1ULL << NSEventTypeOtherMouseDragged,
     NSEventMaskRotate = 1ULL << NSEventTypeRotate,
+    NSEventMaskBeginGesture = 1ULL << NSEventTypeBeginGesture,
+    NSEventMaskEndGesture = 1ULL << NSEventTypeEndGesture,
+    NSEventMaskGesture = 1ULL << NSEventTypeGesture,
     NSEventMaskMagnify = 1ULL << NSEventTypeMagnify,
+    NSEventMaskSwipe = 1ULL << NSEventTypeSwipe,
+    NSEventMaskSmartMagnify = 1ULL << NSEventTypeSmartMagnify,
+    NSEventMaskPressure = 1ULL << NSEventTypePressure,
     NSEventMaskDirectTouch = 1ULL << NSEventTypeDirectTouch,
     NSEventMaskAny = NSUIntegerMax,
 };
@@ -151,6 +182,8 @@ static const NSEventMask NSFlagsChangedMask = NSEventMaskFlagsChanged;
 static const NSEventMask NSPeriodicMask = NSEventMaskPeriodic;
 static const NSEventMask NSCursorUpdateMask = NSEventMaskCursorUpdate;
 static const NSEventMask NSScrollWheelMask = NSEventMaskScrollWheel;
+static const NSEventMask NSTabletPointMask = NSEventMaskTabletPoint;
+static const NSEventMask NSTabletProximityMask = NSEventMaskTabletProximity;
 static const NSEventMask NSApplicationDefinedMask = NSEventMaskApplicationDefined;
 static const NSEventMask NSAppKitDefinedMask = NSEventMaskAppKitDefined;
 static const NSEventMask NSOtherMouseDownMask = NSEventMaskOtherMouseDown;
@@ -275,6 +308,18 @@ enum {
     NSTouchEventSubtype = NSEventSubtypeTouch,
 };
 
+// How a Force Touch trackpad's pressure gesture behaves (see
+// NSPressureConfiguration).
+typedef NS_ENUM(NSInteger, NSPressureBehavior) {
+    NSPressureBehaviorUnknown = -1,
+    NSPressureBehaviorPrimaryDefault = 0,
+    NSPressureBehaviorPrimaryClick = 1,
+    NSPressureBehaviorPrimaryGeneric = 2,
+    NSPressureBehaviorPrimaryAccelerator = 3,
+    NSPressureBehaviorPrimaryDeepClick = 5,
+    NSPressureBehaviorPrimaryDeepDrag = 6,
+};
+
 typedef NS_OPTIONS(NSUInteger, NSEventPhase) {
     NSEventPhaseNone = 0,
     NSEventPhaseBegan = 0x1 << 0,
@@ -319,12 +364,19 @@ typedef NS_OPTIONS(NSUInteger, NSEventSwipeTrackingOptions) {
     NS_LEGACY_IVAR_PAD(_NSEventReserved1, 4)
     NSTimeInterval _timestamp;
     NSInteger _windowNumber;
-    NS_LEGACY_IVAR_PAD(_NSEventReserved2, 24)
+    NS_LEGACY_IVAR_PAD(_NSEventReserved2, 20)
+    NS_EXTRA_IVARS_BEGIN(NSEvent)
+        // The CGEvent and the Carbon event the event was made from or taken from the queue
+        // as, or NULL
+        CGEventRef _cgEvent;
+        void *_eventRef;
+    NS_EXTRA_IVARS_END(NSEvent)
 }
 
 @property(class, readonly) NSPoint mouseLocation;
 @property (class, readonly) NSEventModifierFlags modifierFlags;
 @property(class, readonly) NSUInteger pressedMouseButtons;
+@property(class, readonly) NSTimeInterval doubleClickInterval;
 
 + (nullable id) addLocalMonitorForEventsMatchingMask: (NSEventMask) mask
                                     handler: (NSEvent *_Nullable (^)(NSEvent *_Nonnull event)) block;
@@ -419,7 +471,31 @@ typedef NS_OPTIONS(NSUInteger, NSEventSwipeTrackingOptions) {
 @property(nonatomic, readonly) NSEventPhase phase;
 @property(nonatomic, readonly) NSEventPhase momentumPhase;
 @property(nonatomic, readonly) CGFloat magnification;
+@property(readonly) float pressure;
+@property(readonly) NSInteger stage;
+@property(readonly) CGFloat stageTransition;
 @property(nonatomic, readonly) float rotation;
+
+// Tablet accessors (NSEventTypeTabletPoint and NSEventTypeTabletProximity). Every other event
+// gives the documented neutral value. The absolute coordinates are in the tablet's coordinate
+// space, not the screen's; use -locationInWindow for where on screen the tool is.
+@property(readonly) NSInteger absoluteX;
+@property(readonly) NSInteger absoluteY;
+@property(readonly) NSInteger absoluteZ;
+@property(readonly) NSEventButtonMask buttonMask;
+@property(readonly) NSPoint tilt;
+@property(readonly) float tangentialPressure;
+@property(readonly) NSUInteger vendorID;
+@property(readonly) NSUInteger tabletID;
+@property(readonly) NSUInteger pointingDeviceID;
+@property(readonly) NSUInteger deviceID;
+@property(readonly) NSUInteger systemTabletID;
+@property(readonly) NSUInteger vendorPointingDeviceType;
+@property(readonly) NSUInteger pointingDeviceSerialNumber;
+@property(readonly) unsigned long long uniqueID;
+@property(readonly) NSUInteger capabilityMask;
+@property(readonly) NSPointingDeviceType pointingDeviceType;
+@property(getter=isEnteringProximity, readonly) BOOL enteringProximity;
 @property(nonatomic, readonly) BOOL hasPreciseScrollingDeltas;
 @property(nonatomic, readonly) CGFloat scrollingDeltaX;
 @property(nonatomic, readonly) CGFloat scrollingDeltaY;
@@ -427,6 +503,9 @@ typedef NS_OPTIONS(NSUInteger, NSEventSwipeTrackingOptions) {
 + (BOOL) isSwipeTrackingFromScrollEventsEnabled;
 
 - (nullable CGEventRef) CGEvent;
++ (nullable NSEvent *) eventWithCGEvent: (CGEventRef) cgEvent;
+@property(readonly) const void *_Nullable eventRef;
++ (nullable NSEvent *) eventWithEventRef: (const void *) eventRef;
 
 @property(nullable, nonatomic, readonly) NSString *characters;
 @property(nullable, readonly, copy) NSString *charactersIgnoringModifiers;

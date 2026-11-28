@@ -24,6 +24,22 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSScreen.h>
 #import <CoreGraphics/CGEvent.h>
 
+// A mouse is not pressure-sensitive: AppKit documents pressure as 0 or 1 for
+// such devices, so it is 1 while a button is held and 0 otherwise.
+static float defaultPressure(NSEventType type) {
+    switch (type) {
+    case NSLeftMouseDown:
+    case NSLeftMouseDragged:
+    case NSRightMouseDown:
+    case NSRightMouseDragged:
+    case NSOtherMouseDown:
+    case NSOtherMouseDragged:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 // The button an event of this type is about, until a backend sets the
 // actual one: 0 is the left button, 1 the right one and 2 the middle one.
 static NSInteger defaultButtonNumber(NSEventType type) {
@@ -57,6 +73,7 @@ static NSInteger defaultButtonNumber(NSEventType type) {
                    window: window];
 
     _buttonNumber = defaultButtonNumber(type);
+    _pressure = defaultPressure(type);
     _clickCount = clickCount;
     _deltaX = deltaX;
     _deltaY = deltaY;
@@ -131,6 +148,7 @@ static NSInteger defaultButtonNumber(NSEventType type) {
                    window: [NSApp windowWithWindowNumber: windowNumber]];
     _timestamp = timestamp;
     _buttonNumber = defaultButtonNumber(type);
+    _pressure = pressure;
     _clickCount = clickCount;
     _eventNumber = eventNumber;
     return self;
@@ -140,65 +158,16 @@ static NSInteger defaultButtonNumber(NSEventType type) {
     return _deltaX;
 }
 
+- (float) pressure {
+    return _pressure;
+}
+
 - (CGFloat) deltaY {
     return _deltaY;
 }
 
 - (CGFloat) deltaZ {
     return 0.0;
-}
-
-- (CGEventRef) CGEvent {
-    CGEventRef event;
-
-    switch (_type) {
-    case NSLeftMouseDown:
-    case NSLeftMouseUp:
-    case NSRightMouseDown:
-    case NSRightMouseUp:
-    case NSMouseMoved:
-    case NSLeftMouseDragged:
-    case NSRightMouseDragged:
-    case NSOtherMouseDown:
-    case NSOtherMouseUp:
-    case NSOtherMouseDragged:
-        // The mouse event types have the same values in both enums.
-        event = CGEventCreateMouseEvent(NULL, (CGEventType) _type, CGPointZero,
-                                        (CGMouseButton) _buttonNumber);
-        CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber,
-                                    _buttonNumber);
-        CGEventSetIntegerValueField(event, kCGMouseEventClickState,
-                                    _clickCount);
-        break;
-    case NSScrollWheel:
-        event = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitLine, 2,
-                                              (int32_t) _deltaY,
-                                              (int32_t) _deltaX);
-        break;
-    default:
-        return NULL;
-    }
-    if (event == NULL)
-        return NULL;
-
-    // CGEvent locations are global, in CoreGraphics' space: origin at the
-    // top-left corner of the main display, y down.
-    NSPoint point = [self locationInWindow];
-    NSWindow *window = [self window];
-    if (window != nil)
-        point = [window convertBaseToScreen: point];
-    NSArray *screens = [NSScreen screens];
-    if ([screens count] > 0)
-        point.y = NSHeight([[screens objectAtIndex: 0] frame]) - point.y;
-    CGEventSetLocation(event, NSPointToCGPoint(point));
-
-    // CGEvent times are nanoseconds on the clock NSEvent times count seconds of.
-    CGEventSetTimestamp(event, (CGEventTimestamp) ([self timestamp] * 1e9));
-
-    // NSEventModifierFlags and CGEventFlags use the same bits.
-    CGEventSetFlags(event, (CGEventFlags) [self modifierFlags]);
-
-    return (CGEventRef) CFAutorelease(event);
 }
 
 // Apple's documentation is a bit confusing here. NSEvent exposes no API to pass
@@ -251,6 +220,11 @@ static NSInteger defaultButtonNumber(NSEventType type) {
 
 - (void) _setButtonNumber: (NSInteger) num {
     _buttonNumber = num;
+}
+
+- (void) _setDeltaX: (CGFloat) deltaX deltaY: (CGFloat) deltaY {
+    _deltaX = deltaX;
+    _deltaY = deltaY;
 }
 
 - (void) _setPreciseScrollingDeltaX: (CGFloat) deltaX deltaY: (CGFloat) deltaY phase: (NSEventPhase) phase {

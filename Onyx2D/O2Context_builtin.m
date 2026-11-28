@@ -29,6 +29,7 @@
 #import <Onyx2D/O2Image.h>
 #import <Onyx2D/O2MutablePath.h>
 #import <Onyx2D/O2Paint_axialGradient.h>
+#import <Onyx2D/O2Paint_conicGradient.h>
 #import <Onyx2D/O2Paint_color.h>
 #import <Onyx2D/O2Paint_image.h>
 #import <Onyx2D/O2Paint_pattern.h>
@@ -153,8 +154,23 @@ void O2DContextClipAndFillEdges(O2Context_builtin *self, int fillRuleMask);
 - (O2ContextRef) createCompatibleContextWithSize: (O2Size) size
                                           unused: (NSDictionary *) unused
 {
-    O2Surface *surface = [self createSurfaceWithWidth: ceil(size.width)
-                                               height: ceil(size.height)];
+    // A layer (a transparency layer, a CGLayer) holds content that is composited onto the context
+    // afterwards, so it needs an alpha channel even where the context's own surface has none.
+    O2BitmapInfo bitmapInfo = O2ImageGetBitmapInfo(_surface);
+    O2BitmapInfo alphaInfo = bitmapInfo & kO2BitmapAlphaInfoMask;
+
+    if (alphaInfo == kO2ImageAlphaNoneSkipFirst || alphaInfo == kO2ImageAlphaNone)
+        bitmapInfo = (bitmapInfo & ~kO2BitmapAlphaInfoMask) | kO2ImageAlphaPremultipliedFirst;
+    else if (alphaInfo == kO2ImageAlphaNoneSkipLast)
+        bitmapInfo = (bitmapInfo & ~kO2BitmapAlphaInfoMask) | kO2ImageAlphaPremultipliedLast;
+
+    O2Surface *surface = [[[self surfaceClass] alloc] initWithBytes: NULL
+                                                              width: ceil(size.width)
+                                                             height: ceil(size.height)
+                                                   bitsPerComponent: O2ImageGetBitsPerComponent(_surface)
+                                                        bytesPerRow: 0
+                                                         colorSpace: O2ImageGetColorSpace(_surface)
+                                                         bitmapInfo: bitmapInfo];
     O2ContextRef result = [[[self class] alloc] initWithSurface: surface
                                                         flipped: NO];
     [surface release];
@@ -324,8 +340,10 @@ ONYX2D_STATIC void O2ContextClipToPathShape(O2Context_builtin *self,
     memset(O2SurfaceGetPixelBytes(coverage), 0,
            O2SurfaceGetBytesPerRow(coverage) * boxHeight);
 
+    // The path is in device space, which is what the coverage surface is in as
+    // well: its context must not flip it a second time.
     O2Context_builtin *context = [[[self class] alloc] initWithSurface: coverage
-                                                               flipped: NO];
+                                                               flipped: YES];
     O2MutablePathRef moved = O2PathCreateMutableCopy(path);
 
     O2PathApplyTransform(moved, O2AffineTransformMakeTranslation(-x0, -y0));
@@ -648,7 +666,14 @@ static BOOL copyBitsPixel(O2Float value, long *pixel) {
     O2RasterizerSetShouldAntialias(self, gState->_shouldAntialias,
                                    gState->_antialiasingQuality);
 
-    if ([shading isAxial])
+    if ([shading isConic]) {
+        paint = [[O2Paint_conicGradient alloc]
+                initWithShading: shading
+                deviceTransform: gState->_deviceSpaceTransform];
+        // a colour space the ramp cannot turn into colours draws nothing
+        if (paint == nil)
+            return;
+    } else if ([shading isAxial])
         paint = [[O2Paint_axialGradient alloc]
                 initWithShading: shading
                 deviceTransform: gState->_deviceSpaceTransform];

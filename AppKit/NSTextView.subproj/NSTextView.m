@@ -460,9 +460,15 @@ static NSTextView *s_targetTextView = nil;
 - initWithFrame: (NSRect) frame {
     NSTextStorage *storage = [[NSTextStorage new] autorelease];
     NSLayoutManager *layout = [[NSLayoutManager new] autorelease];
+    // The container of a text view made with a frame is as wide as the view, practically unlimited in
+    // height, and follows the width of the view but not its height: observed on macOS 26.7.3 and 10.14.4
+    // (black-box, tier 2, mac-probes p783: container size {frame width, 10000000}, width tracking on, height
+    // tracking off). The initializers of NSTextContainer default both tracking flags to off.
+    // Test: appkit-textview-default-container.m
     NSTextContainer *container = [[[NSTextContainer alloc]
-            initWithContainerSize: frame.size] autorelease];
+            initWithContainerSize: NSMakeSize(frame.size.width, 10000000)] autorelease];
 
+    [container setWidthTracksTextView: YES];
     [storage addLayoutManager: layout];
     [layout addTextContainer: container];
 
@@ -515,7 +521,7 @@ static NSTextView *s_targetTextView = nil;
 }
 
 - (BOOL) isOpaque {
-    return [self drawsBackground];
+    return [self drawsBackground] && [NS_EXTRA(NSTextView, self)->_backgroundColor alphaComponent] >= 1.0;
 }
 
 - (BOOL) acceptsFirstResponder {
@@ -1328,6 +1334,7 @@ static NSTextView *s_targetTextView = nil;
                             isFinal: YES];
         return;
     }
+    [[self nextResponder] doCommandBySelector: _cmd];
 }
 
 - (void) _setAndScrollToRange: (NSRange) range upstream: (BOOL) upstream {
@@ -2991,14 +2998,16 @@ typedef NS_ENUM(NSInteger, NSTextViewKillKind) {
     NS_EXTRA(NSTextView, self)->_backgroundColor = color;
 }
 
+// Whether the view resizes to fit its text is independent of whether its text
+// container tracks the view's size: a view that grows with its text must keep a
+// container that does not follow its height, or the text stops at the view's
+// current height. Test: appkit-textview-grows-with-text.m
 - (void) setHorizontallyResizable: (BOOL) flag {
     NS_EXTRA(NSTextView, self)->_isHorizontallyResizable = flag;
-    [NS_EXTRA(NSTextView, self)->_textContainer setWidthTracksTextView: flag];
 }
 
 - (void) setVerticallyResizable: (BOOL) flag {
     NS_EXTRA(NSTextView, self)->_isVerticallyResizable = flag;
-    [NS_EXTRA(NSTextView, self)->_textContainer setHeightTracksTextView: flag];
 }
 
 - (void) setMaxSize: (NSSize) size {

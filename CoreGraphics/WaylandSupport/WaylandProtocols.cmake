@@ -35,7 +35,7 @@ set(WAYLAND_PROTOCOL_FILES
 	"${WAYLAND_PROTOCOLS_DIR}/staging/xdg-activation/xdg-activation-v1.xml"
 	"${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-output/xdg-output-unstable-v1.xml"
 	"${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
-	"${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-gestures/pointer-gestures-unstable-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/pointer-gestures-unstable-v1.xml"
 	"${WAYLAND_PROTOCOLS_DIR}/unstable/relative-pointer/relative-pointer-unstable-v1.xml"
 	"${WAYLAND_PROTOCOLS_DIR}/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml"
 	"${WAYLAND_PROTOCOLS_DIR}/unstable/text-input/text-input-unstable-v3.xml"
@@ -49,7 +49,31 @@ set(WAYLAND_PROTOCOL_FILES
 	# Likewise wlr-layer-shell (wlroots).
 	"${CMAKE_CURRENT_LIST_DIR}/protocols/wlr-layer-shell-unstable-v1.xml"
 	# xdg-toplevel-icon (wayland-protocols 1.34), kept in this tree so older systems still build the backend.
-	"${CMAKE_CURRENT_LIST_DIR}/protocols/xdg-toplevel-icon-v1.xml")
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/xdg-toplevel-icon-v1.xml"
+	# The following staging protocols are vendored for the same reason. See protocols/README.md.
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/color-management-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/color-representation-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/xdg-session-management-v1.xml"
+	# pointer-warp-v1 (wayland-protocols 1.50), kept in this tree so older systems still build the backend.
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/pointer-warp-v1.xml"
+	# cursor-shape-v1 refers to the tablet tool interface of tablet-v2, so its table needs that one linked in.
+	"${WAYLAND_PROTOCOLS_DIR}/unstable/tablet/tablet-unstable-v2.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/cursor-shape-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/xdg-dialog-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/xdg-system-bell-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/alpha-modifier-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/xdg-toplevel-tag-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/idle-inhibit-unstable-v1.xml"
+	# Render protocols: DMA-BUF buffer negotiation, explicit synchronization and the
+	# refresh-cycle barrier. Kept here so older wayland-protocols releases still build.
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/linux-dmabuf-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/linux-drm-syncobj-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/fifo-v1.xml"
+	# The following protocols are vendored so that the backends build on systems with older
+	# wayland-protocols releases. See protocols/README.md.
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/content-type-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/input-timestamps-unstable-v1.xml"
+	"${CMAKE_CURRENT_LIST_DIR}/protocols/keyboard-shortcuts-inhibit-unstable-v1.xml")
 
 set(WAYLAND_PROTOCOLS_USABLE TRUE)
 foreach (protocol ${WAYLAND_PROTOCOL_FILES})

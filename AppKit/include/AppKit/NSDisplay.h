@@ -28,18 +28,32 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
         NSOpenPanel, NSFontTypeface, CGWindow;
 
 @interface NSDisplay : NSObject {
-    NSMutableArray *_eventQueue;
-    NSRecursiveLock *_eventQueueLock;
     BOOL _cursorHiddenUntilMouseMoves;
     NSInteger _cursorHideCount;
     BOOL _cursorIsHidden; // what the backend was last told
+    NSLock *_mouseDeltaLock;
     double _mouseDeltaX, _mouseDeltaY;
-    CFRunLoopSourceRef _eventSource;
+    // The top of the main screen, for the global coordinates of the input's CGEvents; NAN until
+    // known, and again when the screens change
+    CGFloat _mainScreenMaxY;
+    // The screens, made from CoreGraphics' displays and dropped when they change. Guarded by
+    // @synchronized(self).
+    NSArray *_screens;
+    // Whether -_desktopShowsMainMenu looked for a desktop that shows application menus.
+    BOOL _desktopMenuProbed;
 }
 
 + (NSDisplay *) currentDisplay;
 
+// The screens are CoreGraphics' active displays (CGGetActiveDisplayList()), the main display first, as
+// NSScreen objects that stay the same until the displays change.
 - (NSArray *) screens;
+// Drops the screens and the main screen's height after the displays changed, so that the next
+// -screens reads them again. CoreGraphics reports a change to its reconfiguration callbacks, which
+// call this.
+- (void) _invalidateScreens;
+// Queues NSApplicationDidChangeScreenParametersNotification (merged per run loop pass).
+- (void) _postScreenParametersChanged;
 
 - (NSPasteboard *) pasteboardWithName: (NSPasteboardName) name;
 
@@ -51,8 +65,6 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (void) _addSystemColor: (NSColor *) result forName: (NSString *) colorName;
 
 - (NSTimeInterval) textCaretBlinkInterval;
-
-- (BOOL) activateProcessIdentifier: (pid_t) processIdentifier;
 
 - (void) hideCursor;
 - (void) unhideCursor;
@@ -72,6 +84,35 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (id) cursorWithName: (NSString *) name;
 - (void) setCursor: (id) cursor;
 
+// Called on the main thread before each wait for events of -[NSApplication
+// nextEventMatchingMask:...]: a backend handles here what its connection has already read, and
+// sends what it has buffered. Does nothing by default.
+- (void) willWaitForEvents;
+
+// The NSEvent of a key event the window system's keyboard posted as a CGEvent (see
+// -[NSApplication nextEventMatchingMask:...]): which window it is for and where the pointer is in
+// that window. NO drops the event (no window of the application can take it). The default is the key
+// window.
+- (BOOL) windowNumber: (NSInteger *) windowNumber
+             location: (NSPoint *) location
+          forKeyEvent: (struct __CGEvent *) event;
+// The NSEvent made for such a CGEvent, before it is handed to the application: the event to hand over,
+// which a display may replace. The default is the event.
+- (NSEvent *) keyEventCreated: (NSEvent *) event fromCGEvent: (struct __CGEvent *) cgEvent;
+// The window and the pointer location of a mouse event CGEvent that names a window system window
+// (kCGSEventNativeWindow): YES when the display knows the window, which is then the window number; the
+// location (in the window, in points) only when it also knows it more exactly than the event's global
+// location says (*hasLocation).
+- (BOOL) windowNumber: (NSInteger *) windowNumber
+             location: (NSPoint *) location
+          hasLocation: (BOOL *) hasLocation
+      forPointerEvent: (struct __CGEvent *) event;
+// The NSEvent made for a mouse event CGEvent (not scroll wheel), before it is handed to the application.
+- (void) pointerEventCreated: (NSEvent *) event fromCGEvent: (struct __CGEvent *) cgEvent;
+
+// The events are those of HIToolbox's main event queue (NSEventQueue.m). These wait for the next one,
+// as -[NSApplication nextEventMatchingMask:...] does but with an NSAppKitSystem event when there is
+// none, and remove events, as -[NSApplication discardEventsMatchingMask:beforeEvent:] does.
 - (NSEvent *) nextEventMatchingMask: (NSUInteger) mask
                           untilDate: (NSDate *) untilDate
                              inMode: (NSRunLoopMode) mode
@@ -80,7 +121,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (void) discardEventsMatchingMask: (NSUInteger) mask
                        beforeEvent: (NSEvent *) event;
 
-- (void) postEvent: (NSEvent *) event atStart: (BOOL) atStart;
+// The input of the window system is not posted through the display: the backends of CoreGraphics
+// post it as CGEvents, which go through the CoreGraphics event taps and stream (where mouse motion
+// is coalesced) into the queue.
+// What the application posts (-[NSApplication postEvent:atStart:])
 - (void) _postEventWithoutCoalescing: (NSEvent *) event atStart: (BOOL) atStart;
 
 - (BOOL) containsAndRemovePeriodicEvents;
@@ -132,24 +176,12 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
                         file: (NSString *) file
                        types: (NSArray *) types;
 
-// The pointer in Cocoa's global space: points, origin at the main screen's
-// bottom-left corner, y up, like screen and window frames.
-- (NSPoint) mouseLocation;
-- (NSUInteger) currentModifierFlags;
-// The buttons held down, as +[NSEvent pressedMouseButtons] reports them: bit 0
-// is the left button, bit 1 the right one and bit n the button numbered n.
-- (NSUInteger) pressedMouseButtons;
-
 - (NSArray *) orderedWindowNumbers;
 
 - (CGRect) insetRect: (CGRect) frame
         forNativeWindowBorderWithStyle: (NSUInteger) styleMask;
 - (CGRect) outsetRect: (CGRect) frame
         forNativeWindowBorderWithStyle: (NSUInteger) styleMask;
-
-- (NSArray *) modesForScreen: (int) screenIndex;
-- (NSDictionary *) currentModeForScreen: (int) screenIndex;
-- (BOOL) setMode: (NSDictionary *) mode forScreen: (int) screenIndex;
 
 // Returns an opaque number of the current keyboard layout.
 // This is because apps tend to call TISCopyCurrentKeyboardLayoutInputSource()
@@ -166,6 +198,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 // position is in CoreGraphics' global space (origin at the main screen's top-left
 // corner, y down), as CGWarpMouseCursorPosition() takes it.
 - (void) warpMouse: (NSPoint) position;
+// NO for a backend whose window system connection in CoreGraphics keeps the pointer's state itself (the cursor
+// hide count, warping, the disassociated mouse, the deltas): CoreGraphics' pointer functions do not reach the display.
+- (BOOL) usesPointerController;
+- (BOOL) cursorIsVisible;
 // YES disassociates the mouse from the cursor, as
 // CGAssociateMouseAndMouseCursorPosition(false) does: the cursor stays where it
 // is and mouse motion only produces event deltas. NO restores normal operation.

@@ -42,6 +42,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (void) _moveColumn: (NSInteger) columnIndex toColumn: (NSInteger) newIndex notify: (BOOL) notify;
 - (void) _noteColumnDidMoveFrom: (NSInteger) oldIndex to: (NSInteger) newIndex;
 - (CGFloat) _spaceTakenByColumn: (NSTableColumn *) column;
+- (void) _sendActionForClickInHeaderOfColumn: (NSInteger) column clickCount: (NSInteger) clickCount;
 @end
 
 @implementation NSTableHeaderView
@@ -107,8 +108,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
     NSTableColumn *tableColumn = [tableColumns objectAtIndex: column];
 
     headerRect.size.width = [_tableView _spaceTakenByColumn: tableColumn];
-    // QUIRK: the rectangle of a hidden column is an empty one at x 0, wherever the column is in the table; see
-    // -[NSTableView rectOfColumn:].
+    // QUIRK: the header rectangle of a hidden column is at x 0 with width 0, wherever the column is in the table,
+    // and keeps the header's height; unlike -[NSTableView rectOfColumn:] it is not NSZeroRect. Observed on macOS
+    // 26.1 (arm64): probe 657.R "hidden=4 ... column 4 -> HIDDEN ; ... headerRectOfColumn:={{0,0},{0,28}}"
+    // with a header of height 28.
     if ([tableColumn isHidden]) {
         headerRect.origin.x = 0.;
         return headerRect;
@@ -301,6 +304,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
     if (clickedColumn < 0)
         return;
 
+    NSInteger clickCount = [theEvent clickCount];
+
     // Dragging a header cell moves its column when the table allows reordering
     if ([_tableView allowsColumnReordering]) {
         id delegate = [_tableView delegate];
@@ -375,11 +380,23 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
             [_tableView selectColumn: clickedColumn byExtendingSelection: NO];
     }
 
+    NSTableColumn *clickedColumnObject = [[_tableView tableColumns] objectAtIndex: clickedColumn];
+
     if ([[_tableView delegate] respondsToSelector: @selector(tableView:didClickTableColumn:)])
         [[_tableView delegate] tableView: _tableView
-                     didClickTableColumn: [[_tableView tableColumns] objectAtIndex: clickedColumn]];
+                     didClickTableColumn: clickedColumnObject];
 
-    [[[_tableView tableColumns] objectAtIndex: clickedColumn] _sort];
+    // The documentation of doubleAction (https://developer.apple.com/documentation/appkit/nstableview/doubleaction)
+    // lists a double click on a column header among the clicks that send the double action, and says clickedRow and
+    // clickedColumn tell a header click from a cell click. The single click sending the action is not documented.
+    // QUIRK: a click on a header sends the table's action too, with clickedRow -1 and clickedColumn the column,
+    // after didClickTableColumn:. Observed on macOS 26.1 (build 25B78) arm64 (probe 659, "header, over column 0"):
+    // `mouseDownInHeaderOfTableColumn(c0) didClickTableColumn(c0) action(clickedRow=-1,clickedColumn=0,selectedRow=-1)`,
+    // and at click count 2 the same three calls ending in `doubleAction(clickedRow=-1,clickedColumn=0,selectedRow=-1)`.
+    // Test: tests/appkit-table-header-click-action.m
+    [_tableView _sendActionForClickInHeaderOfColumn: clickedColumn clickCount: clickCount];
+
+    [clickedColumnObject _sort];
 }
 
 - (void) resetCursorRects {

@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include "CGEventTapInternal.h"
+#import "CGEventObjC.h"
 
 // More than this many events wait for the reader: the new ones are dropped.
 #define kStreamCapacityLimit 65536
@@ -45,6 +46,10 @@ void _CGEventStreamEnqueue(CGEventRef event)
 {
 	CFRunLoopSourceRef source = NULL;
 	CFRunLoopRef runLoop = NULL;
+
+	// The event was for the event taps only (kCGSEventTapsOnly)
+	if (((CGEvent*) event)->_fields[kCGSEventTapsOnly] != 0)
+		return;
 
 	pthread_mutex_lock(&g_streamLock);
 
@@ -92,6 +97,23 @@ void _CGSEventStreamPost(CGEventRef event)
 {
 	if (event)
 		_CGEventPostToPipeline(event, kCGHIDEventTap, 0, false);
+}
+
+void _CGSEventSetClientData(CGEventRef event, CFTypeRef data)
+{
+	if (!event)
+		return;
+
+	void* value = [(id) data retain];
+	id old = (id) __atomic_exchange_n((void**) &((CGEvent*) event)->_clientData, value, __ATOMIC_ACQ_REL);
+	[old release];
+}
+
+CFTypeRef _CGSEventGetClientData(CGEventRef event)
+{
+	if (!event)
+		return NULL;
+	return (CFTypeRef) __atomic_load_n((void**) &((CGEvent*) event)->_clientData, __ATOMIC_ACQUIRE);
 }
 
 CGEventRef _CGSEventStreamCopyNextEvent(void)

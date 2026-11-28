@@ -1259,8 +1259,10 @@ static CGFloat clampMagnification(NSScrollView *self, CGFloat value) {
         // scrollToPoint calls constrainScrollPoint *and* this method.
         headerClipRect.origin.x = [_clipView frame].origin.x;
         headerClipRect.size.width = [_clipView frame].size.width;
-        [_headerClipView setFrame: headerClipRect];
-        [_headerClipView setNeedsDisplay: YES];
+        if (!NSEqualRects([_headerClipView frame], headerClipRect)) {
+            [_headerClipView setFrame: headerClipRect];
+            [_headerClipView setNeedsDisplay: YES];
+        }
     }
 }
 
@@ -1304,6 +1306,12 @@ static CGFloat clampMagnification(NSScrollView *self, CGFloat value) {
     }
 }
 
+// GUESS: how many lines a scroll wheel notch scrolls. The documentation only says that the scrolling
+// deltas of a wheel are counted in lines, to be multiplied by the height of a line or row; it gives no number.
+// Three is what this class has always used.
+// https://developer.apple.com/documentation/appkit/nsevent/scrollingdeltay
+static const CGFloat NSScrollViewLinesPerWheelNotch = 3;
+
 - (void) scrollWheel: (NSEvent *) event {
     NSView *documentView = [self documentView];
     if (documentView == nil) {
@@ -1315,9 +1323,21 @@ static CGFloat clampMagnification(NSScrollView *self, CGFloat value) {
     NSRect visible = [documentView visibleRect];
     CGFloat direction = [documentView isFlipped] ? -1 : 1;
 
-    visible.origin.x += [event deltaX] * [self horizontalLineScroll] * 3;
-    visible.origin.y +=
-            [event deltaY] * direction * [self verticalLineScroll] * 3;
+    // The scrolling deltas are the preferred ones for a scroll wheel event: a precise event gives the
+    // amount to scroll by, and any other one counts lines, to be multiplied by the height of a line or row.
+    // GUESS: the amount of a precise event is in points of the document view, and the line scroll amount
+    // of the axis is the line height of a line-counting event (its page speaks of the scroll arrows).
+    // https://developer.apple.com/documentation/appkit/nsevent/scrollingdeltay
+    // https://developer.apple.com/documentation/appkit/nsevent/hasprecisescrollingdeltas
+    CGFloat deltaX = [event scrollingDeltaX];
+    CGFloat deltaY = [event scrollingDeltaY];
+    if (![event hasPreciseScrollingDeltas]) {
+        deltaX *= [self horizontalLineScroll] * NSScrollViewLinesPerWheelNotch;
+        deltaY *= [self verticalLineScroll] * NSScrollViewLinesPerWheelNotch;
+    }
+
+    visible.origin.x += deltaX;
+    visible.origin.y += deltaY * direction;
 
     if (visible.origin.y < bounds.origin.y)
         visible.origin.y = bounds.origin.y;
@@ -1339,6 +1359,8 @@ static CGFloat clampMagnification(NSScrollView *self, CGFloat value) {
     CGFloat lineScroll = NS_EXTRA(NSScrollView, self)->_verticalLineScroll;
     CGFloat pageScroll = NS_EXTRA(NSScrollView, self)->_verticalPageScroll;
 
+    // The page scroll is the amount of the content that stays visible when scrolling by a page.
+    pageScroll = MAX(clipRect.size.height - pageScroll, lineScroll);
     if (![docView isFlipped]) {
         lineScroll = 0.0 - lineScroll;
         pageScroll = 0.0 - pageScroll;
@@ -1392,11 +1414,14 @@ static CGFloat clampMagnification(NSScrollView *self, CGFloat value) {
         break;
 
     case NSScrollerIncrementPage:
-        clipRect.origin.x += NS_EXTRA(NSScrollView, self)->_horizontalPageScroll;
+        // the page scroll is the amount of the content that stays visible
+        clipRect.origin.x += MAX(clipRect.size.width - NS_EXTRA(NSScrollView, self)->_horizontalPageScroll,
+                                 NS_EXTRA(NSScrollView, self)->_horizontalLineScroll);
         break;
 
     case NSScrollerDecrementPage:
-        clipRect.origin.x -= NS_EXTRA(NSScrollView, self)->_horizontalPageScroll;
+        clipRect.origin.x -= MAX(clipRect.size.width - NS_EXTRA(NSScrollView, self)->_horizontalPageScroll,
+                                 NS_EXTRA(NSScrollView, self)->_horizontalLineScroll);
         break;
 
     case NSScrollerKnobSlot:

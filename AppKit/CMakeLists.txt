@@ -59,6 +59,7 @@ include_directories(
 	${CMAKE_CURRENT_SOURCE_DIR}
 	${CMAKE_CURRENT_SOURCE_DIR}/..
 	${CMAKE_CURRENT_SOURCE_DIR}/../CoreText
+	${CMAKE_CURRENT_SOURCE_DIR}/../CoreGraphics/WaylandSupport
 
 	${CMAKE_CURRENT_SOURCE_DIR}/nib.subproj
 	${CMAKE_CURRENT_SOURCE_DIR}/NSColorPicker.subproj
@@ -99,6 +100,7 @@ set(AppKit_sources
 	NSImageSystemTemplates.m
 	NSPICTImageRep.m
 	NSScroller.m
+	NSScrollingMomentum.m
 	NSCustomImageRep.m
 	NSClipView.m
 	NSApplication.m
@@ -141,6 +143,8 @@ set(AppKit_sources
 	NSPoofAnimation.m
 	NSErrors.m
 	NSPopover.m
+	NSKeyboardShortcut.m
+	NSTextPlaceholder.m
 	NSRunningApplication.m
 	NSAccessibilityCustomChooser.m
 
@@ -191,7 +195,6 @@ set(AppKit_sources
 	NSScrollEdgeEffectStyle.m
 	NSImageHintSymbolScale.m
 	NSPasteboard.m
-	DarlingFileURIList.m
 	DarlingPortalFileChooser.m
 	NSSearchFieldCell.m
 	NSOutlineView.m
@@ -230,6 +233,7 @@ set(AppKit_sources
 	NSColorPicker.subproj/NSColorPicker.m
 
 	NSEPSImageRep.m
+	NSPrintDialogSupport.m
 	NSPrintInfo.m
 
 	NSMenu.subproj/NSMainMenuView.m
@@ -268,6 +272,7 @@ set(AppKit_sources
 
 	NSEvent.subproj/NSEvent_periodic.m
 	NSEvent.subproj/NSEvent_mouse.m
+	NSEvent.subproj/NSEvent_tablet.m
 	NSEvent.subproj/NSEvent_CoreGraphics.m
 	NSEvent.subproj/NSEvent_other.m
 	NSEvent.subproj/NSEvent_keyboard.m
@@ -306,6 +311,7 @@ set(AppKit_sources
 	NSFontDescriptor.m
 	UIFontNames.m
 	NSDisplay.m
+	NSEventQueue.m
 	DarlingDisplay.m
 
 	NSOpenGL/NSOpenGLView.m
@@ -328,6 +334,7 @@ set(AppKit_sources
 	NSColor.subproj/NSColor_dynamic.m
 	NSColor.subproj/NSColor_assetCatalog.m
 	NSAssetCatalog.m
+	NSSVGRenderer.m
 
 	NSTableCornerView.m
 	NSTabView.m
@@ -350,6 +357,9 @@ set(AppKit_sources
 	NSTreeNode.m
 	NSLevelIndicator.m
 	NSDraggingManager.m
+	NSCGSDraggingManager.m
+	NSCGSInputMethod.m
+	NSCGSDropSession.m
 	NSImage.m
 	NSImageSymbolGlyphs.m
 	NSImageDrawingCache.m
@@ -406,6 +416,7 @@ set(AppKit_sources
 	NSDockTile.m
 	NSGraphics.m
 	NSColorWell.m
+	NSPopoverColorWell.m
 	NSAlertPanel.m
 	NSPanel.m
 	NSRuleEditorButtonCell.m
@@ -435,10 +446,10 @@ set(AppKit_sources
 	NSClickGestureRecognizer.m
 	NSDraggingItem.m
 	NSDraggingSession.m
+	NSFilePromiseReceiver.m
 	NSGroupTouchBarItem.m
 	NSKeyBindingManager.m
 	NSPasteboardItem.m
-	NSPasteboardHostBridge.m
 	NSPasteboardSupport.m
 	NSPopoverTouchBarItem.m
 	NSSpaceTouchBarItem.m
@@ -538,6 +549,62 @@ set(AppKit_resources
 	video-x-generic.png SystemImages/video-x-generic.png
 	COPYING.Adwaita SystemImages/COPYING.Adwaita
 
+	SystemSymbols/sidebar-show-symbolic.svg SystemSymbols/sidebar-show-symbolic.svg
+	SystemSymbols/sidebar-show-right-symbolic.svg SystemSymbols/sidebar-show-right-symbolic.svg
+	SystemSymbols/list-add-symbolic.svg SystemSymbols/list-add-symbolic.svg
+	SystemSymbols/list-remove-symbolic.svg SystemSymbols/list-remove-symbolic.svg
+	SystemSymbols/system-search-symbolic.svg SystemSymbols/system-search-symbolic.svg
+	SystemSymbols/zoom-in-symbolic.svg SystemSymbols/zoom-in-symbolic.svg
+	SystemSymbols/zoom-out-symbolic.svg SystemSymbols/zoom-out-symbolic.svg
+	SystemSymbols/document-send-symbolic.svg SystemSymbols/document-send-symbolic.svg
+	SystemSymbols/document-edit-symbolic.svg SystemSymbols/document-edit-symbolic.svg
+	SystemSymbols/document-new-symbolic.svg SystemSymbols/document-new-symbolic.svg
+	SystemSymbols/document-print-symbolic.svg SystemSymbols/document-print-symbolic.svg
+	SystemSymbols/view-more-horizontal-symbolic.svg SystemSymbols/view-more-horizontal-symbolic.svg
+	SystemSymbols/view-list-bullet-symbolic.svg SystemSymbols/view-list-bullet-symbolic.svg
+	SystemSymbols/view-list-symbolic.svg SystemSymbols/view-list-symbolic.svg
+	SystemSymbols/view-grid-symbolic.svg SystemSymbols/view-grid-symbolic.svg
+	SystemSymbols/view-dual-symbolic.svg SystemSymbols/view-dual-symbolic.svg
+	SystemSymbols/view-refresh-symbolic.svg SystemSymbols/view-refresh-symbolic.svg
+	SystemSymbols/view-conceal-symbolic.svg SystemSymbols/view-conceal-symbolic.svg
+	SystemSymbols/view-pin-symbolic.svg SystemSymbols/view-pin-symbolic.svg
+	SystemSymbols/insert-link-symbolic.svg SystemSymbols/insert-link-symbolic.svg
+	SystemSymbols/star-new-symbolic.svg SystemSymbols/star-new-symbolic.svg
+	SystemSymbols/bookmark-new-symbolic.svg SystemSymbols/bookmark-new-symbolic.svg
+	SystemSymbols/edit-undo-symbolic.svg SystemSymbols/edit-undo-symbolic.svg
+	SystemSymbols/media-playback-start-symbolic.svg SystemSymbols/media-playback-start-symbolic.svg
+	SystemSymbols/media-playback-pause-symbolic.svg SystemSymbols/media-playback-pause-symbolic.svg
+	SystemSymbols/media-playback-stop-symbolic.svg SystemSymbols/media-playback-stop-symbolic.svg
+	SystemSymbols/media-record-symbolic.svg SystemSymbols/media-record-symbolic.svg
+	SystemSymbols/go-previous-symbolic.svg SystemSymbols/go-previous-symbolic.svg
+	SystemSymbols/go-next-symbolic.svg SystemSymbols/go-next-symbolic.svg
+	SystemSymbols/go-up-symbolic.svg SystemSymbols/go-up-symbolic.svg
+	SystemSymbols/go-down-symbolic.svg SystemSymbols/go-down-symbolic.svg
+	SystemSymbols/user-trash-symbolic.svg SystemSymbols/user-trash-symbolic.svg
+	SystemSymbols/user-bookmarks-symbolic.svg SystemSymbols/user-bookmarks-symbolic.svg
+	SystemSymbols/folder-download-symbolic.svg SystemSymbols/folder-download-symbolic.svg
+	SystemSymbols/dialog-information-symbolic.svg SystemSymbols/dialog-information-symbolic.svg
+	SystemSymbols/dialog-warning-symbolic.svg SystemSymbols/dialog-warning-symbolic.svg
+	SystemSymbols/dialog-error-symbolic.svg SystemSymbols/dialog-error-symbolic.svg
+	SystemSymbols/starred-symbolic.svg SystemSymbols/starred-symbolic.svg
+	SystemSymbols/system-lock-screen-symbolic.svg SystemSymbols/system-lock-screen-symbolic.svg
+	SystemSymbols/mail-attachment-symbolic.svg SystemSymbols/mail-attachment-symbolic.svg
+	SystemSymbols/mail-unread-symbolic.svg SystemSymbols/mail-unread-symbolic.svg
+	SystemSymbols/mail-read-symbolic.svg SystemSymbols/mail-read-symbolic.svg
+	SystemSymbols/preferences-system-symbolic.svg SystemSymbols/preferences-system-symbolic.svg
+	SystemSymbols/emoji-flags-symbolic.svg SystemSymbols/emoji-flags-symbolic.svg
+	SystemSymbols/system-help-symbolic.svg SystemSymbols/system-help-symbolic.svg
+	SystemSymbols/window-close-symbolic.svg SystemSymbols/window-close-symbolic.svg
+	SystemSymbols/checkbox-checked-symbolic.svg SystemSymbols/checkbox-checked-symbolic.svg
+	SystemSymbols/focus-windows-symbolic.svg SystemSymbols/focus-windows-symbolic.svg
+	SystemSymbols/chat-message-new-symbolic.svg SystemSymbols/chat-message-new-symbolic.svg
+	SystemSymbols/view-reveal-symbolic.svg SystemSymbols/view-reveal-symbolic.svg
+	SystemSymbols/image-x-generic-symbolic.svg SystemSymbols/image-x-generic-symbolic.svg
+	SystemSymbols/network-workgroup-symbolic.svg SystemSymbols/network-workgroup-symbolic.svg
+	SystemSymbols/window-new-symbolic.svg SystemSymbols/window-new-symbolic.svg
+	SystemSymbols/format-text-rich-symbolic.svg SystemSymbols/format-text-rich-symbolic.svg
+	SystemSymbols/COPYING.Adwaita SystemSymbols/COPYING.Adwaita
+
 	NSMenuArrow.tiff NSMenu.subproj/NSMenuArrow.tiff
 	NSMenuViewDoubleRightArrowGray.tiff NSMenu.subproj/NSMenuViewDoubleRightArrowGray.tiff
 	NSMenuViewDoubleRightArrow.tiff NSMenu.subproj/NSMenuViewDoubleRightArrow.tiff
@@ -606,6 +673,8 @@ add_framework(AppKit
 		QuartzCore
 		CoreGraphics
 		ImageIO
+		AudioToolbox
+		CoreAudio
 		# native libraries
 		FreeType
 		fontconfig
@@ -671,12 +740,6 @@ add_backend(X11
 		X11.backend/X11Window.m
 		X11.backend/X11SubWindow.m
 		X11.backend/X11Event.m
-		X11.backend/X11Pasteboard.m
-		X11.backend/X11Cursor.m
-		X11.backend/X11DropSession.m
-		X11.backend/X11DraggingManager.m
-		X11.backend/X11Touch.m
-		X11.backend/X11Gesture.m
 	INFO_PLIST
 		X11.backend/Info.plist
 	DEPENDENCIES
@@ -715,13 +778,9 @@ if (WAYLAND_PROTOCOLS_USABLE)
 			Wayland.backend/WaylandAppMenu.m
 			Wayland.backend/WaylandCursor.m
 			Wayland.backend/WaylandDisplay.m
-			Wayland.backend/WaylandOutputManager.m
-			# Client glue shared with the CoreGraphics Wayland backend, which sits below AppKit.
+			# Client glue shared with the CoreGraphics Wayland backend, which sits below AppKit (and
+			# has the one WaylandColorManager).
 			../CoreGraphics/WaylandSupport/WaylandLibrary.m
-			Wayland.backend/WaylandDropSession.m
-			Wayland.backend/WaylandDraggingManager.m
-			Wayland.backend/WaylandDragIcon.m
-			Wayland.backend/WaylandPasteboard.m
 			Wayland.backend/WaylandWindow.m
 			Wayland.backend/WaylandToplevelIcon.m
 			Wayland.backend/WaylandSubWindow.m
@@ -736,6 +795,7 @@ if (WAYLAND_PROTOCOLS_USABLE)
 			AppKit
 			Onyx2D
 			CoreGraphics
+			IOSurface
 			OpenGL
 	)
 	target_include_directories(Wayland_backend PRIVATE

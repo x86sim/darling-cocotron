@@ -1,6 +1,8 @@
 #import <CoreText/CTParagraphStyle.h>
 #import <CoreText/CTTextTab.h>
 #import <CoreText/CTLine.h>
+#import "CTLineSPI.h"
+#include "CTFontSPI.h"
 #include <CoreFoundation/CFArray.h>
 #include <CoreFoundation/CFRuntime.h>
 #include <pthread.h>
@@ -19,6 +21,9 @@ struct __CTParagraphStyle {
     CFRuntimeBase base;
     union ParagraphValue values[kCTParagraphStyleSpecifierCount];
     CFArrayRef tabs;
+    // Set after creation by CTParagraphStyleSetCompositionLanguage(); Darling's
+    // layout has no East Asian composition rules, so nothing reads it yet.
+    CTCompositionLanguage compositionLanguage;
 };
 
 static void finalizeParagraph(CFTypeRef value) {
@@ -121,6 +126,7 @@ CTParagraphStyleRef CTParagraphStyleCreate(const CTParagraphStyleSetting *settin
             kCFAllocatorDefault, CTParagraphStyleGetTypeID(), sizeof(*style) - sizeof(CFRuntimeBase), NULL);
     if (style == NULL) goto invalid;
     memcpy(style->values, values, sizeof(values));
+    style->compositionLanguage = kCTCompositionLanguageUnset;
     style->tabs = tabs;
     return style;
 invalid:
@@ -144,4 +150,28 @@ bool CTParagraphStyleGetValueForSpecifier(CTParagraphStyleRef style, CTParagraph
     if (spec == kCTParagraphStyleSpecifierTabStops) memcpy(buffer, &style->tabs, sizeof(style->tabs));
     else memcpy(buffer, &style->values[spec], valueSize(spec));
     return true;
+}
+
+void CTParagraphStyleSetCompositionLanguage(CTParagraphStyleRef style, CTCompositionLanguage language) {
+    if (style == NULL || CFGetTypeID(style) != CTParagraphStyleGetTypeID()) return;
+    ((struct __CTParagraphStyle *)style)->compositionLanguage = language;
+}
+
+uint8_t CTParagraphStyleGetCompositionLanguageForLanguage(CFStringRef language) {
+    // QUIRK: NULL and every language other than Japanese and Chinese map to 1. Not documented (SPI).
+    // Evidence: black-box observation on macOS 26.7.3 (tier 2). Test: tests/coretext-swiftui-font-spis.m
+    if (language == NULL)
+        return 1; /* kCTCompositionLanguageNone */
+    if (CFStringHasPrefix(language, CFSTR("ja")))
+        return 2; /* kCTCompositionLanguageJapanese */
+    if (CFStringHasPrefix(language, CFSTR("zh-Hans")) ||
+        CFStringHasPrefix(language, CFSTR("zh_Hans")) ||
+        CFEqual(language, CFSTR("zh-CN")))
+        return 3; /* kCTCompositionLanguageSimplifiedChinese */
+    if (CFStringHasPrefix(language, CFSTR("zh-Hant")) ||
+        CFStringHasPrefix(language, CFSTR("zh_Hant")) ||
+        CFEqual(language, CFSTR("zh-TW")) ||
+        CFEqual(language, CFSTR("zh-HK")))
+        return 4; /* kCTCompositionLanguageTraditionalChinese */
+    return 1; /* kCTCompositionLanguageNone */
 }

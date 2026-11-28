@@ -19,16 +19,13 @@
  SOFTWARE. */
 
 #import "X11Display.h"
+#include <string.h>
 #import "NSEvent_mouse.h"
-#import "X11Cursor.h"
-#import "X11DraggingManager.h"
-#import "X11Pasteboard.h"
-#import "X11LevelStacking.h"
+#import "../NSCGSDraggingManager.h"
 #import "X11Crossing.h"
 #import "../private-include/AppKit/NSEventTime.h"
 #import "X11Window.h"
 #import "X11AppMenu.h"
-#import "X11DockSupport.h"
 #import "../private-include/AppKit/NSGlobalMenu+Private.h"
 #import <AppKit/NSApplication.h>
 #import <AppKit/NSScreen.h>
@@ -51,20 +48,15 @@
 
 #import <OpenGL/CGLInternal.h>
 
-#import "../private-include/AppKit/CarbonKeys.h"
-#import <CoreGraphics/CGSKeySymToUnicodePrivate.h>
-#import "X11KeyEvent.h"
-#import "X11Touch.h"
-#import "X11Gesture.h"
-#import "X11Occlusion.h"
 #import <X11/XKBlib.h>
 #import <X11/Xutil.h>
 #import <X11/extensions/XKBrules.h>
-#import <X11/extensions/Xrandr.h>
+#import "../../CoreGraphics/X11.backend/X11Xrandr.h"
 #import "../../CoreGraphics/X11.backend/X11Monitors.h"
 #import "../../CoreGraphics/X11.backend/X11RandR.h"
 #import <CoreGraphics/CGWindowPrivate.h>
 #import <CoreGraphics/CoreGraphicsPrivate.h>
+#import <CoreGraphics/CGSNativeConnection.h>
 #import <X11/keysym.h>
 #import <fcntl.h>
 #import <fontconfig/fontconfig.h>
@@ -81,134 +73,36 @@ static BOOL appKitPreference(CFStringRef key) {
     return valid && value;
 }
 
-// NSScreen.frame is in points while X reports device pixels, so the screen
-// carries the scale instead of NSScreen assuming one device pixel per point.
-@interface X11Screen : NSScreen {
-@public
-    CGFloat _x11Scale;
-}
-@end
-
-@implementation X11Screen
-- (CGFloat) backingScaleFactor {
-    return _x11Scale;
-}
-@end
-
 @implementation X11Display
 
 static int errorHandler(Display *display, XErrorEvent *errorEvent) {
     return [(X11Display *) [X11Display currentDisplay] handleError: errorEvent];
 }
 
-#ifdef DARLING
-static void socketCallback(CFSocketRef s, CFSocketCallBackType type,
-                           CFDataRef address, const void *data, void *info)
-{
-    X11Display *self = info;
-    [self processPendingEvents];
-}
-
-// Xlib reads events into its own queue whenever it waits for a reply, so
-// events can be pending in Xlib while the connection has nothing left to read
-// and the socket source never fires. Requests may also still sit in Xlib's
-// output buffer. Flush and drain both before the main run loop goes to sleep;
-// posting an event wakes the run loop again.
-static void beforeWaitingCallback(CFRunLoopObserverRef observer,
-                                  CFRunLoopActivity activity, void *info)
-{
-    X11Display *self = info;
-    [self processPendingEvents];
-}
-#endif
-
 - init {
     if (self = [super init]) {
-        // EGL also uses this Display from compositor threads, so Xlib has
-        // to be made thread-safe before the first Xlib call.
-        if (!XInitThreads()) {
-            NSLog(@"X11Display: XInitThreads() failed");
+        // The process has one connection to the X server and CoreGraphics owns it: it reads its
+        // socket, handles the events that are its own (hot keys, keymap, the displays) and gives the
+        // rest to this display through the observer registered at the end. EGL also uses this Display
+        // from compositor threads; CoreGraphics made Xlib thread-safe before opening it.
+        if (_CGSNativeConnectionKind() != CGSNativeConnectionKindX11) {
             [self release];
             return nil;
         }
-
-        // The server named by DISPLAY; with DISPLAY unset there is none.
-        _display = XOpenDisplay(NULL);
-
+        _display = (Display *) _CGSNativeConnectionDisplay();
         if (_display == NULL) {
-            // Failed to connect.
             [self release];
             return nil;
         }
-
-        if (NSDebugEnabled)
-            XSynchronize(_display, True);
 
         XSetErrorHandler(errorHandler);
-
-        _fileDescriptor = ConnectionNumber(_display);
-#ifndef DARLING
-        _inputSource = [[NSSelectInputSource
-                socketInputSourceWithSocket:
-                        [NSSocket_bsd socketWithDescriptor: _fileDescriptor]]
-                retain];
-        [_inputSource setDelegate: self];
-        [_inputSource setSelectEventMask: NSSelectReadEvent];
-#else
-        // There's no need to retain/release the display,
-        // because the display is guaranteed to outlive
-        // the socket.
-        CFSocketContext context = {.version = 0,
-                                   .info = self,
-                                   .retain = NULL,
-                                   .release = NULL,
-                                   .copyDescription = NULL};
-        _cfSocket = CFSocketCreateWithNative(
-                kCFAllocatorDefault, _fileDescriptor, kCFSocketReadCallBack,
-                socketCallback, &context);
-        _source =
-                CFSocketCreateRunLoopSource(kCFAllocatorDefault, _cfSocket, 0);
-        CFRunLoopAddSource(CFRunLoopGetMain(), _source, kCFRunLoopCommonModes);
-
-        CFRunLoopObserverContext observerContext = {.version = 0,
-                                                    .info = self};
-        _beforeWaitingObserver = CFRunLoopObserverCreate(
-                kCFAllocatorDefault, kCFRunLoopBeforeWaiting, true, 0,
-                beforeWaitingCallback, &observerContext);
-        CFRunLoopAddObserver(CFRunLoopGetMain(), _beforeWaitingObserver,
-                             kCFRunLoopCommonModes);
-
         CGLRegisterNativeDisplay(_display);
-#endif
 
         _windowsByID = [NSMutableDictionary new];
-        [self _enableDetectableAutoRepeat];
 
-        [[NSNotificationCenter defaultCenter]
-                addObserver: self
-                   selector: @selector(_displayOverlayWindowCreated:)
-                       name: (NSString *) _kCGSDisplayOverlayWindowCreated
-                     object: nil];
-
-        XSetLocaleModifiers("");
-        _xim = XOpenIM(_display, NULL, NULL, NULL);
-
-        if (!_xim) {
-            NSLog(@"Failed to open XIM, falling back to im=none\n");
-
-            XSetLocaleModifiers("@im=none");
-            _xim = XOpenIM(_display, NULL, NULL, NULL);
-        }
-
-        int errorBase;
-        if (XRRQueryExtension(_display, &_rrEventBase, &errorBase)) {
-            XRRSelectInput(_display, DefaultRootWindow(_display), X11_RANDR_EVENT_MASK);
-        }
-        // The window manager publishes the focused window and the stacking order on the root window.
-        XSelectInput(_display, DefaultRootWindow(_display), PropertyChangeMask);
-        _occlusionDirty = YES;
-
-        X11TouchInit(_display);
+        // RandR events are CoreGraphics', which reports the new layout (see -nativeConnectionDisplayLayoutChanged).
+        // Which window covers one of ours is judged by CoreGraphics, which tells the windows (see
+        // kCGSToplevelEventOcclusionChanged).
 
         int xwaylandOpcode, xwaylandEvent, xwaylandError;
         _isXwayland = XQueryExtension(_display, "XWAYLAND", &xwaylandOpcode,
@@ -217,85 +111,19 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer,
         lastFocusedWindow = nil;
         _confinesPointer = appKitPreference(CFSTR("ConfinePointerToFullscreenWindows"));
         _controlActsAsCommand = appKitPreference(CFSTR("ControlKeyActsAsCommand"));
-        _modifierFlags = 0;
 
-        // The general pasteboard and the CLIPBOARD selection show the same contents.
-        NSPasteboardRegisterHostClipboard([X11Pasteboard hostClipboardOfDisplay: self]);
+        // From here on CoreGraphics hands this display the events of the connection.
+        _CGSSetNativeConnectionObserver(self);
     }
     return self;
 }
 
-// A display overlay window (CGLSetFullScreen) belongs to no NSWindow, so the
-// application's input for it is taken up here: its key and pointer events are
-// selected on this connection and the keyboard focus goes to it. Its events
-// reach the application with no window and screen coordinates, as those of a
-// captured display do on macOS. Relative mouse mode, if the application asked
-// for it, takes its grab on the overlay.
-- (void) _displayOverlayWindowCreated: (NSNotification *) notification {
-    if (![NSThread isMainThread]) {
-        [self performSelectorOnMainThread: _cmd
-                               withObject: notification
-                            waitUntilDone: YES];
-        return;
-    }
-    NSNumber *native = [[notification userInfo] objectForKey: @"NativeWindow"];
-    if (native == nil)
-        return;
-    Window overlay = (Window) [native unsignedLongValue];
-    if (_overlayWindows == nil)
-        _overlayWindows = [NSMutableSet new];
-    [_overlayWindows addObject: native];
-    _overlayWindow = overlay;
-    _overlayPointerKnown = NO;
-    XSelectInput(_display, overlay,
-                 KeyPressMask | KeyReleaseMask | ButtonPressMask |
-                 ButtonReleaseMask | PointerMotionMask | StructureNotifyMask);
-    XSetInputFocus(_display, overlay, RevertToPointerRoot, CurrentTime);
-    XFlush(_display);
-    if (_relativeRequested && !_relativeMouse.active)
-        [self beginRelativeMouse];
-}
-
-// The overlay is gone: the server released any grab on it.
-- (void) _overlayWindowDestroyed: (Window) overlay {
-    if (![_overlayWindows containsObject: @((unsigned long) overlay)])
-        return;
-    [_overlayWindows removeObject: @((unsigned long) overlay)];
-    if (_overlayWindow == overlay)
-        _overlayWindow = None;
-    if (_relativeWindow == overlay)
-        [self suspendRelativeMouse];
-}
-
 - (void) dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver: self];
-    [_overlayWindows release];
-#ifdef DARLING
-    // The observer uses the connection, so it goes before XCloseDisplay().
-    if (_beforeWaitingObserver != NULL) {
-        CFRunLoopObserverInvalidate(_beforeWaitingObserver);
-        CFRelease(_beforeWaitingObserver);
-    }
-#endif
-    X11RelativeMouseEnd(&_relativeMouse);
-    [_blankCursor release];
-    [_defaultCursor release];
+    _CGSSetNativeConnectionObserver(nil);
 
-    // -init releases self when it cannot connect to the X server, so none of these may exist yet.
-    if (_xim)
-        XCloseIM(_xim);
-
-    if (_display)
-        XCloseDisplay(_display);
-#ifdef DARLING
-    if (_source != NULL) {
-        CFRunLoopRemoveSource(CFRunLoopGetMain(), _source, kCFRunLoopCommonModes);
-        CFRelease(_source);
-    }
-    if (_cfSocket != NULL)
-        CFRelease(_cfSocket);
-#endif
-
+    // -init releases self when it cannot use the connection, so none of these may exist yet.
+    // The connection itself is CoreGraphics'; it stays open.
     [_appMenu release];
     [_windowsByID release];
     [super dealloc];
@@ -309,72 +137,35 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer,
     return _display;
 }
 
-// X11 has no scale protocol; see X11ScaleChoose() for what is read.
+// Device pixels per point. X11 has no scale protocol; CoreGraphics decides the scale of the displays (see
+// X11ScaleChoose()), and the main display's is the one window geometry here uses.
 - (CGFloat) backingScale {
     if (_backingScale > 0)
         return _backingScale;
 
-    double preferred = 0;
-    CFPropertyListRef value = CFPreferencesCopyAppValue(
-            CFSTR("X11BackingScale"), CFSTR("org.darlinghq.AppKit"));
-    if (value != NULL) {
-        if (CFGetTypeID(value) == CFNumberGetTypeID())
-            CFNumberGetValue(value, kCFNumberDoubleType, &preferred);
-        CFRelease(value);
-    }
-    const char *source = NULL;
-    _backingScale = (CGFloat) X11ScaleChoose(preferred, &source);
+    _backingScale = (CGFloat) _CGSDisplayBackingScaleFactor(CGMainDisplayID());
     return _backingScale;
 }
 
-- (void) _enableDetectableAutoRepeat {
-    int major = XkbMajorVersion, minor = XkbMinorVersion;
-    XkbStateRec state;
-
-    if (!XkbLibraryVersion(&major, &minor))
-        return;
-    if (!XkbQueryExtension(_display, NULL, NULL, &major, &minor, NULL))
-        return;
-    
-    Bool supported;
-    XkbSetDetectableAutoRepeat(_display, TRUE, &supported);
-}
-
-- (void) _invalidateRRCache {
-    _pointerKnown = NO;
-    // The root may have shrunk or a monitor gone: the pointer's reachable
-    // area, and with it a relative-mode grab's bounds, changed.
-    [self resnapshotRelativeMouse];
-    if (_lastScreens) {
-        [_lastScreens release];
-        _lastScreens = nil;
-    }
+// The layout of the monitors changed. The displays are CoreGraphics', which reads RandR on the shared
+// connection: it has brought them up to date (and reported the change to the display reconfiguration
+// callbacks, which is what posts NSApplicationDidChangeScreenParametersNotification) before it says so
+// here, so what this display derives from the layout is dropped now.
+- (void) nativeConnectionDisplayLayoutChanged {
     _primaryRootFrameValid = NO;
-    // Whether the focused window covers a monitor depends on the layout.
-    _occlusionCoverValid = NO;
-    _occlusionDirty = YES;
     [self reevaluateBackingScale];
-    [self _postScreenParametersChanged];
 }
 
-// RandR reports one change as several events, so the notification is queued
-// and merged per run loop pass, and goes out on the next pass like the
-// notification on macOS (the screens themselves are already up to date).
-- (void) _postScreenParametersChanged {
-    NSNotification *note = [NSNotification
-            notificationWithName: NSApplicationDidChangeScreenParametersNotification
-                          object: NSApp];
-    [[NSNotificationQueue defaultQueue] enqueueNotification: note
-                                               postingStyle: NSPostASAP
-                                               coalesceMask: NSNotificationCoalescingOnName |
-                                                             NSNotificationCoalescingOnSender
-                                                   forModes: nil];
+// Called when the displays changed, from any thread: the main monitor's rectangle is read again.
+- (void) _invalidateScreens {
+    [super _invalidateScreens];
+    _primaryRootFrameValid = NO;
 }
 
 // X11 has no scale event: the scale comes from the user's setting or the
-// session's GDK_SCALE (see -backingScale), so the places where it is looked at
-// again are the moments the display layout changes. When the value differs
-// from the one in use, the screens drop their cached frames and every window
+// session's GDK_SCALE (CoreGraphics reads them with the displays), so the places
+// where it is looked at again are the moments the display layout changes. When
+// the value differs from the one in use, the screens drop their cached frames and every window
 // keeps its size in points at the new scale, and learns of the change (which
 // posts NSWindowDidChangeBackingPropertiesNotification).
 - (void) reevaluateBackingScale {
@@ -386,13 +177,8 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer,
     if (newScale == oldScale)
         return;
 
-    [_lastScreens release];
-    _lastScreens = nil;
-    _primaryRootFrameValid = NO;
-    for (id window in [_windowsByID allValues]) {
-        if ([window isKindOfClass: [X11Window class]])
-            [window displayBackingScaleChangedFrom: oldScale];
-    }
+    [self _invalidateScreens];
+    // The windows follow the new scale in CoreGraphics, which tells them (see CGSToplevelEvent).
 }
 
 // The windows carry the application icon in _NET_WM_ICON: when the application sets another one,
@@ -408,10 +194,19 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer,
 
 // The main monitor's rectangle in root coordinates, device pixels: the origin
 // of the global coordinate space, as on macOS. With one monitor, or without
-// RandR, it is the root window.
+// RandR, it is the root window. It is the display CoreGraphics lists first,
+// which describes it in the window system's pixels.
 - (NSRect) primaryRootFrame {
-    if (!_primaryRootFrameValid)
-        [self screens];
+    if (!_primaryRootFrameValid) {
+        CGRect frame;
+
+        if (_CGSDisplayNativeFrame(CGMainDisplayID(), &frame))
+            _primaryRootFrame = NSMakeRect(frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
+        else
+            _primaryRootFrame = NSMakeRect(0, 0, DisplayWidth(_display, DefaultScreen(_display)),
+                                           DisplayHeight(_display, DefaultScreen(_display)));
+        _primaryRootFrameValid = YES;
+    }
     return _primaryRootFrame;
 }
 
@@ -430,360 +225,6 @@ static void beforeWaitingCallback(CFRunLoopObserverRef observer,
     X11Point point = X11CGPointFromRoot([self primaryFrameInPoints],
                                         (X11Point){root.x / scale, root.y / scale});
     return NSMakePoint(point.x, point.y);
-}
-
-- (NSArray *) rootScreenFallback {
-    int width = DisplayWidth(_display, DefaultScreen(_display));
-    int height = DisplayHeight(_display, DefaultScreen(_display));
-    _primaryRootFrame = NSMakeRect(0, 0, width, height);
-    _primaryRootFrameValid = YES;
-    CGFloat scale = [self backingScale];
-    NSRect frame = NSMakeRect(0, 0, width / scale, height / scale);
-    X11Screen *screen = [[[X11Screen alloc] initWithFrame: frame
-                                             visibleFrame: frame] autorelease];
-    screen->_x11Scale = scale;
-    [screen setCgDirectDisplayID: 1];
-    return [NSArray arrayWithObject: screen];
-}
-
-// [NSScreen screens] starts with the main monitor, as on macOS, and every
-// frame is relative to that monitor's origin. A display's CGDirectDisplayID
-// stays tied to its RandR output (index + 1), whatever its position in the
-// array, because the mode functions address the output by that index.
-- (NSArray *) screens {
-
-    NSArray* last = [_lastScreens retain];
-    if (last) {
-        return [last autorelease];
-    }
-
-    int count = 0, primary = -1;
-    X11Monitor *monitors = X11MonitorsCopy(_display, &count, &primary);
-    // A server that lists no output at all still has a root window; an empty
-    // screen list would make +[NSScreen mainScreen] throw.
-    if (monitors == NULL || count == 0) {
-        free(monitors);
-        return [self rootScreenFallback];
-    }
-
-    // Without any active output the root window stands in, like without RandR.
-    _primaryRootFrame =
-            primary >= 0
-                    ? NSMakeRect(monitors[primary].x, monitors[primary].y,
-                                 monitors[primary].width, monitors[primary].height)
-                    : NSMakeRect(0, 0, DisplayWidth(_display, DefaultScreen(_display)),
-                                 DisplayHeight(_display, DefaultScreen(_display)));
-    _primaryRootFrameValid = YES;
-    int *order = calloc(count > 0 ? (size_t) count : 1, sizeof *order);
-    if (order == NULL) {
-        free(monitors);
-        return [self rootScreenFallback];
-    }
-    X11MonitorsOrder(monitors, count, primary, order);
-
-    NSMutableArray<NSScreen *> *retval =
-            [NSMutableArray arrayWithCapacity: count];
-    Atom edidAtom = XInternAtom(_display, "EDID", FALSE);
-
-    for (int n = 0; n < count; n++) {
-        int i = order[n];
-
-        // An output without a CRTC and mode (a disconnected or switched-off
-        // connector) shows nothing, so it is not a screen.
-        if (!monitors[i].active)
-            continue;
-
-        // The frame is in Cocoa's global space, y up from the main
-        // monitor's bottom-left corner, like window frames.
-        CGFloat scale = [self backingScale];
-        X11Frame global = X11FrameFromRoot(
-                [self primaryFrameInPoints],
-                (X11Frame){monitors[i].x / scale, monitors[i].y / scale,
-                           monitors[i].width / scale,
-                           monitors[i].height / scale});
-        NSRect frame = NSMakeRect(global.x, global.y, global.width,
-                                  global.height);
-
-        X11Screen *nsscreen =
-                [[[X11Screen alloc] initWithFrame: frame
-                                     visibleFrame: frame] autorelease];
-        nsscreen->_x11Scale = scale;
-
-        Atom actualType;
-        unsigned long nitems, bytesAfter;
-        int actualFormat;
-        unsigned char *prop = NULL;
-
-        if (XRRGetOutputProperty(_display, monitors[i].output, edidAtom, 0,
-                                 100, FALSE, FALSE, AnyPropertyType,
-                                 &actualType, &actualFormat, &nitems,
-                                 &bytesAfter, &prop) == Success) {
-            if (prop && actualFormat == 8 && nitems > 0)
-                [nsscreen setEdid: [NSData dataWithBytes: prop
-                                                  length: nitems]];
-        }
-        if (prop)
-            XFree(prop);
-        [nsscreen setCgDirectDisplayID: X11MonitorDisplayID(i)];
-        [retval addObject: nsscreen];
-    }
-
-    free(order);
-    free(monitors);
-
-    if ([retval count] == 0)
-        return [self rootScreenFallback];
-
-    NSArray* array = [NSArray arrayWithArray: retval];
-    _lastScreens = [array retain];
-    return array;
-}
-
-// Width and Height are in points, like CGDisplayModeGetWidth/Height; the
-// PixelWidth/PixelHeight keys carry the mode's size in device pixels (the
-// RandR mode size), which the points are derived from with the backing scale.
-static NSDictionary *modeInfoToDictionary(const XRRModeInfo *mi, int depth,
-                                          CGFloat scale) {
-    double rate = 0;
-
-    if (mi->hTotal && mi->vTotal)
-        rate = (double) mi->dotClock /
-               ((double) mi->hTotal * (double) mi->vTotal);
-
-    return @{
-        @"Width" : @((unsigned) lround(mi->width / scale)),
-        @"Height" : @((unsigned) lround(mi->height / scale)),
-        @"Depth" : @(depth),
-        @"RefreshRate" : @(rate),
-        @"PixelWidth" : @(mi->width),
-        @"PixelHeight" : @(mi->height)
-    };
-}
-
-- (NSArray *) modesForScreen: (int) screenIndex {
-    int eventBase, errorBase;
-    const int defaultDepth =
-            XDefaultDepthOfScreen(XDefaultScreenOfDisplay(_display));
-
-    if (!XRRQueryExtension(_display, &eventBase, &errorBase)) {
-        Screen *defaultScreen = XDefaultScreenOfDisplay(_display);
-        CGFloat scale = [self backingScale];
-        return @[ @{
-            @"Width" : @((unsigned) lround(WidthOfScreen(defaultScreen) / scale)),
-            @"Height" : @((unsigned) lround(HeightOfScreen(defaultScreen) / scale)),
-            @"Depth" : @(defaultDepth),
-            @"PixelWidth" : @(WidthOfScreen(defaultScreen)),
-            @"PixelHeight" : @(HeightOfScreen(defaultScreen))
-        } ];
-    } else {
-        XRRScreenResources *screen = XRRGetScreenResourcesCurrent(
-                _display, DefaultRootWindow(_display));
-        if (screen == NULL)
-            return nil;
-
-        if (screenIndex < 0 || screenIndex >= screen->noutput) {
-            XRRFreeScreenResources(screen);
-            return nil;
-        }
-
-        XRROutputInfo *oinfo = XRRGetOutputInfo(_display, screen,
-                                                screen->outputs[screenIndex]);
-
-        NSMutableArray<NSDictionary *> *retval =
-                [NSMutableArray arrayWithCapacity: oinfo->nmode];
-
-        for (int i = 0; i < oinfo->nmode; i++) {
-            XRRModeInfo *mode = NULL;
-            for (int j = 0; j < screen->nmode; j++) {
-                if (screen->modes[j].id == oinfo->modes[i]) {
-                    mode = &screen->modes[j];
-                    break;
-                }
-            }
-
-            if (mode != NULL) {
-                NSDictionary *dict = modeInfoToDictionary(mode, defaultDepth, [self backingScale]);
-                [retval addObject: dict];
-            }
-        }
-
-        XRRFreeOutputInfo(oinfo);
-        XRRFreeScreenResources(screen);
-        return [NSArray arrayWithArray: retval];
-    }
-}
-
-static Bool isRandRLayoutEvent(Display *display, XEvent *event, XPointer arg) {
-    return X11RandRIsLayoutChange(event, *(int *) arg);
-}
-
-// Bounding box of the active CRTCs, in root coordinates, with the CRTC being
-// changed taken at its new size.
-static void crtcBoundingBox(Display *display, XRRScreenResources *resources, RRCrtc changed,
-                            int newWidth, int newHeight, int newX, int newY, int *width, int *height) {
-    int maxX = 0, maxY = 0;
-    for (int i = 0; i < resources->ncrtc; i++) {
-        int x, y, w, h;
-        if (resources->crtcs[i] == changed) {
-            x = newX; y = newY; w = newWidth; h = newHeight;
-        } else {
-            XRRCrtcInfo *info = XRRGetCrtcInfo(display, resources, resources->crtcs[i]);
-            if (info == NULL)
-                continue;
-            x = info->x; y = info->y;
-            w = info->width; h = info->height;
-            if (info->mode == None) {
-                XRRFreeCrtcInfo(info);
-                continue;
-            }
-            if (info->rotation & (RR_Rotate_90 | RR_Rotate_270)) {
-                int t = w; w = h; h = t;
-            }
-            XRRFreeCrtcInfo(info);
-        }
-        if (x + w > maxX) maxX = x + w;
-        if (y + h > maxY) maxY = y + h;
-    }
-    *width = maxX;
-    *height = maxY;
-}
-
-// Sets the CRTC that drives the output to the RandR mode of the same size and
-// refresh rate as mode (a dictionary from modesForScreen:), growing the
-// screen first when the new bounding box needs it and shrinking it to the
-// bounding box afterwards, as the desktop follows the mode on macOS.
-- (BOOL) setMode: (NSDictionary *) mode forScreen: (int) screenIndex {
-    int eventBase, errorBase;
-    if (mode == nil || !XRRQueryExtension(_display, &eventBase, &errorBase))
-        return NO;
-
-    Window root = DefaultRootWindow(_display);
-    XRRScreenResources *resources = XRRGetScreenResourcesCurrent(_display, root);
-    if (resources == NULL)
-        return NO;
-    if (screenIndex < 0 || screenIndex >= resources->noutput) {
-        XRRFreeScreenResources(resources);
-        return NO;
-    }
-    RROutput output = resources->outputs[screenIndex];
-    XRROutputInfo *oinfo = XRRGetOutputInfo(_display, resources, output);
-    XRRCrtcInfo *crtc = (oinfo && oinfo->crtc) ? XRRGetCrtcInfo(_display, resources, oinfo->crtc) : NULL;
-    BOOL ok = NO;
-
-    // The wanted RandR mode: one of the output's modes with the wanted size and the nearest rate.
-    RRMode wanted = None;
-    const XRRModeInfo *wantedInfo = NULL;
-    if (crtc != NULL) {
-        NSNumber *pw = [mode objectForKey: @"PixelWidth"], *ph = [mode objectForKey: @"PixelHeight"];
-        double rate = [[mode objectForKey: @"RefreshRate"] doubleValue], best = 0;
-        for (int i = 0; i < oinfo->nmode; i++) {
-            for (int j = 0; j < resources->nmode; j++) {
-                const XRRModeInfo *mi = &resources->modes[j];
-                if (mi->id != oinfo->modes[i])
-                    continue;
-                if (pw == nil || ph == nil || mi->width != [pw unsignedIntValue] || mi->height != [ph unsignedIntValue])
-                    break;
-                double r = (mi->hTotal && mi->vTotal)
-                        ? (double) mi->dotClock / ((double) mi->hTotal * mi->vTotal) : 0;
-                if (wanted == None || fabs(r - rate) < best) {
-                    wanted = mi->id;
-                    wantedInfo = mi;
-                    best = fabs(r - rate);
-                }
-                break;
-            }
-        }
-    }
-
-    if (wanted != None) {
-        BOOL turned = (crtc->rotation & (RR_Rotate_90 | RR_Rotate_270)) != 0;
-        int w = turned ? wantedInfo->height : wantedInfo->width;
-        int h = turned ? wantedInfo->width : wantedInfo->height;
-        int boxW, boxH, minW, minH, maxW, maxH;
-        crtcBoundingBox(_display, resources, oinfo->crtc, w, h, crtc->x, crtc->y, &boxW, &boxH);
-        int oldW = DisplayWidth(_display, DefaultScreen(_display));
-        int oldH = DisplayHeight(_display, DefaultScreen(_display));
-        if (boxW < 1) boxW = 1;
-        if (boxH < 1) boxH = 1;
-        BOOL sizeKnown = XRRGetScreenSizeRange(_display, root, &minW, &minH, &maxW, &maxH);
-        if (sizeKnown && (boxW < minW || boxH < minH || boxW > maxW || boxH > maxH)) {
-            wanted = None;
-        } else {
-            // Millimetres follow the pixel size at the current density.
-            int mmW = (int) lround((double) DisplayWidthMM(_display, DefaultScreen(_display)) * boxW / (oldW ? oldW : 1));
-            int mmH = (int) lround((double) DisplayHeightMM(_display, DefaultScreen(_display)) * boxH / (oldH ? oldH : 1));
-            if (boxW > oldW || boxH > oldH)
-                XRRSetScreenSize(_display, root, MAX(boxW, oldW), MAX(boxH, oldH),
-                                 MAX(mmW, 1), MAX(mmH, 1));
-            Status status = XRRSetCrtcConfig(_display, resources, oinfo->crtc, CurrentTime, crtc->x, crtc->y,
-                                             wanted, crtc->rotation, crtc->outputs, crtc->noutput);
-            ok = (status == RRSetConfigSuccess);
-            if (ok && (boxW < oldW || boxH < oldH))
-                XRRSetScreenSize(_display, root, boxW, boxH, MAX(mmW, 1), MAX(mmH, 1));
-            if (!ok && (boxW > oldW || boxH > oldH))
-                XRRSetScreenSize(_display, root, oldW, oldH,
-                                 DisplayWidthMM(_display, DefaultScreen(_display)),
-                                 DisplayHeightMM(_display, DefaultScreen(_display)));
-        }
-    }
-
-    if (crtc) XRRFreeCrtcInfo(crtc);
-    if (oinfo) XRRFreeOutputInfo(oinfo);
-    XRRFreeScreenResources(resources);
-
-    if (ok) {
-        // The callers read the screens right away, so apply the layout events
-        // now instead of when the event loop gets to them.
-        XSync(_display, False);
-        XEvent event;
-        int base = _rrEventBase;
-        while (XCheckIfEvent(_display, &event, isRandRLayoutEvent, (XPointer) &base))
-            X11RandRHandleLayoutChange(&event, _rrEventBase);
-        [self _invalidateRRCache];
-    }
-    return ok;
-}
-
-- (NSDictionary *) currentModeForScreen: (int) screenIndex {
-    int eventBase, errorBase;
-    NSDictionary *dict = @{};
-
-    if (XRRQueryExtension(_display, &eventBase, &errorBase)) {
-        XRRScreenResources *screen = XRRGetScreenResourcesCurrent(
-                _display, DefaultRootWindow(_display));
-        if (screen == NULL)
-            return dict;
-
-        if (screenIndex < 0 || screenIndex >= screen->noutput) {
-            XRRFreeScreenResources(screen);
-            return dict;
-        }
-
-        XRROutputInfo *oinfo = XRRGetOutputInfo(_display, screen,
-                                                screen->outputs[screenIndex]);
-
-        if (oinfo->crtc) {
-            XRRCrtcInfo *crtc = XRRGetCrtcInfo(_display, screen, oinfo->crtc);
-
-            for (int i = 0; i < screen->nmode; i++) {
-                if (screen->modes[i].id == crtc->mode) {
-                    const int defaultDepth = XDefaultDepthOfScreen(
-                            XDefaultScreenOfDisplay(_display));
-                    dict = modeInfoToDictionary(&screen->modes[i],
-                                                defaultDepth,
-                                                [self backingScale]);
-
-                    break;
-                }
-            }
-
-            XRRFreeCrtcInfo(crtc);
-        }
-
-        XRRFreeOutputInfo(oinfo);
-        XRRFreeScreenResources(screen);
-    }
-    return dict;
 }
 
 - (void) textInputCandidateRectChangedInWindow: (NSWindow *) window {
@@ -867,72 +308,71 @@ static void crtcBoundingBox(Display *display, XRRScreenResources *resources, RRC
     }
 }
 
-- (NSUInteger) currentModifierFlags {
-    XkbStateRec r;
-    if (XkbGetState(_display, XkbUseCoreKbd, &r) != Success)
-        return 0;
-
-    return [self modifierFlagsForState: r.mods];
-}
-
-- (NSUInteger) pressedMouseButtons {
-    Window root, child;
-    int rootX, rootY, winX, winY;
-    unsigned int mask = 0;
-
-    if (!XQueryPointer(_display, DefaultRootWindow(_display), &root, &child,
-                       &rootX, &rootY, &winX, &winY, &mask))
-        return 0;
-
-    // X numbers the buttons by position (1 left, 2 middle, 3 right); Cocoa
-    // numbers them 0 left, 1 right, 2 middle. The core protocol only reports
-    // the state of buttons 1 to 5, and 4 and 5 are the wheel.
-    NSUInteger buttons = 0;
-    if (mask & Button1Mask)
-        buttons |= 1 << 0;
-    if (mask & Button3Mask)
-        buttons |= 1 << 1;
-    if (mask & Button2Mask)
-        buttons |= 1 << 2;
-    return buttons;
-}
-
+// Drag and drop is CoreGraphics' (XDND on its connection); this is the manager on top of it.
 - (NSDraggingManager *) draggingManager {
-    return [X11DraggingManager sharedManager];
+    return [NSCGSDraggingManager sharedManager];
 }
 
-// Activating another process asks the window manager to activate its
-// frontmost window with an EWMH _NET_ACTIVE_WINDOW request, which CoreGraphics
-// makes (its window system layer owns the process-to-window mapping). The
-// window manager decides, and may refuse to steal focus; without one, nothing
-// can be activated. The current process is activated through its own windows
-// by NSApplication.
-- (BOOL) activateProcessIdentifier: (pid_t) processIdentifier {
-    if (processIdentifier <= 0 || processIdentifier == getpid() ||
-        !X11WindowManagerIsRunning(_display))
-        return NO;
-
-    return _CGSActivateProcess(processIdentifier,
-                               kCGSActivateProcessFrontWindowOnly) ==
-           kCGErrorSuccess;
+- (BOOL) usesPointerController {
+    return NO;
 }
 
-- (void) hideCursor {
-    if (!_blankCursor)
-        _blankCursor = [[X11Cursor alloc] initBlank];
-    [self setCursor: _blankCursor];
+- (void) hideCursorCounted {
+    CGDisplayHideCursor(kCGNullDirectDisplay);
 }
 
-- (void) unhideCursor {
-    NSCursor *current = [NSCursor currentCursor];
-    if (current != nil) {
-        [current push];
-        [current pop];
-    } else {
-        if (!_defaultCursor)
-            _defaultCursor = [[X11Cursor alloc] init];
-        [self setCursor: _defaultCursor];
+- (void) unhideCursorCounted {
+    CGDisplayShowCursor(kCGNullDirectDisplay);
+}
+
+- (void) forceShowCursor {
+    _cursorHiddenUntilMouseMoves = NO;
+    CGSForceShowCursor(CGSMainConnectionID());
+}
+
+// The window CoreGraphics grabs the pointer for while the mouse is disassociated from the cursor, unless a display
+// overlay is up: the key window, else the main, else the first visible, else the first window.
+- (unsigned long) nativeConnectionRelativeMouseWindow {
+    NSWindow *nswin = [NSApp keyWindow];
+    if (!nswin)
+        nswin = [NSApp mainWindow];
+    if (!nswin) {
+        NSArray *windows = [NSApp windows];
+        for (NSWindow *w in windows) {
+            if ([w isVisible]) {
+                nswin = w;
+                break;
+            }
+        }
+        if (!nswin && [windows count] > 0)
+            nswin = [windows objectAtIndex: 0];
     }
+    X11Window *xwin = (X11Window *) [nswin platformWindow];
+    return xwin ? (unsigned long) [xwin windowHandle] : 0;
+}
+
+// The grab was taken or released: a confinement grab was replaced, and the window's cursor position is where the
+// cursor froze (absolute motion after the release starts from there).
+// The pointer is held for the window of a menu that is being tracked (see -[CGSWindow setToplevelHoldsInputForMenu:]):
+// the grab replaced the confinement of the pointer, which is taken again when the menus are gone.
+- (void) nativeConnectionMenuGrabChanged: (BOOL) active {
+    if (active) {
+        _confinedWindow = None;
+        return;
+    }
+    [self updatePointerConfinement];
+}
+
+- (void) nativeConnectionRelativeMouseGrabChanged: (BOOL) active window: (unsigned long) window rootX: (int) x rootY: (int) y {
+    if (!active)
+        return;
+    _confinedWindow = None;
+    X11Window *xwin = (X11Window *) [self windowForID: (XID) window];
+    Window child;
+    int windowX, windowY;
+    if ([xwin isKindOfClass: [X11Window class]] &&
+        XTranslateCoordinates(_display, DefaultRootWindow(_display), (Window) window, x, y, &windowX, &windowY, &child))
+        [xwin setLastKnownCursorPosition: [xwin logicalPoint: NSMakePoint(windowX, windowY)]];
 }
 
 - (BOOL) cursorAwaitsPointerMotion {
@@ -963,161 +403,11 @@ static void crtcBoundingBox(Display *display, XRRScreenResources *resources, RRC
         [self selectPointerMotionOnWindows];
 }
 
-// Arrow, IBeam, HorizontalResize, VerticalResize
-- (id) cursorWithName: (NSString *) name {
-    unsigned int shape = XC_left_ptr;
-    const char *xname = "left_ptr";
-
-    if ([name isEqualToString: @"arrowCursor"])
-        xname = "left_ptr";
-    else if ([name isEqualToString: @"closedHandCursor"])
-        xname = "hand3";
-    else if ([name isEqualToString: @"crosshairCursor"])
-        xname = "crosshair";
-    // else if([name isEqualToString:@"disappearingItemCursor"])
-    // shape = XC_left_ptr;
-    else if ([name isEqualToString: @"IBeamCursor"])
-        xname = "xterm";
-    else if ([name isEqualToString: @"IBeamCursorForVerticalLayout"])
-        xname = "vertical-text";
-    else if ([name isEqualToString: @"zoomInCursor"])
-        xname = "zoom-in";
-    else if ([name isEqualToString: @"zoomOutCursor"])
-        xname = "zoom-out";
-    else if ([name isEqualToString: @"openHandCursor"])
-        xname = "fleur";
-    else if ([name isEqualToString: @"pointingHandCursor"])
-        xname = "hand";
-    else if ([name isEqualToString: @"resizeDownCursor"])
-        xname = "bottom_side";
-    else if ([name isEqualToString: @"resizeLeftCursor"])
-        xname = "left_side";
-    else if ([name isEqualToString: @"resizeLeftRightCursor"])
-        xname = "h_double_arrow";
-    else if ([name isEqualToString: @"resizeRightCursor"])
-        xname = "right_side";
-    else if ([name isEqualToString: @"resizeUpCursor"])
-        xname = "top_side";
-    else if ([name isEqualToString: @"resizeUpDownCursor"])
-        xname = "v_double_arrow";
-    else if ([name isEqualToString: @"frameResizeNorthWestCursor"])
-        xname = "top_left_corner";
-    else if ([name isEqualToString: @"frameResizeNorthEastCursor"])
-        xname = "top_right_corner";
-    else if ([name isEqualToString: @"frameResizeSouthEastCursor"])
-        xname = "bottom_right_corner";
-    else if ([name isEqualToString: @"frameResizeSouthWestCursor"])
-        xname = "bottom_left_corner";
-    else if ([name isEqualToString: @"frameResizeNorthWestSouthEastCursor"])
-        xname = "fd_double_arrow";
-    else if ([name isEqualToString: @"frameResizeNorthEastSouthWestCursor"])
-        xname = "bd_double_arrow";
-
-    return [[[X11Cursor alloc] initWithName: xname] autorelease];
-}
-
-- (id) cursorWithImage: (NSImage *) image hotSpot: (NSPoint) hotSpot {
-    return [[[X11Cursor alloc] initWithImage: image
-                                    hotPoint: hotSpot] autorelease];
-}
-
-- (void) setCursor: (id) cursor {
-    Cursor c = ((X11Cursor *) cursor).cursor;
-    Window root = DefaultRootWindow(_display);
-
-    // Define the cursor on the window the pointer is actually over. Defining it only on the
-    // key window left every other window with its own cursor, so moving between windows
-    // showed two pointers at once - the stale cursor of the window under the mouse plus the
-    // key window's cursor. XQueryPointer reports the child window under the pointer; fall
-    // back to the root (and the key window) when there is none, so the cursor always has a
-    // defined target.
-    Window child = None, returnedRoot = None, target = None;
-    int rx, ry, wx, wy;
-    unsigned int mask;
-    XQueryPointer(_display, root, &returnedRoot, &child, &rx, &ry, &wx, &wy, &mask);
-    target = child;
-
-    if (target == None) {
-        CGWindow *key = [[NSApp keyWindow] platformWindow];
-        if (key != nil)
-            target = [(X11Window *) key windowHandle];
-    }
-
-    XDefineCursor(_display, target != None ? target : root, c);
-    XSync(_display, False);
-    _cursorHidden = cursor != nil && cursor == _blankCursor;
-}
-
 - (void) beep {
     XBell(_display, 100);
 }
 
 
-
-- (BOOL) queryPointerRootX: (int *) x y: (int *) y state: (unsigned int *) state {
-    if (_pointerKnown) {
-        *x = _pointerRootX;
-        *y = _pointerRootY;
-        *state = _pointerState;
-        return YES;
-    }
-    // Not known from the event stream: ask the server, and again next time.
-    Window root, child;
-    int winX, winY;
-    return XQueryPointer(_display, DefaultRootWindow(_display), &root, &child,
-                         x, y, &winX, &winY, state);
-}
-
-// Tracks the pointer from the event stream, so that asking for the mouse
-// location, as applications do every frame, costs no round trip while the
-// pointer moves over our windows. Motion over other clients' windows is not
-// reported, which is why every event that can precede such motion forgets it.
-- (void) trackPointerForEvent: (XEvent *) ev {
-    switch (ev->type) {
-    case MotionNotify:
-        _pointerKnown = ev->xmotion.same_screen &&
-                ev->xmotion.root == DefaultRootWindow(_display);
-        _pointerRootX = ev->xmotion.x_root;
-        _pointerRootY = ev->xmotion.y_root;
-        _pointerState = ev->xmotion.state;
-        break;
-    case ButtonPress:
-    case ButtonRelease:
-    case KeyPress:
-    case KeyRelease:
-    case EnterNotify:
-    case LeaveNotify:
-    case FocusIn:
-    case FocusOut:
-    case KeymapNotify:
-        _pointerKnown = NO;
-        break;
-    default:
-        break;
-    }
-}
-
-- (NSPoint) mouseLocation {
-    int root_x = 0, root_y = 0;
-    unsigned int mask;
-
-    if (_relativeMouse.active) {
-        // The cursor is disassociated: report the frozen (virtual) position, as macOS does.
-        root_x = (int) _relativeMouse.virtualX;
-        root_y = (int) _relativeMouse.virtualY;
-    } else {
-        [self queryPointerRootX: &root_x y: &root_y state: &mask];
-    }
-    // Cocoa's global space, as +[NSEvent mouseLocation] reports on macOS: points,
-    // origin at the main monitor's bottom-left corner, y up, so the result can be
-    // compared with window and screen frames. CGEventGetLocation() reports the same
-    // point in CoreGraphics' y-down space (see CGSConnectionX11).
-    // -[X11Window mouseLocationOutsideOfEventStream] is window-local.
-    CGFloat scale = [self backingScale];
-    X11Point point = X11PointFromRoot([self primaryFrameInPoints],
-                                      (X11Point){root_x / scale, root_y / scale});
-    return NSMakePoint(point.x, point.y);
-}
 
 - (void) setWindow: (id) window forID: (XID) i {
     if (window)
@@ -1126,9 +416,6 @@ static void crtcBoundingBox(Display *display, XRRScreenResources *resources, RRC
                    forKey: [NSNumber
                                    numberWithUnsignedLong: (unsigned long) i]];
     else {
-        // A window replaced by another X window ends its pinch here, while it is still known and
-        // has its delegate; -[X11Window invalidate] ends it earlier.
-        [self cancelPinchOnWindow: i];
         [_windowsByID removeObjectForKey: [NSNumber numberWithUnsignedLong:
                                                             (unsigned long) i]];
 
@@ -1143,32 +430,30 @@ static void crtcBoundingBox(Display *display, XRRScreenResources *resources, RRC
         // The server released a grab on a window that became unviewable.
         if (_confinedWindow == i)
             _confinedWindow = None;
-        // The server released a grab on a destroyed window.
-        if (_relativeWindow == i)
-            [self suspendRelativeMouse];
+        // The pointer grab of the relative mouse (CoreGraphics') is released with the window.
+        _CGSNativeConnectionObjectDestroyed((void *) (uintptr_t) i);
     }
 }
 
-// The menu bar window is a dock that the window manager has to place at the top of the screen. Under a manager
-// that does not handle docks it would float over the windows of the application (see X11DockSupport.h), so
-// there the menu is outside the windows only when the desktop has a global menu, as on Wayland, and the
-// windows draw it themselves otherwise. -appMenu is not used: it asks +[NSWindow _usesInWindowMenuBar], which
-// is what is being answered.
-- (BOOL) _showsMainMenuOutsideWindows {
-    if (X11WindowManagerPlacesDocks(_display))
-        return YES;
-    if (_appMenu == nil)
-        _appMenu = [[X11AppMenu alloc] initWithDisplay: _display];
-    if ([_appMenu globalMenuPresent])
-        return YES;
-    [_appMenu release];
-    _appMenu = nil;
-    return NO;
+// Whether a registrar owns its name on the session bus. Asked with a throw-away exporter. -appMenu is not used: it asks
+// +[NSWindow _usesInWindowMenuBar], which is being answered.
+- (BOOL) _probeGlobalMenuRegistrar {
+    X11AppMenu *probe = [[X11AppMenu alloc] initWithDisplay: _display exporting: YES];
+    BOOL present = [probe globalMenuPresent];
+
+    [probe release];
+    return present;
 }
 
+// The menu is exported for the desktop's global menu unless the windows carry it as strips. The menu bar is
+// kept for the time no window carries a strip, where the window manager places it.
 - (X11AppMenu *) appMenu {
-    if (_appMenu == nil && ![NSWindow _usesInWindowMenuBar])
-        _appMenu = [[X11AppMenu alloc] initWithDisplay: _display];
+    if (_appMenu == nil) {
+        BOOL strips = [NSWindow _usesInWindowMenuBar];
+
+        if (!strips || _CGSNativeConnectionPlacesMenuBar())
+            _appMenu = [[X11AppMenu alloc] initWithDisplay: _display exporting: !strips];
+    }
     return _appMenu;
 }
 
@@ -1180,27 +465,9 @@ static void crtcBoundingBox(Display *display, XRRScreenResources *resources, RRC
     return [_windowsByID objectForKey: [NSNumber numberWithUnsignedLong: i]];
 }
 
-- (NSEvent *) nextEventMatchingMask: (NSUInteger) mask
-                          untilDate: (NSDate *) untilDate
-                             inMode: (NSRunLoopMode) mode
-                            dequeue: (BOOL) dequeue
-{
-#ifndef DARLING
-    [[NSRunLoop currentRunLoop] addInputSource: _inputSource forMode: mode];
-#else
+// Xlib may have read events into its own queue, which leaves the connection's descriptor quiet
+- (void) willWaitForEvents {
     [self processPendingEvents];
-#endif
-
-    NSEvent *result = [super nextEventMatchingMask: mask
-                                         untilDate: untilDate
-                                            inMode: mode
-                                           dequeue: dequeue];
-
-#ifndef DARLING
-    [[NSRunLoop currentRunLoop] removeInputSource: _inputSource forMode: mode];
-#endif
-
-    return result;
 }
 
 // With ControlKeyActsAsCommand set, Control+C, V and X (without Command or
@@ -1234,341 +501,16 @@ static void crtcBoundingBox(Display *display, XRRScreenResources *resources, RRC
     return ret;
 }
 
-// A modifier key reaches AppKit as an NSFlagsChanged and never as a key down or
-// up, so each modifier keysym is mapped to the virtual keycode the event must
-// carry and the X mask bit it drives. `toggle` marks the lock keys, whose press
-// flips the bit and whose release changes nothing. A carbon keycode of -1 means
-// the keysym is not a modifier at all.
-typedef struct {
-    int carbonKeyCode;
-    unsigned int xMask;
-    BOOL toggle;
-} X11ModifierKey;
-
-static X11ModifierKey modifierKeyForKeysym(KeySym keySym) {
-    X11ModifierKey notAModifier = {-1, 0, NO};
-    switch (keySym) {
-    case XK_Shift_L: return (X11ModifierKey){kVK_Shift, ShiftMask, NO};
-    case XK_Shift_R: return (X11ModifierKey){kVK_RightShift, ShiftMask, NO};
-    case XK_Control_L: return (X11ModifierKey){kVK_Control, ControlMask, NO};
-    case XK_Control_R: return (X11ModifierKey){kVK_RightControl, ControlMask, NO};
-    case XK_Alt_L: return (X11ModifierKey){kVK_Option, Mod1Mask, NO};
-    case XK_Alt_R: return (X11ModifierKey){kVK_RightOption, Mod1Mask, NO};
-    case XK_Super_L: case XK_Meta_L:
-        return (X11ModifierKey){kVK_Command, Mod4Mask, NO};
-    case XK_Super_R: case XK_Meta_R:
-        return (X11ModifierKey){0x36, Mod4Mask, NO};
-    case XK_ISO_Level3_Shift: case XK_Mode_switch:
-        return (X11ModifierKey){kVK_Function, Mod5Mask, NO};
-    case XK_Caps_Lock:
-        return (X11ModifierKey){kVK_CapsLock, LockMask, YES};
-    case XK_Num_Lock:
-        return (X11ModifierKey){kVK_ANSI_KeypadClear, Mod2Mask, NO};
-    default: return notAModifier;
-    }
-}
-
-// The X server fills `state` with the modifier and button state as it was
-// *before* the event, so the key's own contribution has to be applied to reach
-// the state the event leaves behind. Verified against an Xvfb server: a
-// Shift_L press carries state 0 and its release carries ShiftMask.
-static unsigned int x11StateAfterKeyEvent(const X11ModifierKey *key,
-                                          unsigned int state,
-                                          BOOL pressed) {
-    if (pressed)
-        return key->toggle ? (state ^ key->xMask) : (state | key->xMask);
-    if (key->toggle)
-        return state;
-    return state & ~key->xMask;
-}
-
-static BOOL isModifierKeyHeld(const unsigned char *held, unsigned int keycode) {
-    return keycode < 256 && (held[keycode / 8] & (1 << (keycode % 8)));
-}
-
-static void setModifierKeyHeld(unsigned char *held, unsigned int keycode, BOOL down) {
-    if (keycode >= 256)
-        return;
-    if (down)
-        held[keycode / 8] |= 1 << (keycode % 8);
-    else
-        held[keycode / 8] &= ~(1 << (keycode % 8));
-}
-
-// The X masks still driven by held modifier keys other than `keycode`. A key
-// event only carries the state from before it, so this is what tells whether
-// releasing one Shift key leaves Shift down because the other one is held.
-- (unsigned int) maskOfHeldModifierKeysExcept: (unsigned int) keycode {
-    unsigned int mask = 0;
-    for (unsigned int code = 0; code < 256; code++) {
-        if (code == keycode || !isModifierKeyHeld(_heldModifierKeys, code))
-            continue;
-        X11ModifierKey key = modifierKeyForKeysym(XKeycodeToKeysym(_display, code, 0));
-        if (key.carbonKeyCode >= 0 && !key.toggle)
-            mask |= key.xMask;
-    }
-    return mask;
-}
-
-// Cocoa has no event for "a modifier's aggregate changed without a key": the
-// same flagsChanged carries a sentinel keycode, which is what macOS sends when
-// a modifier is released while another app holds the focus and the next key
-// event is the first this process sees of the new mask.
-- (void) postFlagsChanged: (unsigned short) keyCode
-                    flags: (NSEventModifierFlags) flags
-                 inWindow: (X11Window *) window {
-    NSWindow *delegate = [window delegate];
-    if (delegate == nil)
-        return;
-    [self postEvent: [NSEvent keyEventWithType: NSFlagsChanged
-            location: [window mouseLocationOutsideOfEventStream]
-            modifierFlags: flags
-            timestamp: NSEventCurrentTime()
-            windowNumber: [delegate windowNumber]
-            context: nil
-            characters: @""
-            charactersIgnoringModifiers: @""
-            isARepeat: NO
-            keyCode: keyCode]
-             atStart: NO];
-}
-
-// Every input event carries the modifier state the server holds. A modifier
-// that went up while another client had the keyboard, or whose release a
-// compositor kept for itself, therefore shows up as a difference here, and
-// is reported the way macOS reports it, with a flagsChanged that names no key.
-- (void) resyncModifierFlagsWithState: (unsigned int) state
-                               window: (X11Window *) window {
-    NSEventModifierFlags flags = [self modifierFlagsForState: state];
-    if (flags == _modifierFlags)
-        return;
-
-    for (unsigned int code = 0; code < 256; code++) {
-        if (!isModifierKeyHeld(_heldModifierKeys, code))
-            continue;
-        X11ModifierKey key = modifierKeyForKeysym(XKeycodeToKeysym(_display, code, 0));
-        if (key.carbonKeyCode < 0 || !(state & key.xMask))
-            setModifierKeyHeld(_heldModifierKeys, code, NO);
-    }
-
-    _modifierFlags = flags;
-    [self postFlagsChanged: 0xFFFF flags: flags inWindow: window];
-}
-
-// Keys pressed or released while another client had the focus never reached
-// us, so on getting the focus back the held keys are read from the server.
-- (void) resyncModifierKeysOnFocusIn: (X11Window *) window {
-    char keys[32];
-    Window root, child;
-    int rootX, rootY, winX, winY;
-    unsigned int state;
-
-    XQueryKeymap(_display, keys);
-    for (unsigned int code = 0; code < 256; code++) {
-        BOOL down = (keys[code / 8] & (1 << (code % 8))) != 0;
-        X11ModifierKey key = modifierKeyForKeysym(XKeycodeToKeysym(_display, code, 0));
-        setModifierKeyHeld(_heldModifierKeys, code,
-                           down && key.carbonKeyCode >= 0 && !key.toggle);
-    }
-
-    if (XQueryPointer(_display, DefaultRootWindow(_display), &root, &child,
-                      &rootX, &rootY, &winX, &winY, &state))
-        [self resyncModifierFlagsWithState: state window: window];
-}
-
-// Cocoa groups clicks only within its double-click interval and four logical
-// points of the preceding press, and only for the same button in the same
-// window. Without the button and the window, a left click followed by a right
-// click inside the interval was reported as a double click; without the
-// distance, a click on a far side of a window was too. The X server's own
-// timestamp is used rather than the wall clock, which the client cannot
-// compare against a server that may be a different machine, and its unsigned
-// subtraction covers the 32-bit wrap.
-- (NSInteger) countClickForButton: (unsigned int) button
-                                  window: (XID) window
-                                   point: (NSPoint) point
-                                   time: (Time) time {
-    CGFloat dx = point.x - _lastClickPoint.x;
-    CGFloat dy = point.y - _lastClickPoint.y;
-    if (_lastClickWindow == window && _lastClickButton == button &&
-        (uint32_t) (time - _lastClickTime) < [self doubleClickInterval] * 1000 &&
-        dx * dx + dy * dy <= 16 && _clickCount < NSIntegerMax)
-        _clickCount++;
-    else
-        _clickCount = 1;
-    _lastClickTime = time;
-    _lastClickButton = button;
-    _lastClickWindow = window;
-    _lastClickPoint = point;
-    [_buttonClickCounts setObject: @(_clickCount) forKey: @(button)];
-    return _clickCount;
-}
-
-// Cocoa numbers the mouse buttons in press order from 0 (left), 1 (right) and
-// 2 for everything else, so an app reading +[NSEvent buttonNumber] for the
-// right button gets 3 and reads the middle button as the right one. X numbers
-// them by position instead: 1 left, 3 right, 2 middle.
-static NSInteger cocoaButtonNumber(unsigned int xButton) {
-    switch (xButton) {
-    case Button1: return 0;
-    case Button3: return 1;
-    case Button2: return 2;
-    default:
-        // X buttons 4 to 7 are the two wheels and never get here. The extra
-        // buttons start at 8 (back) and 9 (forward), which Cocoa numbers 3
-        // and 4, right after the middle button.
-        return xButton >= 8 ? (NSInteger) xButton - 5 : (NSInteger) xButton;
-    }
-}
-
-// Returns the window numbers of this app's windows, frontmost first, using the X server's stacking
-// order: XQueryTree lists the root's children bottom to top. Under a reparenting window manager our
-// top-level windows are children of frame windows, so each root child is matched against our windows
-// and their ancestors.
-static XErrorHandler previousOrderingErrorHandler;
-
-// Windows (for example a window manager's frame, when a window closes) can be destroyed while
-// -orderedWindowNumbers walks the tree. XQueryTree then fails with BadWindow, which isn't an error
-// there; any other error goes to the handler that was installed before.
-// The handler is swapped through the process-wide XSetErrorHandler and a file-scope variable, which
-// is safe only because the X connection and this method are used from the main thread alone.
-static int ignoreBadWindowWhileOrdering(Display *display, XErrorEvent *errorEvent) {
-    if (errorEvent->error_code == BadWindow)
-        return 0;
-    return previousOrderingErrorHandler ? previousOrderingErrorHandler(display, errorEvent) : 0;
-}
-
+// The window numbers of this app's windows, frontmost first, in the window system's stacking order (the order
+// CGWindowListCopyWindowInfo lists them in).
 - (NSArray *) orderedWindowNumbers {
-    NSMutableArray *result = [NSMutableArray array];
-    NSMutableDictionary *byTopLevel = [NSMutableDictionary dictionary];
-    Window root = DefaultRootWindow(_display);
-
-    XErrorHandler previousHandler = XSetErrorHandler(ignoreBadWindowWhileOrdering);
-    previousOrderingErrorHandler = previousHandler;
-    @try {
-        for (NSNumber *xid in _windowsByID) {
-            // X11Pasteboard registers its helper X window in the same map; it has no window number.
-            if (![_windowsByID[xid] isKindOfClass: [X11Window class]])
-                continue;
-            Window w = (Window) [xid unsignedLongValue];
-            Window rootRet, parent, *children = NULL;
-            unsigned int count;
-
-            // Walk up to the root's direct child that contains this window.
-            while (XQueryTree(_display, w, &rootRet, &parent, &children, &count)) {
-                if (children)
-                    XFree(children);
-                children = NULL;
-                if (parent == root || parent == None)
-                    break;
-                w = parent;
-            }
-            byTopLevel[@((unsigned long) w)] = _windowsByID[xid];
-        }
-
-        Window rootRet, parent, *children = NULL;
-        unsigned int count = 0;
-        if (XQueryTree(_display, root, &rootRet, &parent, &children, &count)) {
-            for (unsigned int i = count; i > 0; i--) {
-                id window = byTopLevel[@((unsigned long) children[i - 1])];
-                if (window != nil)
-                    [result addObject: @([window windowNumber])];
-            }
-            if (children)
-                XFree(children);
-        }
-    } @finally {
-        XSetErrorHandler(previousHandler);
-        previousOrderingErrorHandler = NULL;
+    // A window gets its number, and so its place in the registry that maps numbers back to windows, when it is
+    // first asked for it; the numbers CoreGraphics lists have to be known by then.
+    for (id window in [_windowsByID allValues]) {
+        if ([window isKindOfClass: [X11Window class]])
+            [window windowNumber];
     }
-
-    return result;
-}
-
-// An unmanaged window is above the frames that the window manager restacks around it, so the order
-// by window level (see X11LevelStacking.h) is made by moving the unmanaged windows, never the
-// managed ones. Called from the window code after it made its own request, and again when the window
-// manager has framed and mapped a window (ReparentNotify, MapNotify), because it stacks a new frame
-// by itself.
-- (void) restackWindowsForLevelsAround: (X11Window *) anchor {
-    if (![anchor takesPartInLevelStacking])
-        return;
-
-    XErrorHandler previousHandler = XSetErrorHandler(ignoreBadWindowWhileOrdering);
-    previousOrderingErrorHandler = previousHandler;
-    @try {
-        BOOL anchorUnmanaged = [anchor isUnmanaged];
-        Window anchorTop = X11TopLevelAncestor(_display, [anchor windowHandle]);
-
-        for (NSNumber *xid in [_windowsByID allKeys]) {
-            id candidate = _windowsByID[xid];
-            if (candidate == anchor || ![candidate isKindOfClass: [X11Window class]])
-                continue;
-            X11Window *other = candidate;
-            if (![other takesPartInLevelStacking])
-                continue;
-
-            if (anchorUnmanaged && [other isUnmanaged]) {
-                // Two override-redirect windows (the menu bar and a borderless window that cannot become
-                // key): the server stacks them in the order they were raised, so the level is applied here.
-                Window otherTop = X11TopLevelAncestor(_display, [other windowHandle]);
-                if (anchorTop == None || otherTop == None)
-                    continue;
-                if (X11UnmanagedBelowUnmanaged([anchor stackingLevel], [other stackingLevel]))
-                    X11StackBelowIfAbove(_display, anchorTop, otherTop);
-                else if (X11UnmanagedBelowUnmanaged([other stackingLevel], [anchor stackingLevel]))
-                    X11StackBelowIfAbove(_display, otherTop, anchorTop);
-                continue;
-            }
-            if ([other isUnmanaged] == anchorUnmanaged)
-                continue;
-
-            X11Window *unmanaged = anchorUnmanaged ? anchor : other;
-            X11Window *managed = anchorUnmanaged ? other : anchor;
-            Window otherTop = X11TopLevelAncestor(_display, [other windowHandle]);
-            Window unmanagedTop = anchorUnmanaged ? anchorTop : otherTop;
-            Window managedTop = anchorUnmanaged ? otherTop : anchorTop;
-            if (unmanagedTop == None || managedTop == None)
-                continue;
-            if (X11UnmanagedBelowManaged(anchorUnmanaged, [unmanaged stackingLevel], [managed stackingLevel]))
-                X11StackBelowIfAbove(_display, unmanagedTop, managedTop);
-            else if (!anchorUnmanaged && X11UnmanagedAboveManaged([unmanaged stackingLevel], [managed stackingLevel]))
-                X11StackAboveIfBelow(_display, unmanagedTop, managedTop);
-        }
-    } @finally {
-        XSetErrorHandler(previousHandler);
-        previousOrderingErrorHandler = NULL;
-    }
-}
-
-// Xlib names only the first five buttons. 6 and 7 are conventionally the
-// horizontal wheel, to the left and to the right.
-enum {
-    HorizontalScrollLeftButton = 6,
-    HorizontalScrollRightButton = 7,
-};
-// While relative mode is active the cursor is the virtual one, not wherever the
-// pointer physically is (it is put back under the cursor after each motion, but a
-// click can arrive in between). Returns NO when the server cannot translate.
-static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11RelativeMouse *mouse, NSPoint *point) {
-    Window child;
-    int winX, winY;
-    if (dpy == NULL || window == nil ||
-        !XTranslateCoordinates(dpy, DefaultRootWindow(dpy), [window windowHandle], (int) mouse->virtualX,
-                               (int) mouse->virtualY, &winX, &winY, &child))
-        return NO;
-    *point = [window logicalPoint: NSMakePoint(winX, winY)];
-    return YES;
-}
-
-// The Cocoa screen point (points, origin at the main monitor's bottom-left,
-// y up) of a root pixel position: where an event for a display overlay window
-// is located, as the window of such an event is nil.
-- (NSPoint) screenPointFromRootX: (double) x y: (double) y {
-    CGFloat scale = [self backingScale];
-    X11Point point = X11PointFromRoot([self primaryFrameInPoints],
-                                      (X11Point){x / scale, y / scale});
-    return NSMakePoint(point.x, point.y);
+    return _CGSOrderedToplevelWindowIDs();
 }
 
 // The window has the input focus: tell the NSWindow it is active, which makes it the key window unless
@@ -1588,618 +530,79 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
     if (window != nil)
         window->_receivingFocus = NO;
     lastFocusedWindow = delegate;
-    if (window != nil && window->_xic != NULL) {
-        XSetICFocus(window->_xic);
-        [window updateInputMethodSpot];
-    }
+    // The input method took the focus with the window system's (CoreGraphics gives it); it needs to know where
+    // the client's caret is.
+    [window updateInputMethodSpot];
 }
 
-// Whether the window is one of this process's own: an application window, or an overlay of the display.
-- (BOOL) isOwnWindowID: (Window) window {
-    return window != None && ([self windowForID: window] != nil ||
-                              [_overlayWindows containsObject: [NSNumber numberWithUnsignedLong: (unsigned long) window]]);
+// The window system's keyboard focus came to a window or left it (see kCGSToplevelEventFocusGained). Focus
+// changes caused by a grab, or by the pointer entering the window or one of its children, are not reported.
+- (void) window: (X11Window *) window focusChanged: (BOOL) gained {
+    id delegate = [window delegate];
+
+    if (gained) {
+        // The server can still report FocusIn (detail NotifyPointer) for a
+        // window we have unmapped; an ordered-out window must not become key.
+        if (window != nil && ![window isMapped])
+            return;
+        if ([delegate attachedSheet]) {
+            [[delegate attachedSheet] makeKeyAndOrderFront: delegate];
+            return;
+        }
+        [self windowHoldsFocus: window];
+        [self updatePointerConfinement];
+        return;
+    }
+
+    [delegate platformWindowDeactivated: window
+                checkForAppDeactivation: NO];
+    lastFocusedWindow = nil;
+    [self updatePointerConfinement];
 }
 
-// The window manager made a window of another client the active one: the application is no longer
-// active, even when none of its own windows ever held the focus and so no focus-out will tell it.
-- (void) noteActiveWindowOfAnotherClient {
-    Window active = X11OcclusionActiveWindow(_display);
-
-    if (active != None && ![self isOwnWindowID: active])
-        [NSApp _systemFocusMovedToAnotherClient];
-}
-
-// Marks the occlusion state for a new judgement when the event can change it. Returns YES for the
-// root window's and the watched foreign window's events, which nothing else is interested in.
-// A ConfigureNotify that repeats the geometry of the previous one for the same window changes
-// nothing, so it does not ask for a new judgement: a window manager may send one for every
-// request that leaves the geometry as it was.
-- (BOOL) noteOcclusionEvent: (XEvent *) ev window: (X11Window *) window {
-    Window target = ev->xany.window;
-    if (target == DefaultRootWindow(_display)) {
-        if (ev->type != PropertyNotify)
-            return NO; // RandR notifications
-        Atom atom = ev->xproperty.atom;
-        if (atom == XInternAtom(_display, "_NET_ACTIVE_WINDOW", False)) {
-            _occlusionActiveKnown = NO;
-            _occlusionDirty = YES;
-            [self noteActiveWindowOfAnotherClient];
-        } else if (atom == XInternAtom(_display, "_NET_CLIENT_LIST_STACKING", False)) {
-            _occlusionDirty = YES;
-        }
-        return YES;
-    }
-    if (window == nil) {
-        if (target == None || target != _occlusionWatchWindow)
-            return NO;
-        if (ev->type == DestroyNotify) {
-            _occlusionWatchWindow = None;
-            _occlusionActiveKnown = NO;
-        }
-        if (ev->type == ConfigureNotify) {
-            XConfigureEvent *c = &ev->xconfigure;
-            if (_occlusionWatchGeometryKnown && c->x == _occlusionWatchX && c->y == _occlusionWatchY &&
-                c->width == _occlusionWatchWidth && c->height == _occlusionWatchHeight)
-                return YES;
-            _occlusionWatchGeometryKnown = YES;
-            _occlusionWatchX = c->x;
-            _occlusionWatchY = c->y;
-            _occlusionWatchWidth = c->width;
-            _occlusionWatchHeight = c->height;
-        }
-        _occlusionCoverValid = NO;
-        _occlusionDirty = YES;
-        // A property deleted on that window may be the end of a transfer another part is waiting for.
-        return !(ev->type == PropertyNotify && ev->xproperty.state == PropertyDelete);
-    }
-    switch (ev->type) {
-    case MapNotify:
-    case UnmapNotify:
-        _occlusionDirty = YES;
-        break;
-    case ConfigureNotify:
-        if ([window noteConfigureGeometryChanged: &ev->xconfigure])
-            _occlusionDirty = YES;
-        break;
-    }
-    return NO;
-}
-
-// Judges every window of ours against the focused foreign window and tells the ones whose state changed.
-- (void) updateOcclusion {
-    _occlusionDirty = NO;
-    Window root = DefaultRootWindow(_display);
-
-    // The focused window and its geometry are read again only after an event that can change them.
-    if (!_occlusionActiveKnown) {
-        Window focused = X11OcclusionActiveWindow(_display);
-        // The application's own windows never cover each other here.
-        if ([self isOwnWindowID: focused])
-            focused = None;
-        _occlusionActive = focused;
-        _occlusionActiveKnown = YES;
-        _occlusionCoverValid = NO;
-        _occlusionWatchGeometryKnown = NO;
-    }
-    Window active = _occlusionActive;
-
-    // Watch the focused foreign window for size, fullscreen and unmap changes. Selecting input replaces
-    // this client's earlier selection on that window.
-    if (active != _occlusionWatchWindow) {
-        X11OcclusionStopWatching(_display, _occlusionWatchWindow, [self isOwnWindowID: _occlusionWatchWindow]);
-        _occlusionWatchWindow = active;
-        if (active != None)
-            XSelectInput(_display, active, StructureNotifyMask | PropertyChangeMask);
-    }
-
-    NSSet *windows = [NSSet setWithArray: [_windowsByID allValues]];
-    X11FullscreenRect cover = {0};
-    bool coverFullscreen = false, coverOpaque = false;
-    unsigned long *stack = NULL, stackCount = 0;
-    if (active != None && [windows count] > 0) {
-        if (!_occlusionCoverValid) {
-            X11FullscreenRect info = {0};
-            bool fullscreen = false, opaque = false;
-            _occlusionCoverOK = X11OcclusionCoverInfo(_display, active, &info, &fullscreen, &opaque);
-            _occlusionCoverX = info.x;
-            _occlusionCoverY = info.y;
-            _occlusionCoverWidth = info.width;
-            _occlusionCoverHeight = info.height;
-            _occlusionCoverFullscreen = fullscreen;
-            _occlusionCoverOpaque = opaque;
-            _occlusionCoverValid = YES;
-        }
-        cover = (X11FullscreenRect){_occlusionCoverX, _occlusionCoverY, _occlusionCoverWidth,
-                                    _occlusionCoverHeight};
-        coverFullscreen = _occlusionCoverFullscreen;
-        coverOpaque = _occlusionCoverOpaque;
-        if (_occlusionCoverOK && coverFullscreen && coverOpaque)
-            stack = X11OcclusionStackingList(_display, &stackCount);
-    }
-
-    for (X11Window *platform in windows) {
-        if (![platform isKindOfClass: [X11Window class]])
-            continue;
-        NSWindow *delegate = [platform delegate];
-        Window handle = [platform windowHandle];
-        BOOL occluded = NO;
-        if (stack != NULL && delegate != nil && handle != None) {
-            XWindowAttributes attributes;
-            Window child;
-            int x, y;
-            if (XGetWindowAttributes(_display, handle, &attributes) && attributes.map_state == IsViewable &&
-                XTranslateCoordinates(_display, handle, root, 0, 0, &x, &y, &child)) {
-                X11FullscreenRect own = {x, y, (unsigned int) attributes.width, (unsigned int) attributes.height};
-                occluded = X11OcclusionCovers(own, cover, coverFullscreen, coverOpaque,
-                                              X11OcclusionStackIndex(stack, stackCount, handle),
-                                              X11OcclusionStackIndex(stack, stackCount, active));
-            }
-        }
-        if (occluded == [platform isOccluded])
-            continue;
-        [platform setOccluded: occluded];
-        if ([delegate respondsToSelector: @selector(platformWindowOcclusionChanged:)])
-            [delegate platformWindowOcclusionChanged: platform];
-    }
-    if (stack != NULL)
-        XFree(stack);
+// The window system's input focus went to a window of another client: the application is no longer active, even
+// when none of its own windows ever held the focus and so no focus-out will tell it.
+- (void) nativeConnectionFocusMovedToAnotherClient {
+    [NSApp _systemFocusMovedToAnotherClient];
 }
 
 - (void) postXEvent: (XEvent *) ev {
     id event = nil;
     NSEventType type;
+    NSPoint pos;
     X11Window* window = (X11Window*) [self windowForID: ev->xany.window];
-
-    if ([self noteOcclusionEvent: ev window: window])
-        return;
-    // Pointer events of a display overlay have no window; they are located in
-    // screen coordinates.
-    BOOL overlay = window == nil &&
-            [_overlayWindows containsObject: @((unsigned long) ev->xany.window)];
 
     id delegate = [window delegate];
 
-    // Events another client sent carry whatever state it chose.
-    if (!ev->xany.send_event) {
-        switch (ev->type) {
-        case ButtonPress:
-        case ButtonRelease:
-            [self resyncModifierFlagsWithState: ev->xbutton.state window: window];
-            break;
-        case MotionNotify:
-            [self resyncModifierFlagsWithState: ev->xmotion.state window: window];
-            break;
-        case EnterNotify:
-        case LeaveNotify:
-            [self resyncModifierFlagsWithState: ev->xcrossing.state window: window];
-            break;
-        }
-    }
-    [self trackPointerForEvent: ev];
-
-    // Expected warp echoes are among the events queued when the warp was
-    // synced; motion ages them itself.
-    if (_relativeMouse.active && ev->type != MotionNotify)
-        X11RelativeMouseTick(&_relativeMouse);
-
     switch (ev->type) {
     case KeyPress:
-    case KeyRelease:;
-
-        // Xlib wants every event through XFilterEvent(), key events included, and an input method only sees
-        // a key that goes through it: one that is switched by a modifier alone (fcitx's Shift_L alternative
-        // trigger key, a pinyin engine's Shift) never hears of a modifier that is handled first.
-        BOOL filtered = XFilterEvent(ev, None) != False;
-
-        NSEventModifierFlags modifierFlags = [self modifierFlagsForState: ev->xkey.state];
-        char buf[20] = {0};
-        char *text = buf;
-        KeySym keySym = NoSymbol;
-        int strLen;
-
-        // A modifier is not text. One the input method took is left alone (X11KeyEvent.h): the unfiltered
-        // copy it forwards back updates the flags and is posted as a flagsChanged, and one it keeps is
-        // corrected by the modifier state of the next key or pointer event, with the keycode macOS uses when
-        // no single key is responsible.
-        {
-            BOOL pressed = ev->type == KeyPress;
-            unsigned int keycode = ev->xkey.keycode;
-            X11ModifierKey modifier = modifierKeyForKeysym(
-                    XKeycodeToKeysym(_display, keycode, 0));
-            X11KeyEventPlan plan = X11KeyEventPlanFor(modifier.carbonKeyCode >= 0, filtered,
-                                                      ev->xany.send_event);
-            if (modifier.carbonKeyCode >= 0) {
-                if (!plan.trackModifier)
-                    break;
-                // A lock key changes the state on its press only.
-                if (modifier.toggle && !pressed)
-                    break;
-                unsigned int after = x11StateAfterKeyEvent(&modifier, ev->xkey.state, pressed);
-                if (!modifier.toggle) {
-                    setModifierKeyHeld(_heldModifierKeys, keycode, pressed);
-                    // The other key of a pair keeps the mask down.
-                    if (!pressed)
-                        after |= [self maskOfHeldModifierKeysExcept: keycode] & modifier.xMask;
-                }
-                _modifierFlags = [self modifierFlagsForState: after];
-                [self postFlagsChanged: (unsigned short) modifier.carbonKeyCode
-                                 flags: _modifierFlags
-                              inWindow: window];
-                break; // Modifiers are neither text nor repeatable keys.
-            }
-            if (plan.resyncFromState)
-                [self resyncModifierFlagsWithState: ev->xkey.state window: window];
-            if (!plan.lookUpText)
-                break; // The input method took the key; what it commits comes back as another event.
-        }
-
-        // A window has no input context when the display couldn't open an input method or
-        // XCreateIC() failed, and Xutf8LookupString() dereferences its XIC unconditionally.
-        if (ev->type == KeyPress && window != nil && window->_xic != NULL) {
-            Status status;
-            strLen = Xutf8LookupString(window->_xic, (XKeyPressedEvent *) ev, buf, sizeof(buf) - 1, &keySym, &status);
-            if (status == XBufferOverflow) {
-                // Composed and input method text can be longer than buf. Nothing was copied and
-                // strLen is the size needed; Xlib says to repeat the lookup with a large enough buffer.
-                char *larger = malloc(strLen + 1);
-                if (larger != NULL) {
-                    text = larger;
-                    strLen = Xutf8LookupString(window->_xic, (XKeyPressedEvent *) ev, text, strLen, &keySym, &status);
-                }
-            }
-            // The text and keySym are only valid for the statuses that report them.
-            if (status != XLookupChars && status != XLookupBoth)
-                strLen = 0;
-            if (status != XLookupKeySym && status != XLookupBoth)
-                keySym = NoSymbol;
-            text[strLen] = 0;
-        } else {
-            // Xutf8LookupString() may not be used with KeyRelease
-            strLen = XLookupString((XKeyEvent*) ev, buf, sizeof(buf) - 1, &keySym, NULL);
-            buf[strLen] = 0;
-        }
-
-        // Shortcut characters ignore modifiers other than Shift.
-        KeySym shortcutKeySym = X11KeySymIgnoringModifiers(&ev->xkey);
-
-        // With ControlKeyActsAsCommand set, the copy, paste and cut shortcuts
-        // of other systems work as macOS's: Control+C, V and X, without
-        // Command or Option, arrive as Command+C, V and X, whose characters
-        // are the letters rather than control codes. Other Control
-        // combinations are left alone.
-        KeySym lower = shortcutKeySym;
-        if (lower >= XK_A && lower <= XK_Z)
-            lower += XK_a - XK_A;
-        if (lower < 0x100 && [self controlStandsInForCommand: modifierFlags
-                                                keyEquivalent: (unichar) lower]) {
-            modifierFlags = (modifierFlags & ~NSControlKeyMask) | NSCommandKeyMask;
-            if (text != buf)
-                free(text);
-            text = buf;
-            buf[0] = (char) shortcutKeySym;
-            buf[1] = 0;
-        }
-
-        // Arrow, function and editing keys produce no text; AppKit reports
-        // them as the NS*FunctionKey private-use characters, as macOS and the
-        // Wayland backend do.
-        if (text[0] == 0) {
-            uint32_t functionKey = CGSKeySymToUnicode(keySym != NoSymbol ? keySym : shortcutKeySym);
-            if (functionKey >= 0xF700 && functionKey <= 0xF8FF) {
-                unichar functionKeyChar = (unichar) functionKey;
-                id functionKeyStr = [[NSString alloc] initWithCharacters: &functionKeyChar length: 1];
-                if (text != buf)
-                    free(text);
-                text = buf;
-                [functionKeyStr getCString: buf maxLength: sizeof(buf) encoding: NSUTF8StringEncoding];
-                [functionKeyStr release];
-            }
-        }
-
-        id str = [[NSString alloc] initWithCString: text
-                                          encoding: NSUTF8StringEncoding];
-        if (text != buf)
-            free(text);
-        NSPoint pos =
-                [window logicalPoint: NSMakePoint(ev->xkey.x, ev->xkey.y)];
-
-        // The text above retains normal XIM/keyboard modifier behavior.
-        uint16_t shortcutCode = (uint16_t) CGSKeySymToUnicode(shortcutKeySym);
-        NSString* strIg = [NSString stringWithCharacters: &shortcutCode length: 1];
-
-        // If there's an app that uses constants from HIToolbox/Events.h (e.g.
-        // kVK_ANSI_A), this gives it a chance to work. x11ToCarbon is 256 wide
-        // and the protocol's keycode is 8 bits, but the field is a full word.
-        const int carbonKeyCode = ev->xkey.keycode < 256
-                ? x11ToCarbon[ev->xkey.keycode] : 0;
-
-        // Key events belong to the key window whichever window of the application holds the X focus.
-        // That matters when the key window is one with alpha 0, which does not get the focus once the
-        // window manager moves it to a window that was ordered in. Menus and pop-ups that hold the
-        // focus keep the keys.
-        NSInteger keyEventWindowNumber = [delegate windowNumber];
-        {
-            NSWindow *keyWindow = [NSApp keyWindow];
-            id keyPlatformWindow = [keyWindow platformWindow];
-            if (window != nil && ![window isMenuOrPopup] && keyPlatformWindow != window &&
-                [keyPlatformWindow isKindOfClass: [X11Window class]] && [keyPlatformWindow isMapped])
-                keyEventWindowNumber = [keyWindow windowNumber];
-        }
-
-        BOOL isARepeat = NO;
-
-        if (ev->type == KeyPress) {
-            isARepeat = _lastKeySym == keySym;
-            _lastKeySym = keySym;
-        } else {
-            _lastKeySym = 0;
-        }
-
-        id event = [NSEvent keyEventWithType: ev->type == KeyPress ? NSKeyDown
-                                                                   : NSKeyUp
-                                    location: pos
-                               modifierFlags: modifierFlags
-                                   timestamp: NSEventCurrentTime()
-                                windowNumber: keyEventWindowNumber
-                                     context: nil
-                                  characters: str
-                 charactersIgnoringModifiers: strIg
-                                   isARepeat: isARepeat
-                                     keyCode: carbonKeyCode];
-
-        [self postEvent: event atStart: NO];
-
-        [str release];
+    case KeyRelease:
+        // CoreGraphics decodes the keyboard and posts the keys as CGEvents (and the modifier state the
+        // pointer events carry); the NSEvents are made from those (-windowNumber:location:forKeyEvent:).
         break;
 
-    case ButtonPress:;
-        pos = overlay ? [self screenPointFromRootX: ev->xbutton.x_root
-                                                 y: ev->xbutton.y_root]
-                      : [window logicalPoint: NSMakePoint(ev->xbutton.x, ev->xbutton.y)];
-        if (_relativeMouse.active) {
-            if (overlay)
-                pos = [self screenPointFromRootX: _relativeMouse.virtualX
-                                               y: _relativeMouse.virtualY];
-            else
-                relativeEventPoint(_display, window, &_relativeMouse, &pos);
-        }
-
-        // A wheel notch arrives as a press/release pair and belongs to exactly
-        // one of them, or the notch scrolls twice. The press carries it: a
-        // release the client never sees (a grab, an unmap, focus lost while
-        // the button is held) then cannot swallow the scroll, and the press
-        // has already been accepted by the server when we get it. A notch is
-        // not a click, so it must not touch the click count either.
-        if (ev->xbutton.button >= Button4 &&
-            ev->xbutton.button <= HorizontalScrollRightButton) {
-            // Buttons 4 and 5 are the vertical wheel, 6 and 7 the horizontal
-            // one. -[NSView scrollWheel:] adds the delta to the document view's
-            // bounds origin, so a positive delta scrolls towards the larger
-            // coordinate on both axes: the up and right buttons are positive.
-            CGFloat deltaX = 0.0, deltaY = 0.0;
-            switch (ev->xbutton.button) {
-            case Button4: deltaY = 1.0; break;
-            case Button5: deltaY = -1.0; break;
-            case HorizontalScrollLeftButton: deltaX = -1.0; break;
-            case HorizontalScrollRightButton: deltaX = 1.0; break;
-            }
-            event = [NSEvent
-                    mouseEventWithType: NSScrollWheel
-                              location: pos
-                         modifierFlags: [self modifierFlagsForState: ev->xbutton
-                                                                             .state]
-                               window: delegate
-                           clickCount: 0
-                               deltaX: deltaX
-                               deltaY: deltaY];
-            [self postEvent: event atStart: NO];
-            break;
-        }
-
-        switch (ev->xbutton.button) {
-        case Button1:
-            type = NSLeftMouseDown;
-            break;
-        case Button3:
-            type = NSRightMouseDown;
-            break;
-        default:
-            type = NSOtherMouseDown;
-        }
-
-        event = [NSEvent
-                mouseEventWithType: type
-                          location: pos
-                     modifierFlags: [self modifierFlagsForState: ev->xbutton
-                                                                         .state]
-                            window: delegate
-                        clickCount: [self
-                                    countClickForButton: ev->xbutton.button
-                                                   window: ev->xany.window
-                                                    point: pos
-                                                    time: ev->xbutton.time]
-                            deltaX: 0.0
-                            deltaY: 0.0];
-        [(NSEvent_mouse *) event
-                _setButtonNumber: cocoaButtonNumber(ev->xbutton.button)];
-        // The window manager may focus the window for this very click, before
-        // or after the press reaches us; the press is judged by what we knew
-        // when it arrived, not by what the queue shows when it is taken.
-        [(NSEvent_mouse *) event _setWindowWasKeyOnArrival: [delegate isKeyWindow]];
-        [self postEvent: event atStart: NO];
+    case ButtonPress:
+    case ButtonRelease:
+        // CoreGraphics decodes the buttons and the wheel into CGEvents (click state, button number, flags,
+        // window), whichever window they are for; the NSEvents are made from those.
         break;
 
-    case ButtonRelease:;
-        // The wheel's other half of the pair; the press already scrolled.
-        if (ev->xbutton.button >= Button4 &&
-            ev->xbutton.button <= HorizontalScrollRightButton)
+    case MotionNotify: {
+        // CoreGraphics decoded the motion into a CGEvent (the deltas are added to the pointer's total when it is
+        // about to be posted, see -nativeConnectionWillPostPointerEvent:forXEvent:). What stays here is what
+        // depends on the windows: where the pointer is in the window, the cursor and the tracking areas.
+        [window setLastKnownCursorPosition:
+                        [window logicalPoint: NSMakePoint(ev->xmotion.x, ev->xmotion.y)]];
+        [self pointerMoved];
+        BOOL moved = !(ev->xmotion.state & (Button1Mask | Button2Mask | Button3Mask));
+        if (moved && ![delegate acceptsMouseMovedEvents])
             break;
-
-        pos = overlay ? [self screenPointFromRootX: ev->xbutton.x_root
-                                                 y: ev->xbutton.y_root]
-                      : [window logicalPoint: NSMakePoint(ev->xbutton.x, ev->xbutton.y)];
-        if (_relativeMouse.active) {
-            if (overlay)
-                pos = [self screenPointFromRootX: _relativeMouse.virtualX
-                                               y: _relativeMouse.virtualY];
-            else
-                relativeEventPoint(_display, window, &_relativeMouse, &pos);
-        }
-
-        // The up of a click reports the count its down was given, so that a
-        // double click's two downs are matched by their own ups. A release
-        // with no press behind it (the app attached mid-drag) is a single
-        // click: Cocoa never reports an up with a count of zero.
-        NSNumber *upCount = [_buttonClickCounts objectForKey: @(ev->xbutton.button)];
-        [_buttonClickCounts removeObjectForKey: @(ev->xbutton.button)];
-
-        switch (ev->xbutton.button) {
-        case Button1:
-            type = NSLeftMouseUp;
-            break;
-        case Button3:
-            type = NSRightMouseUp;
-            break;
-        default:
-            type = NSOtherMouseUp;
-        }
-
-        event = [NSEvent
-                mouseEventWithType: type
-                          location: pos
-                     modifierFlags: [self modifierFlagsForState: ev->xbutton
-                                                                         .state]
-                            window: delegate
-                        clickCount: upCount ? [upCount integerValue] : 1
-                            deltaX: 0.0
-                            deltaY: 0.0];
-        [(NSEvent_mouse *) event
-                _setButtonNumber: cocoaButtonNumber(ev->xbutton.button)];
-        [self postEvent: event atStart: NO];
+        [delegate platformWindowSetCursorEvent: window];
         break;
-
-    case MotionNotify:; {
-            // NSLog(@"MotionNotify, x=%d, y=%d, xroot=%d, yroot=%d\n",
-            // ev->xmotion.x, ev->xmotion.y, ev->xmotion.x_root,
-            // ev->xmotion.y_root);
-
-            CGPoint lastMotionPos = [window mouseLocationOutsideOfEventStream];
-            pos = overlay ? [self screenPointFromRootX: ev->xmotion.x_root
-                                                     y: ev->xmotion.y_root]
-                          : [window logicalPoint: NSMakePoint(ev->xmotion.x,
-                                                              ev->xmotion.y)];
-
-            CGFloat deltaX, deltaY;
-
-            if (_relativeMouse.active) {
-                // The cursor is disassociated: physical motion only produces
-                // deltas, the event reports the frozen cursor, and the pointer is
-                // put back under it where the server honours warps. A warp's own
-                // echo is not motion.
-                bool recorded;
-                X11RelativeMouseMotion relative = X11RelativeMouseMotionEvent(
-                        _display, &_relativeMouse, &ev->xmotion,
-                        [self warpsHonoured], &recorded);
-                // An echo that could not be recorded would be taken for input.
-                if (!recorded)
-                    [self suspendRelativeMouse];
-                if (!relative.post)
-                    break;
-                // Deltas are in points, like the absolute ones.
-                CGFloat deltaScale = overlay ? [self backingScale]
-                                             : [window backingScaleFactor];
-                deltaX = relative.deltaX / deltaScale;
-                deltaY = relative.deltaY / deltaScale;
-                // The window's origin in root coordinates is (x_root - x, y_root - y).
-                if (overlay)
-                    pos = [self screenPointFromRootX: _relativeMouse.virtualX
-                                                   y: _relativeMouse.virtualY];
-                else
-                    pos = [window logicalPoint: NSMakePoint(
-                            _relativeMouse.virtualX - (ev->xmotion.x_root - ev->xmotion.x),
-                            _relativeMouse.virtualY - (ev->xmotion.y_root - ev->xmotion.y))];
-            } else if (overlay) {
-                // Root pixels moved since the previous motion; y grows downwards.
-                CGFloat scale = [self backingScale];
-                deltaX = _overlayPointerKnown
-                        ? (ev->xmotion.x_root - _overlayPointerX) / scale : 0;
-                deltaY = _overlayPointerKnown
-                        ? (ev->xmotion.y_root - _overlayPointerY) / scale : 0;
-            } else {
-                // Mouse deltas are in screen orientation, y growing downwards
-                // (as CGEvent's kCGMouseEventDeltaY), while pos is window-local
-                // with y growing upwards; relative mode reports root deltas,
-                // which already grow downwards.
-                deltaX = pos.x - lastMotionPos.x;
-                deltaY = lastMotionPos.y - pos.y;
-            }
-            [window setLastKnownCursorPosition: pos];
-            if (overlay) {
-                _overlayPointerKnown = YES;
-                _overlayPointerX = ev->xmotion.x_root;
-                _overlayPointerY = ev->xmotion.y_root;
-            }
-            [self accumulateMouseDeltaX: deltaX y: deltaY];
-
-            // X11 numbers the right button 3 (Button3Mask); Button2Mask is
-            // the middle button, whose drags are other-mouse drags.
-            type = NSMouseMoved;
-
-            if (ev->xmotion.state & Button1Mask) {
-                type = NSLeftMouseDragged;
-            } else if (ev->xmotion.state & Button3Mask) {
-                type = NSRightMouseDragged;
-            } else if (ev->xmotion.state & Button2Mask) {
-                type = NSOtherMouseDragged;
-            }
-
-            // The pointer moved: a cursor hidden until then comes back, even
-            // when the application does not want the mouse-moved event.
-            [self pointerMoved];
-            if (type == NSMouseMoved && !overlay && ![delegate acceptsMouseMovedEvents])
-                break;
-
-            // Events the queue is about to drop in favour of this one carry
-            // deltas that are all the application gets in relative mode.
-            // Posting any motion discards every queued left drag (below), so
-            // those deltas move to this event whatever its type, and any
-            // moved or dragged event also replaces a directly preceding one
-            // of its type for the same window (-[NSDisplay postEvent:atStart:]).
-            if (_relativeMouse.active) {
-                [_eventQueueLock lock];
-                for (NSEvent *queued in _eventQueue) {
-                    BOOL dropped = [queued type] == NSLeftMouseDragged ||
-                            (queued == [_eventQueue lastObject] &&
-                             [NSEvent isMouseCoalescingEnabled] &&
-                             [queued type] == type &&
-                             [queued window] == delegate);
-                    if (dropped) {
-                        deltaX += [queued deltaX];
-                        deltaY += [queued deltaY];
-                    }
-                }
-                [_eventQueueLock unlock];
-            }
-
-            event = [NSEvent
-                    mouseEventWithType: type
-                              location: pos
-                         modifierFlags:
-                                 [self modifierFlagsForState: ev->xmotion.state]
-                                window: delegate
-                            clickCount: 1
-                                deltaX: deltaX
-                                deltaY: deltaY];
-            [self postEvent: event atStart: NO];
-            [self discardEventsMatchingMask: NSLeftMouseDraggedMask
-                                beforeEvent: event];
-
-            [delegate platformWindowSetCursorEvent: window];
-            break;
-        }
+    }
 
     case EnterNotify:
-        if (!_relativeMouse.active)
+        if (!_CGSNativeConnectionRelativeMouseState(NULL, NULL))
             [window setLastKnownCursorPosition:
                             [window logicalPoint: NSMakePoint(
                                                           ev->xcrossing.x,
@@ -2212,7 +615,7 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
         // exits for the areas the position is outside. A leave that comes with the pointer still inside the window's
         // rectangle (another window mapped over it) finds the areas still containing it and sends nothing. A pointer
         // on another screen has no usable position here.
-        if (window == nil || _relativeMouse.active || !ev->xcrossing.same_screen ||
+        if (window == nil || _CGSNativeConnectionRelativeMouseState(NULL, NULL) || !ev->xcrossing.same_screen ||
             !X11LeaveNotifyMeansPointerLeft(ev->xcrossing.mode, ev->xcrossing.detail))
             break;
         [window setLastKnownCursorPosition:
@@ -2222,72 +625,15 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
         break;
 
     case FocusIn:
-        // Focus changes caused by a grab, or by the pointer entering the
-        // window or one of its children, do not move the keyboard focus.
-        if (ev->xfocus.mode == NotifyGrab || ev->xfocus.mode == NotifyUngrab)
-            break;
-        if (ev->xfocus.detail == NotifyPointer ||
-            ev->xfocus.detail == NotifyPointerRoot ||
-            ev->xfocus.detail == NotifyInferior)
-            break;
-
-        // The server can still report FocusIn (detail NotifyPointer) for a
-        // window we have unmapped; an ordered-out window must not become key.
-        if (window != nil && ![window isMapped])
-            break;
-        if ([delegate attachedSheet]) {
-            [[delegate attachedSheet] makeKeyAndOrderFront: delegate];
-            break;
-        }
-        [self windowHoldsFocus: window];
-        [self resyncModifierKeysOnFocusIn: window];
-        // Losing the focus released the pointer grab; the application still
-        // wants relative mode.
-        if (_relativeRequested && !_relativeMouse.active)
-            [self beginRelativeMouse];
-        [self updatePointerConfinement];
-        break;
-
     case FocusOut:
-        if (ev->xfocus.mode == NotifyGrab || ev->xfocus.mode == NotifyUngrab)
-            break;
-        if (ev->xfocus.detail == NotifyPointer ||
-            ev->xfocus.detail == NotifyPointerRoot ||
-            ev->xfocus.detail == NotifyInferior)
-            break;
-
-        [delegate platformWindowDeactivated: window
-                    checkForAppDeactivation: NO];
-        lastFocusedWindow = nil;
-        // Give the pointer back to other clients; relative mode stays requested
-        // and resumes on FocusIn.
-        [self suspendRelativeMouse];
-        [self updatePointerConfinement];
-        // Unlike XSetICFocus(), XUnsetICFocus() doesn't accept a NULL XIC.
-        if (window != nil && window->_xic != NULL)
-            XUnsetICFocus(window->_xic);
+        // Told by the window system's window (see kCGSToplevelEventFocusGained).
         break;
 
     case KeymapNotify:
         break;
 
-    case Expose:;
-        // The exposed area is in device pixels from the top-left corner; the
-        // delegate takes points with y up.
-        CGFloat exposeScale = [window backingScaleFactor];
-        O2Rect rect = NSMakeRect(ev->xexpose.x / exposeScale,
-                                 ev->xexpose.y / exposeScale,
-                                 ev->xexpose.width / exposeScale,
-                                 ev->xexpose.height / exposeScale);
-
-        rect.origin.y =
-                [window frame].size.height - rect.origin.y - rect.size.height;
-        // The server sends one event per rectangle of an exposed area; the window is flushed
-        // and the delegate told once, for their union, after the last one.
-        if (![window addExposedRect: rect isLast: ev->xexpose.count == 0 exposedUnion: &rect])
-            break;
-        [window flushBuffer];
-        [delegate platformWindowExposed: window inRect: rect];
+    case Expose:
+        // Painting the window again is the window system's window's to report (see CGSToplevelEvent).
         break;
 
     case GraphicsExpose:
@@ -2303,7 +649,6 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
         break;
 
     case DestroyNotify:;
-        [self _overlayWindowDestroyed: ev->xany.window];
         // we should never get this message before the WM_DELETE_WINDOW
         // ClientNotify so normally, window should be nil here.
         [window invalidate];
@@ -2311,50 +656,21 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
 
     case UnmapNotify:
         // The server released a grab whose window became unviewable.
-        if (ev->xany.window == _relativeWindow)
-            [self suspendRelativeMouse];
         if (ev->xany.window == _confinedWindow)
             _confinedWindow = None;
         break;
 
     case MapNotify:
-        [window mapNotified];
         [self updatePointerConfinement];
         break;
 
     case MapRequest:
         break;
 
-    case ReparentNotify:
-        // A window manager frame has to point back at our window through XdndProxy
-        // before a drag source can find it under the pointer.
-        if ([window isKindOfClass: [X11Window class]]) {
-            [(X11DraggingManager *) [self draggingManager]
-                    windowReparented: (X11Window *) window
-                              intoParent: ev->xreparent.parent];
-            // A new frame is stacked by the window manager as it sees fit: put the
-            // unmanaged windows that are meant to be below it where they belong.
-            [(X11Window *) window restackForLevels];
-        }
+    case ConfigureNotify:
+        // The new frame of the window is the window system's window's to report (see CGSToplevelEvent).
+        [self updatePointerConfinement];
         break;
-
-    case ConfigureNotify:; {
-            // The server also sends a ConfigureNotify for a pure move, and for
-            // every pixel of a drag, so reporting a resize unconditionally
-            // posted NSWindowDidResizeNotification for all of them. NSWindow
-            // resizes its background view, resets the cursor rects and saves
-            // the frame on each of those, once per pixel of a drag.
-            if (_relativeMouse.active && ev->xconfigure.window == _relativeWindow)
-                [self resnapshotRelativeMouse];
-            O2Rect oldFrame = [window frame];
-            [window frameChanged];
-            O2Rect newFrame = [window frame];
-            [delegate platformWindow: window
-                        frameChanged: newFrame
-                             didSize: !NSEqualSizes(oldFrame.size, newFrame.size)];
-            [self updatePointerConfinement];
-            break;
-        }
 
     case ConfigureRequest:
         break;
@@ -2372,78 +688,26 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
         break;
 
     case PropertyNotify:
-        if ([window respondsToSelector: @selector(propertyNotify:)]) {
-            [window propertyNotify: &ev->xproperty];
-            // The window may have entered or left fullscreen.
+        // The window may have entered or left fullscreen (its _NET_WM_STATE is the window system's window's to
+        // report, see kCGSToplevelEventFullscreenChanged).
+        if ([window isKindOfClass: [X11Window class]])
             [self updatePointerConfinement];
-        } else if (window == nil) {
-            // An incremental transfer is paced by the receiver deleting the
-            // property, and that property lives on the receiver's window, which
-            // belongs to another client and so is not in the window map. The
-            // pasteboard that wrote it is the one waiting for the deletion.
-            [(X11DraggingManager *) [self draggingManager]
-                    handlePropertyChange: &ev->xproperty];
-        }
-        // An INCR transfer a pasteboard serves is paced by the requestor
-        // deleting a property on its own window, usually another client's,
-        // which therefore is not in the window map.
-        if (ev->xproperty.state == PropertyDelete &&
-            (window == nil || [window isKindOfClass: [X11Pasteboard class]]))
-            [X11Pasteboard dispatchPropertyNotify: &ev->xproperty];
         break;
 
-    case SelectionClear:
-        if ([window respondsToSelector: @selector(selectionClear:)]) {
-            [window selectionClear: &ev->xselectionclear];
-        }
-        break;
+    // The selections (the requests, replies and clears of the clipboard and of a drag's data, and the property
+    // changes that pace their transfers) are handled by CoreGraphics, which owns the connection.
 
-    case SelectionRequest:
-        if ([window respondsToSelector: @selector(selectionRequest:)]) {
-            [window selectionRequest: &ev->xselectionrequest];
-        }
-        break;
-
-    case SelectionNotify:
-        if ([window respondsToSelector: @selector(selectionNotify:)]) {
-            [window selectionNotify: &ev->xselection];
-        }
+    case ReparentNotify:
+        // A window manager reparenting a top-level window into its frame is tracked by CoreGraphics,
+        // which owns the connection; AppKit has nothing to do.
         break;
 
     case ColormapNotify:
         break;
 
     case ClientMessage:
-        // XDND is entirely ClientMessage traffic: XdndEnter, XdndPosition,
-        // XdndStatus, XdndDrop, XdndFinished and XdndLeave.
-        if (ev->xclient.format == 32) {
-            if ([window isKindOfClass: [X11Window class]]) {
-                [(X11DraggingManager *) [self draggingManager]
-                        handleXdndMessage: &ev->xclient
-                                     toWindow: (X11Window *) window];
-            } else if ([window isKindOfClass: [X11Pasteboard class]]) {
-                // A drag's source window is the helper window of the pasteboard
-                // that owns its selection, so the replies a target sends to the
-                // source arrive there rather than on one of our windows.
-                [(X11DraggingManager *) [self draggingManager]
-                        handleXdndSourceMessage: &ev->xclient];
-            }
-        }
-        if (ev->xclient.format == 32 &&
-            ev->xclient.data.l[0] ==
-                    XInternAtom(_display, "WM_DELETE_WINDOW", False)) {
-            [[NSRunLoop currentRunLoop] cancelPerformSelector: @selector(platformWindowWillClose:)
-                                                       target: delegate
-                                                     argument: window];
-            [[NSRunLoop currentRunLoop] performSelector: @selector(platformWindowWillClose:)
-                                                 target: delegate
-                                               argument: window
-                                                  order: 0
-                                                  modes: @[
-                                                        NSDefaultRunLoopMode, NSModalPanelRunLoopMode,
-                                                        NSEventTrackingRunLoopMode
-                                                    ]];
-        }
+        // XDND (drag and drop) is CoreGraphics', which owns the connection. The close request is the window
+        // system's window's to report (see CGSToplevelEvent).
         break;
 
     case MappingNotify:
@@ -2456,43 +720,128 @@ static BOOL relativeEventPoint(Display *dpy, X11Window *window, const X11Relativ
         break;
 
     case GenericEvent:
-        // events of other extensions are not used
-        X11TouchHandleEvent(self, ev);
+        // The events of XInput2 (touch screens, pinch gestures, smooth scrolling) are CoreGraphics', which
+        // decodes them into CGEvents; the events of other extensions are not used.
         break;
 
     default:
-        // RandR reports layout changes as plain extension events (see X11RandR.h).
-        if (X11RandRHandleLayoutChange(ev, _rrEventBase)) {
-            [self _invalidateRRCache];
-            break;
-        }
         NSLog(@"Unknown X11 event type %i", ev->type);
         break;
     }
 }
 
-#ifndef DARLING
-- (void) selectInputSource: (NSSelectInputSource *) inputSource
-               selectEvent: (NSUInteger) selectEvent
-{
-#else
-- (void) processPendingEvents {
-#endif
-    int numEvents;
+// CoreGraphics reads the connection and gives this display each event it did not handle itself (see
+// CGSNativeConnection.h); an event that was only read into Xlib's queue while a request waited for its
+// reply is still delivered, since CoreGraphics also reads before the run loop sleeps.
+- (void) nativeConnectionEvent: (void *) event {
+    XEvent *e = event;
 
-    while ((numEvents = XPending(_display)) > 0) {
-        XEvent e;
-        int error;
+    // The input method has seen it already: CoreGraphics runs it.
+    [self postXEvent: e];
+}
 
-        if ((error = XNextEvent(_display, &e)) != 0)
-            NSLog(@"XNextEvent returned %d", error);
-        else if (e.type != KeyPress && e.type != KeyRelease && XFilterEvent(&e, None))
-            continue; // An input method's reply (Xlib: every event goes through XFilterEvent()).
-        else
-            [self postXEvent: &e];
+// CoreGraphics decoded a pointer event and is about to post it. What AppKit knows when the event arrives is
+// added: whether a pressed button's window was the key window (the window manager may focus it for this very
+// click before or after the press reaches us, so the press is judged by what we knew at its arrival). A mouse
+// moved event for a window that did not ask for them goes to the event taps only (a display overlay has no window
+// and takes them all).
+- (BOOL) nativeConnectionWillPostPointerEvent: (CGEventRef) event forXEvent: (void *) xEvent {
+    XEvent *ev = (XEvent *) xEvent;
+    X11Window *window = (X11Window *) [self windowForID: ev->xany.window];
+    id delegate = [window delegate];
+
+    switch (CGEventGetType(event)) {
+    case kCGEventLeftMouseDown:
+    case kCGEventRightMouseDown:
+    case kCGEventOtherMouseDown:
+        CGEventSetIntegerValueField(event, kCGSMouseEventWindowKeyState, [delegate isKeyWindow] ? 1 : 2);
+        return YES;
+    case kCGEventMouseMoved:
+    case kCGEventLeftMouseDragged:
+    case kCGEventRightMouseDragged:
+    case kCGEventOtherMouseDragged:
+        return CGEventGetType(event) != kCGEventMouseMoved || window == nil || [delegate acceptsMouseMovedEvents];
+    default:
+        return YES;
     }
-    if (_occlusionDirty)
-        [self updateOcclusion];
+}
+
+// The window a pointer event is for and where the pointer was in it, from the X window and the position
+// CoreGraphics read from the server. They apply only while no event tap has moved the event.
+- (BOOL) windowNumber: (NSInteger *) windowNumber
+             location: (NSPoint *) location
+          hasLocation: (BOOL *) hasLocation
+      forPointerEvent: (CGEventRef) event {
+    Window native = (Window) CGEventGetIntegerValueField(event, kCGSEventNativeWindow);
+    X11Window *window = (X11Window *) [self windowForID: native];
+
+    if (![window isKindOfClass: [X11Window class]])
+        return NO;
+    *windowNumber = [[window delegate] windowNumber];
+    CGPoint global = CGEventGetLocation(event);
+    if (llround(global.x * 1024) == CGEventGetIntegerValueField(event, kCGSEventPostedLocationX) &&
+        llround(global.y * 1024) == CGEventGetIntegerValueField(event, kCGSEventPostedLocationY)) {
+        *location = [window logicalPoint: NSMakePoint(CGEventGetIntegerValueField(event, kCGSEventNativeLocationX),
+                                                      CGEventGetIntegerValueField(event, kCGSEventNativeLocationY))];
+        *hasLocation = YES;
+    }
+    return YES;
+}
+
+// The window a key event is for, and where the pointer is in it (the NSEvent made from a CGEvent of the
+// keyboard). Key events belong to the key window whichever window of the application holds the X focus.
+// That matters when the key window is one with alpha 0, which does not get the focus once the window manager
+// moves it to a window that was ordered in. Menus and pop-ups that hold the focus keep the keys.
+- (BOOL) windowNumber: (NSInteger *) windowNumber location: (NSPoint *) location forKeyEvent: (CGEventRef) event {
+    // An event the application or Carbon posted names no window: it is for the key window.
+    Window native = (Window) CGEventGetIntegerValueField(event, kCGSEventNativeWindow);
+    if (native == None)
+        return [super windowNumber: windowNumber location: location forKeyEvent: event];
+
+    // A window of a display overlay (or one that is gone) is no NSWindow: the event has no window.
+    X11Window *window = (X11Window *) [self windowForID: native];
+    if (![window isKindOfClass: [X11Window class]])
+        window = nil;
+    NSWindow *keyWindow = [NSApp keyWindow];
+    id keyPlatformWindow = [keyWindow platformWindow];
+    if (window != nil && ![window isMenuOrPopup] && keyPlatformWindow != window &&
+        [keyPlatformWindow isKindOfClass: [X11Window class]] && [keyPlatformWindow isMapped])
+        window = keyPlatformWindow;
+
+    *windowNumber = [[window delegate] windowNumber];
+    *location = window != nil ? [window mouseLocationOutsideOfEventStream] : NSZeroPoint;
+    return YES;
+}
+
+// ControlKeyActsAsCommand: the copy, paste and cut shortcuts of other systems work as macOS's. Control+C, V and
+// X, without Command or Option, arrive as Command+C, V and X, whose characters are the letters rather than
+// control codes. Other Control combinations are left alone.
+- (NSEvent *) keyEventCreated: (NSEvent *) event fromCGEvent: (CGEventRef) cgEvent {
+    if (!_controlActsAsCommand || ([event type] != NSKeyDown && [event type] != NSKeyUp))
+        return event;
+    NSString *letters = [event charactersIgnoringModifiers];
+    if ([letters length] != 1)
+        return event;
+    unichar key = [letters characterAtIndex: 0];
+    unichar lower = (key >= 'A' && key <= 'Z') ? key + ('a' - 'A') : key;
+    NSEventModifierFlags flags = [event modifierFlags];
+    if (lower >= 0x100 || ![self controlStandsInForCommand: flags keyEquivalent: lower])
+        return event;
+    return [NSEvent keyEventWithType: [event type]
+                            location: [event locationInWindow]
+                       modifierFlags: (flags & ~NSControlKeyMask) | NSCommandKeyMask
+                           timestamp: [event timestamp]
+                        windowNumber: [event windowNumber]
+                             context: nil
+                          characters: letters
+         charactersIgnoringModifiers: letters
+                           isARepeat: [event isARepeat]
+                             keyCode: [event keyCode]];
+}
+
+// Reads what the server has sent, now (CoreGraphics' pump; the events come back through the methods above).
+- (void) processPendingEvents {
+    _CGSProcessNativeConnectionEvents();
 }
 
 - (int) handleError: (XErrorEvent *) errorEvent {
@@ -2513,212 +862,6 @@ void CGNativeBorderFrameWidthsForStyle(NSUInteger styleMask, CGFloat *top,
     *right = 0.0;
 }
 
-- (CGRect) insetRect: (CGRect) frame
-        forNativeWindowBorderWithStyle: (NSUInteger) styleMask
-{
-    CGFloat top, left, bottom, right;
-
-    CGNativeBorderFrameWidthsForStyle(styleMask, &top, &left, &bottom, &right);
-
-    frame.origin.x += left;
-    frame.origin.y += bottom;
-    frame.size.width -= left + right;
-    frame.size.height -= top + bottom;
-
-    return frame;
-}
-
-- (CGRect) outsetRect: (CGRect) frame
-        forNativeWindowBorderWithStyle: (NSUInteger) styleMask
-{
-    CGFloat top, left, bottom, right;
-
-    CGNativeBorderFrameWidthsForStyle(styleMask, &top, &left, &bottom, &right);
-
-    frame.origin.x -= left;
-    frame.origin.y -= bottom;
-    frame.size.width += left + right;
-    frame.size.height += top + bottom;
-
-    return frame;
-}
-
-// Takes CoreGraphics global points (origin at the main monitor's top-left corner,
-// y down): CGWarpMouseCursorPosition hands its argument straight through, and on
-// macOS that API is documented in that space. Internal callers that hold a root
-// point convert it with -cgPointFromRoot:.
-//
-// The relative-mode state and Xlib are only used from the main thread (the one that
-// pumps X events), and CGWarpMouseCursorPosition may be called from any thread, so a
-// call from another thread is handed over. The warp produces no delta, so the caller
-// need not wait.
-- (void) warpMouse: (NSPoint) position {
-    if (![NSThread isMainThread]) {
-        [self performSelectorOnMainThread: @selector(warpMouseOnMainThread:)
-                               withObject: [NSValue valueWithPoint: position]
-                            waitUntilDone: NO];
-        return;
-    }
-    [self warpMouseOnMainThread: [NSValue valueWithPoint: position]];
-}
-
-- (void) warpMouseOnMainThread: (NSValue *) target {
-    NSPoint position = [target pointValue];
-    _pointerKnown = NO;
-    // The position is in points; X takes device pixels.
-    X11Point root = X11CGPointToRoot([self primaryFrameInPoints],
-                                     (X11Point){position.x, position.y});
-    CGFloat scale = [self backingScale];
-    int root_x = (int) round(root.x * scale);
-    int root_y = (int) round(root.y * scale);
-
-    if (_relativeMouse.active) {
-        // CGWarpMouseCursorPosition moves the disassociated cursor without
-        // producing a delta; the warp's echo is dropped.
-        if (!X11RelativeMouseApplicationWarp(_display, &_relativeMouse, root_x,
-                                             root_y, [self warpsHonoured]))
-            [self suspendRelativeMouse];
-        return;
-    }
-
-    XWarpPointer(_display, None, DefaultRootWindow(_display), 0, 0, 0, 0,
-                 root_x, root_y);
-    XSync(_display, False);
-    if (_relativeRequested) {
-        // Suspended (focus lost, retry pending): the next grab must resume at
-        // the application's target, not at the cursor frozen before.
-        _relativeResumeValid = YES;
-        _relativeResumeX = root_x;
-        _relativeResumeY = root_y;
-    }
-}
-
-- (BOOL) warpsHonoured {
-    return !_isXwayland || _cursorHidden;
-}
-
-// Takes the relative-mode pointer grab on the key (else main, else first
-// visible) window, starting the virtual cursor at the current pointer position.
-// Without the keyboard focus nothing is grabbed (a grab would take the pointer
-// from whichever client has it); FocusIn retries the preserved request.
-- (void) beginRelativeMouse {
-    // A display overlay covers the screen above every window, so it is the
-    // window the pointer is grabbed for while there is one.
-    X11Window *xwin = nil;
-    Window win = _overlayWindow;
-    if (win == None) {
-        NSWindow *nswin = [NSApp keyWindow];
-        if (!nswin)
-            nswin = [NSApp mainWindow];
-        if (!nswin) {
-            NSArray *windows = [NSApp windows];
-            for (NSWindow *w in windows) {
-                if ([w isVisible]) {
-                    nswin = w;
-                    break;
-                }
-            }
-            if (!nswin && [windows count] > 0)
-                nswin = [windows objectAtIndex: 0];
-        }
-
-        xwin = (X11Window *) [nswin platformWindow];
-        win = xwin ? [xwin windowHandle] : None;
-    }
-    if (win == None) {
-        NSLog(@"Relative mouse mode: no window to grab the pointer for\n");
-        return;
-    }
-    if (_relativeMouse.active && _relativeWindow == win)
-        return;
-    [self suspendRelativeMouse];
-    _pointerKnown = NO;
-
-    int result = X11RelativeMouseGrab(_display, &_relativeMouse, win,
-                                      [self warpsHonoured]);
-    if (result == X11_RELATIVE_MOUSE_NOT_FOCUSED)
-        return;
-    if (result != GrabSuccess) {
-        NSLog(@"XGrabPointer() failed with error %d for window %lu\n", result, win);
-        return;
-    }
-    NSLog(@"XGrabPointer() succeeded for window %lu\n", win);
-    _relativeWindow = win;
-    // The relative-mode grab replaced a confinement grab, if there was one.
-    _confinedWindow = None;
-    if (_relativeResumeValid) {
-        // The cursor stays where it froze, not where the pointer is now.
-        X11RelativeMouseRestoreCursor(&_relativeMouse, _relativeResumeX,
-                                      _relativeResumeY);
-        _relativeResumeValid = NO;
-    }
-
-    // Absolute motion after the release is measured from where the cursor froze.
-    Window child;
-    int windowX, windowY;
-    if (XTranslateCoordinates(_display, DefaultRootWindow(_display), win,
-                              (int) _relativeMouse.virtualX,
-                              (int) _relativeMouse.virtualY, &windowX, &windowY,
-                              &child))
-        [xwin setLastKnownCursorPosition:
-                        [xwin logicalPoint: NSMakePoint(windowX, windowY)]];
-}
-
-// A reconfiguration (the grab window moved or resized, the screen layout
-// changed) can move a confined pointer by itself and changes where it can go:
-// take a new snapshot and drop the old geometry's pending motion. The new grab
-// can fail while the window manager is mid-operation (AlreadyGrabbed, or the
-// focus check during a fullscreen transition) and FocusIn may never follow, so
-// a failure is retried for a while.
-- (void) resnapshotRelativeMouse {
-    if (!_relativeMouse.active)
-        return;
-    // Most RandR events (a backlight change, an output property) change
-    // nothing the grab depends on: skip the new grab unless the reachable
-    // rectangle moved.
-    X11RelativeMouseBounds bounds;
-    if (X11RelativeMouseWindowBounds(_display, _relativeWindow, &bounds) &&
-        bounds.minX == _relativeMouse.minX && bounds.minY == _relativeMouse.minY &&
-        bounds.maxX == _relativeMouse.maxX && bounds.maxY == _relativeMouse.maxY)
-        return;
-    [self suspendRelativeMouse];
-    [self beginRelativeMouse];
-    if (_relativeRequested && !_relativeMouse.active)
-        [self scheduleRelativeMouseRetry];
-}
-
-- (void) scheduleRelativeMouseRetry {
-    _relativeRetriesLeft = 10;
-    [NSObject cancelPreviousPerformRequestsWithTarget: self
-                                             selector: @selector(retryRelativeMouse)
-                                               object: nil];
-    [self performSelector: @selector(retryRelativeMouse)
-               withObject: nil
-               afterDelay: 0.1];
-}
-
-- (void) retryRelativeMouse {
-    if (!_relativeRequested || _relativeMouse.active)
-        return;
-    [self beginRelativeMouse];
-    if (_relativeRequested && !_relativeMouse.active && --_relativeRetriesLeft > 0)
-        [self performSelector: @selector(retryRelativeMouse)
-                   withObject: nil
-                   afterDelay: 0.1];
-}
-
-// Releases the grab without cancelling the request (focus loss, window gone).
-- (void) suspendRelativeMouse {
-    if (!_relativeMouse.active)
-        return;
-    _pointerKnown = NO;
-    _relativeResumeValid = YES;
-    _relativeResumeX = _relativeMouse.virtualX;
-    _relativeResumeY = _relativeMouse.virtualY;
-    X11RelativeMouseRelease(_display, &_relativeMouse);
-    _relativeWindow = None;
-}
-
 // With ConfinePointerToFullscreenWindows set, the pointer cannot leave the
 // window that has the keyboard focus while that window is fullscreen, so that
 // on a setup with several monitors it stays on the fullscreen window's one, as
@@ -2727,11 +870,13 @@ void CGNativeBorderFrameWidthsForStyle(NSUInteger styleMask, CGFloat *top,
 // taken and released as the focus, the fullscreen state and the mapping
 // change; relative mouse mode has its own grab, which takes precedence.
 - (void) updatePointerConfinement {
-    if (!_confinesPointer || _relativeMouse.active)
+    if (!_confinesPointer || _CGSNativeConnectionRelativeMouseState(NULL, NULL))
         return;
 
     Window target = None;
-    if (!_relativeRequested && lastFocusedWindow != nil) {
+    BOOL relativeRequested = NO;
+    _CGSNativeConnectionRelativeMouseState(&relativeRequested, NULL);
+    if (!relativeRequested && lastFocusedWindow != nil) {
         X11Window *window = (X11Window *) [lastFocusedWindow platformWindow];
         if ([window isKindOfClass: [X11Window class]] && [window isMapped] &&
             [window isFullscreen])
@@ -2757,74 +902,6 @@ void CGNativeBorderFrameWidthsForStyle(NSUInteger styleMask, CGFloat *top,
         if (result == GrabSuccess)
             _confinedWindow = target;
     }
-}
-
-// Holds the pointer for the application while a menu is open, on the newest
-// menu window. Relative mouse mode holds the pointer already; it is not
-// disturbed, an open menu then only sees the pointer inside its windows.
-- (void) grabPointerForMenus {
-    if ([_openMenuWindows count] == 0 || _relativeMouse.active)
-        return;
-    Window target = [(X11Window *) [_openMenuWindows lastObject] windowHandle];
-    if (target == None)
-        return;
-    // The grab replaces the confinement grab, if there was one.
-    _confinedWindow = None;
-    XGrabPointer(_display, target, True,
-                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
-                 GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
-}
-
-- (void) menuWindowMapped: (X11Window *) window {
-    if (_openMenuWindows == nil)
-        _openMenuWindows = [NSMutableArray new];
-    [_openMenuWindows removeObjectIdenticalTo: window];
-    [_openMenuWindows addObject: window];
-    [self grabPointerForMenus];
-}
-
-- (void) menuWindowUnmapped: (X11Window *) window {
-    if ([_openMenuWindows indexOfObjectIdenticalTo: window] == NSNotFound)
-        return;
-    [_openMenuWindows removeObjectIdenticalTo: window];
-    _pointerKnown = NO;
-    if ([_openMenuWindows count] > 0) {
-        [self grabPointerForMenus];
-        return;
-    }
-    if (!_relativeMouse.active)
-        XUngrabPointer(_display, CurrentTime);
-    [self updatePointerConfinement];
-}
-
-// CGAssociateMouseAndMouseCursorPosition(!doGrab).
-- (void) grabMouse: (BOOL) doGrab {
-    // Main thread only, like -warpMouse:.
-    if (![NSThread isMainThread]) {
-        [self performSelectorOnMainThread: @selector(grabMouseOnMainThread:)
-                               withObject: [NSNumber numberWithBool: doGrab]
-                            waitUntilDone: NO];
-        return;
-    }
-    [self grabMouseOnMainThread: [NSNumber numberWithBool: doGrab]];
-}
-
-- (void) grabMouseOnMainThread: (NSNumber *) wanted {
-    BOOL doGrab = [wanted boolValue];
-    if (doGrab) {
-        _relativeRequested = YES;
-        [self beginRelativeMouse];
-        // A failed first grab (AlreadyGrabbed while a window manager holds the
-        // pointer) is retried for a while, like one after a reconfiguration.
-        if (!_relativeMouse.active)
-            [self scheduleRelativeMouseRetry];
-    } else {
-        _relativeRequested = NO;
-        [self suspendRelativeMouse];
-        _relativeResumeValid = NO;
-        [self updatePointerConfinement];
-    }
-    XSync(_display, False);
 }
 
 @end

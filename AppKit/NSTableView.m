@@ -55,6 +55,7 @@ const CGFloat NSTableViewDefaultRowHeight = 17.0f;
 - (void) _sizeColumnToFit: (NSInteger) columnIndex;
 - (void) _moveColumn: (NSInteger) columnIndex toColumn: (NSInteger) newIndex notify: (BOOL) notify;
 - (void) _noteColumnDidMoveFrom: (NSInteger) oldIndex to: (NSInteger) newIndex;
+- (void) _sendActionForClickInHeaderOfColumn: (NSInteger) column clickCount: (NSInteger) clickCount;
 - (void) _recycleView: (NSView *) view;
 - (void) _recycleCellViewsOutsideRows: (NSRange) rows;
 - (NSView *) _cellViewAtColumn: (NSInteger) column row: (NSInteger) row make: (BOOL) make;
@@ -138,8 +139,28 @@ const CGFloat NSTableViewDefaultRowHeight = 17.0f;
     NSUnimplementedMethod();
 }
 
+// QUIRK: clickedRow and clickedColumn answer the click only while the click is being handled (the action and
+// double action messages); the click's end puts both back to -1, and a table that has not been clicked reports -1
+// too. Observed on macOS 26.7.3 (black-box, tier 2): the test below was run there and passes. The documentation of
+// clickedRow and clickedColumn says they are meaningful in the action and double-action methods and does not say
+// what they return afterwards.
+// Test: test_clicked_row_and_column_are_reset_after_the_click in tests/appkit-table-click-beside-columns.m.
+static void forgetClickedCell(NSTableView *table) {
+    NS_EXTRA(NSTableView, table)->_clickedColumn = -1;
+    NS_EXTRA(NSTableView, table)->_clickedRow = -1;
+}
+
+// The first click of a click sequence sends the action, the second the double action.
+static void sendClickAction(NSTableView *table, NSInteger clickCount) {
+    if (clickCount < 2)
+        [table sendAction: [table action] to: [table target]];
+    else if (clickCount == 2)
+        [table sendAction: [table doubleAction] to: [table target]];
+}
+
 - initWithCoder: (NSCoder *) coder {
     [super initWithCoder: coder];
+    forgetClickedCell(self);
 
     if ([coder allowsKeyedCoding]) {
         NSKeyedUnarchiver *keyed = (NSKeyedUnarchiver *) coder;
@@ -279,6 +300,7 @@ const CGFloat NSTableViewDefaultRowHeight = 17.0f;
 
 - initWithFrame: (NSRect) frame {
     [super initWithFrame: frame];
+    forgetClickedCell(self);
     NS_EXTRA(NSTableView, self)->_rowHeightsCount = 0;
     NS_EXTRA(NSTableView, self)->_rowHeights = NULL;
     _standardRowHeight = NSTableViewDefaultRowHeight;
@@ -645,17 +667,20 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
                             (long) column, 0, (unsigned long) [_tableColumns count]];
     }
 
-    rect.origin.x = 0.;
-    // QUIRK: the rectangle of a hidden column is an empty one at x 0, wherever the column is in the table; the
-    // documentation of isHidden does not say. Observed on macOS 26.7.3 and Mac OS X 10.14.4 (tier 2, the PR's test passes on both) and on 26.1 (arm64), probe 657.1: with 5 columns of
-    // widths 50, 60, 70, 80 and 90 "hidden=1 ... rectOfColumn x+w=[10+65 0+0 75+87 162+97 259+74]" and
-    // "hidden=4 ... [10+65 75+77 152+87 239+94 0+0]"; the probe printed x and width only, so y and height of
-    // that rectangle are unchanged here. The header rect and the cell frame of a hidden column agree
-    // (headerRect in 657.1, frameOfCellAtColumn:row: in probe 657.3).
+    // QUIRK: the rectangle of a hidden column is NSZeroRect, wherever the column is in the table: its y and
+    // height are 0 as well, not the height of the shown columns; the documentation of isHidden and of
+    // rectOfColumn: does not say. Observed on macOS 26.1 (arm64), 5 columns of 50 to 90 points: probe 657.R
+    // "hidden=4 ... column 4 -> HIDDEN ; rectOfColumn:={{0,0},{0,0}}" (the same for the hidden columns 0, 2,
+    // and 1 and 3), while a shown column gave "rectOfColumn:={{10,0},{65,172}}". The earlier observations (macOS
+    // 26.7.3, 10.14.4, probe 657.1) printed x and width only. The header rect of a hidden column keeps the
+    // header's height (probe 657.R "headerRectOfColumn:={{0,0},{0,28}}").
     // Test: tests/appkit-table-hidden-columns.m (test_rects_close_the_gap)
-    if (![[_tableColumns objectAtIndex: column] isHidden])
-        for (i = 0; i < column; i++)
-            rect.origin.x += [self _spaceTakenByColumn: [_tableColumns objectAtIndex: i]];
+    if ([[_tableColumns objectAtIndex: column] isHidden])
+        return NSZeroRect;
+
+    rect.origin.x = 0.;
+    for (i = 0; i < column; i++)
+        rect.origin.x += [self _spaceTakenByColumn: [_tableColumns objectAtIndex: i]];
     rect.origin.y = 0.;
 
     rect.size.width = [self _spaceTakenByColumn: [_tableColumns objectAtIndex: column]];
@@ -767,12 +792,16 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
         row >= [self numberOfRows])
         return NSZeroRect;
 
-    // QUIRK: x 0 for a hidden column, as in -rectOfColumn: (probe 657.3 "hidden=1 ... frameOfCellAtColumn:row:1
-    // -> 16+50 0+0 83+70 170+80 267+60").
+    // QUIRK: NSZeroRect for a hidden column, as in -rectOfColumn: (not x 0 and width 0 with the row's y and
+    // height). Observed on macOS 26.1 (arm64): probe 657.R "hidden=2 ... column 2 -> HIDDEN ;
+    // frameOfCellAtColumn:row:1={{0,0},{0,0}} ; frameOfCellAtColumn:row:0={{0,0},{0,0}}" while the shown
+    // cells of the same table gave "row:1={{16,29},{50,24}}".
+    if ([[_tableColumns objectAtIndex: column] isHidden])
+        return NSZeroRect;
+
     frame.origin.x = 0.;
-    if (![[_tableColumns objectAtIndex: column] isHidden])
-        for (i = 0; i < column; i++)
-            frame.origin.x += [self _spaceTakenByColumn: [_tableColumns objectAtIndex: i]];
+    for (i = 0; i < column; i++)
+        frame.origin.x += [self _spaceTakenByColumn: [_tableColumns objectAtIndex: i]];
 
     frame.origin.y = 0.;
     for (i = 0; i < row; i++)
@@ -799,7 +828,7 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     NSRect frame = [self _spacedFrameOfCellAtColumn: column row: row];
 
     if (NSIsEmptyRect(frame) || NSWidth(frame) <= 0)
-        return frame; // also the zero-width frame of a hidden column
+        return frame; // also the empty frame of a hidden column
     CGFloat insetX = floor(_intercellSpacing.width / 2), insetY = floor(_intercellSpacing.height / 2);
 
     frame.origin.x += insetX;
@@ -968,9 +997,25 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     [self setNeedsDisplay: YES];
 }
 
+// The row views of a view-based table follow the selection state of the table: they draw the highlight in the
+// style it has, and hand their cell views the interior background style that goes with it.
+- (void) _syncRowViewsEmphasisWithState: (BOOL) emphasized {
+    NSTableViewSelectionHighlightStyle style = [self selectionHighlightStyle];
+
+    for (NSTableRowView *rowView in [NS_EXTRA(NSTableView, self)->_rowViews allValues]) {
+        [rowView setEmphasized: emphasized];
+        [rowView setSelectionHighlightStyle: style];
+    }
+}
+
+- (void) _syncRowViewsEmphasis {
+    [self _syncRowViewsEmphasisWithState: [self _selectionIsEmphasized]];
+}
+
 - (void) setSelectionHighlightStyle: (NSTableViewSelectionHighlightStyle) value
 {
     NS_EXTRA(NSTableView, self)->_selectionHighlightStyle = value;
+    [self _syncRowViewsEmphasis];
     [self setNeedsDisplay: YES];
 }
 
@@ -1558,8 +1603,11 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     if (numberOfRows > 0) {
         size.width = [self rectOfRow: 0].size.width;
     }
+    // The height of the rows, as -rectOfColumn: gives it for a shown column; not read from the rectangle of
+    // column 0, which is NSZeroRect when that column is hidden.
     if ([_tableColumns count] > 0)
-        size.height = [self rectOfColumn: 0].size.height;
+        size.height = MAX(numberOfRows > 0 ? NSMaxY([self rectOfRow: numberOfRows - 1]) : 0.,
+                          [[self superview] bounds].size.height);
 
     // The table is at least as wide and as tall as its clip view, whatever its columns and rows add up to: observed
     // on macOS 26.7.3, where after -reloadData a table of 4 rows and 296 points of columns in a 400 by 300 point
@@ -1703,12 +1751,25 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 }
 
 - (void) _keyStateChanged: (NSNotification *) note {
+    [self _syncRowViewsEmphasis];
     [self setNeedsDisplay: YES];
 }
 
+// A click makes the table the first responder (NSControl answers with the selectability of its cell, which a table
+// does not have).
+- (BOOL) needsPanelToBecomeKey {
+    return YES;
+}
+
 - (BOOL) becomeFirstResponder {
-    [self setNeedsDisplay: YES];
-    return [super becomeFirstResponder];
+    BOOL accepted = [super becomeFirstResponder];
+
+    if (accepted) {
+        // The window has not recorded the new first responder yet.
+        [self _syncRowViewsEmphasisWithState: [[self window] isKeyWindow]];
+        [self setNeedsDisplay: YES];
+    }
+    return accepted;
 }
 
 // A table gives way to the field editor of the cell it edits. NSControl checks its selected cell while it has an
@@ -1717,7 +1778,12 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     [self setNeedsDisplay: YES];
     if (NS_EXTRA(NSControl, self)->_currentEditor != nil)
         return _editingCell == nil || [_editingCell hasValidObjectValue];
-    return [super resignFirstResponder];
+
+    BOOL resigned = [super resignFirstResponder];
+
+    if (resigned)
+        [self _syncRowViewsEmphasisWithState: NO];
+    return resigned;
 }
 
 - (void) drawHighlightedSelectionForColumn: (NSInteger) column
@@ -1761,6 +1827,8 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     }
 
     if ([dataCell respondsToSelector: @selector(setTextColor:)]) {
+        // A selected row keeps the normal text colour while its highlight is the grey, secondary one
+        // (selectedTextColor is the colour of selected text in a text view, not of a selected row).
         if ([self isRowSelected: row] ||
             [self isColumnSelected: columnNumber]) {
             [(NSTextFieldCell *) dataCell
@@ -1772,7 +1840,7 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
                                            NSTableViewSelectionHighlightStyleNone &&
                                    [self _selectionIsEmphasized])
                                           ? [NSColor alternateSelectedControlTextColor]
-                                          : [NSColor selectedTextColor]];
+                                          : [NSColor textColor]];
         } else
             [(NSTextFieldCell *) dataCell setTextColor: [NSColor textColor]];
     }
@@ -1863,16 +1931,35 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     }
 }
 
+static BOOL tableColorIsOpaque(NSColor *color) {
+    if (color == nil)
+        return NO;
+    NSColor *resolved = [(id)color _resolvedColor];
+    return resolved != nil && [resolved type] != NSColorTypePattern &&
+           [resolved alphaComponent] >= 1.0;
+}
+
+static void fillBackgroundRect(NSColor *color, NSRect rect) {
+    if (NSIsEmptyRect(rect))
+        return;
+    [color setFill];
+    if (tableColorIsOpaque(color))
+        NSRectFill(rect);
+    else
+        NSRectFillUsingOperation(rect, NSCompositeSourceOver);
+}
+
 - (void) drawBackgroundInClipRect: (NSRect) clipRect {
     NSArray *rowColors = [NSColor controlAlternatingRowBackgroundColors];
     NSInteger colorCount = [rowColors count];
 
     if (colorCount == 0 || !NS_EXTRA(NSTableView, self)->_alternatingRowBackground) {
-        [_backgroundColor setFill];
-        NSRectFill(clipRect);
+        if (_backgroundColor != nil) {
+            [_backgroundColor setFill];
+            NSRectFillUsingOperation(clipRect, NSCompositeSourceOver);
+        }
     } else if (colorCount == 1) {
-        [(NSColor *) [rowColors objectAtIndex: 0] setFill];
-        NSRectFill(clipRect);
+        fillBackgroundRect([rowColors objectAtIndex: 0], clipRect);
     } else {
         NSInteger numberOfRows = [self numberOfRows];
         NSRange rangeOfRows = [self rowsInRect: clipRect];
@@ -1883,8 +1970,8 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 
             rectToFill.origin.x = clipRect.origin.x;
             rectToFill.size.width = clipRect.size.width;
-            [(NSColor *) [rowColors objectAtIndex: i % colorCount] setFill];
-            NSRectFill(NSIntersectionRect(rectToFill, clipRect));
+            fillBackgroundRect([rowColors objectAtIndex: i % colorCount],
+                               NSIntersectionRect(rectToFill, clipRect));
         }
 
         // The stripes carry on below the last row at the height of a row, the colors
@@ -1903,8 +1990,8 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
             for (; y < NSMaxY(clipRect); y += pitch, index++) {
                 NSRect rectToFill = NSMakeRect(clipRect.origin.x, y, clipRect.size.width, pitch);
 
-                [(NSColor *) [rowColors objectAtIndex: index % colorCount] setFill];
-                NSRectFill(NSIntersectionRect(rectToFill, clipRect));
+                fillBackgroundRect([rowColors objectAtIndex: index % colorCount],
+                                   NSIntersectionRect(rectToFill, clipRect));
             }
         }
     }
@@ -2031,21 +2118,43 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     [self setNeedsDisplay: YES];
 }
 
-// Spreads delta over the columns in equal whole points, the points left over
-// going one each to the first columns.
+// Spreads delta over the shown columns in whole points. A round gives each column in turn the share delta / count
+// rounded to the nearest point (a column takes no more than what is left of delta), the last columns getting
+// less, and a column that reaches its minimum or maximum width takes no more in the next rounds; the part it
+// could not take is spread the same way over the columns that did take their share, until delta is used up, so
+// the widths change by exactly delta as long as some column has room. When the share rounds to nothing the
+// points left go one each to the first columns.
+// QUIRK: the documentation of NSTableViewUniformColumnAutoresizingStyle gives the equal distribution of the
+// space among all columns and nothing about limits or whole points. Evidence: black-box observation on macOS
+// 26.7.3 and 10.14.4 (tier 2, x86_64 and i386, mac-probes p790; the contributor's probe on 26.1 gave the same
+// structure): five columns of 50, 60, 70, 80 and 240 points (minimum width 20), the clip view 200 narrower:
+// 20 20 26 37 197; 203 narrower: 20 20 25 36 196; 100 narrower: 30 40 50 60 220; 307 narrower: 20 20 20 20 113;
+// five columns of 50 to 90 (maximum width 100) 103 wider: 75 84 94 100 100, with maximum width 1000:
+// 71 81 91 101 109; 53 narrower: 39 49 59 69 81.
+// Test: tests/appkit-table-column-autoresizing.m
 - (void) _resizeColumnsUniformlyBy: (CGFloat) delta {
-    NSArray *columns = [self _shownTableColumns];
-    NSInteger i, count = [columns count];
+    NSMutableArray *columns = [[[self _shownTableColumns] mutableCopy] autorelease];
 
-    if (count == 0)
-        return;
+    while ([columns count] > 0 && fabs(delta) >= 1) {
+        CGFloat sign = delta > 0 ? 1 : -1;
+        CGFloat share = round(delta / [columns count]);
+        NSMutableArray *remaining = [NSMutableArray arrayWithCapacity: [columns count]];
 
-    CGFloat share = floor(delta / count);
-    NSInteger extra = (NSInteger) (delta - share * count);
+        if (share == 0)
+            share = sign;
+        for (NSTableColumn *column in columns) {
+            if (fabs(delta) < 1)
+                break;
 
-    for (i = 0; i < count; ++i) {
-        NSTableColumn *column = [columns objectAtIndex: i];
-        [column setWidth: [column width] + share + (i < extra ? 1 : 0)];
+            CGFloat before = [column width];
+            CGFloat wanted = before + (fabs(share) < fabs(delta) ? share : delta);
+
+            [column setWidth: wanted];
+            delta -= [column width] - before;
+            if ([column width] == wanted)
+                [remaining addObject: column];
+        }
+        columns = remaining;
     }
 }
 
@@ -2101,6 +2210,28 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 
 - (BOOL) isFlipped {
     return YES;
+}
+
+- (BOOL) isOpaque {
+    if (NS_EXTRA(NSTableView, self)->_alternatingRowBackground) {
+        NSArray *rowColors = [NSColor controlAlternatingRowBackgroundColors];
+        NSUInteger count = [rowColors count];
+        if (count > 0) {
+            if (count > 1) {
+                NSInteger numberOfRows = [self numberOfRows];
+                CGFloat pitch = numberOfRows > 0 ? [self rectOfRow: 0].size.height
+                                                 : [self _effectiveRowHeight] + _intercellSpacing.height;
+                if (pitch <= 0.)
+                    return NO;
+            }
+            for (NSColor *color in rowColors) {
+                if (!tableColorIsOpaque(color))
+                    return NO;
+            }
+            return YES;
+        }
+    }
+    return tableColorIsOpaque(_backgroundColor);
 }
 
 - (BOOL) delegateShouldSelectTableColumn: (NSTableColumn *) tableColumn {
@@ -2419,10 +2550,24 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     NS_EXTRA(NSTableView, self)->_clickedRow = [self rowAtPoint: location];
 
     if (NS_EXTRA(NSTableView, self)->_clickedRow < 0) { // click beyond the end of the table
+        // QUIRK: a click below the last row still sends the action (the double action on a double click), and
+        // clickedColumn is -1 in it as well as clickedRow, even over column 0. The clickedRow documentation says
+        // -1 for a click where no rows are, and the clickedColumn documentation says -1 only where the point is not
+        // occupied by a column; the observed clickedColumn == -1 over column 0 contradicts that page, and the
+        // action send is not documented.
+        // Observed on macOS 26.1 (build 25B78) arm64 (probe 659, "below the last row, inside column 0"):
+        // `action(clickedRow=-1,clickedColumn=-1,selectedRow=-1)`, then on click count 2
+        // `doubleAction(clickedRow=-1,clickedColumn=-1,selectedRow=-1)`.
+        // Test: test_a_click_below_the_rows_sends_the_action in tests/appkit-table-click-beside-columns.m
+        // Both are reset first so that the delegate's selection and editing notifications below see -1 and -1 too.
+        forgetClickedCell(self);
         if (_editingCell != nil)
             [self _finishEditingWithTextMovement: NSIllegalTextMovement];
         [self selectRowIndexes: [NSIndexSet indexSet] byExtendingSelection: NO];
         [NS_EXTRA(NSTableView, self)->_selectedColumns removeAllObjects];
+
+        sendClickAction(self, [event clickCount]);
+        forgetClickedCell(self);
         return;
     }
 
@@ -2484,6 +2629,7 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
 
         [self setNeedsDisplay: YES];
 
+        forgetClickedCell(self);
         return;
     }
 
@@ -2491,8 +2637,10 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     // single click behavior
     if ([event clickCount] < 2) {
         if ([self delegateSelectionShouldChange] ==
-            NO) // provide delegate opportunity
+            NO) { // provide delegate opportunity
+            forgetClickedCell(self);
             return;
+        }
 
         if ([event modifierFlags] &
             NSAlternateKeyMask) {                    // extend/change selection
@@ -2651,10 +2799,18 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
     } else if ([event clickCount] == 2) {
         // nb this logic was backwards previously
 
-        id binder = [clickedColumnObject _binderForBinding: @"value"
-                                                    create: NO];
         BOOL interpretedAsEdit = NO;
-        if ([clickedColumnObject isEditable]) {
+        // The documentation of doubleAction (https://developer.apple.com/documentation/appkit/nstableview/doubleaction)
+        // says a double click on a cell sends the double action, and that a table without one begins editing the cell.
+        // QUIRK: with one set, a double click on an editable cell starts no edit; the documentation does not say
+        // whether the cell is edited as well. Observed on macOS 26.1 (build 25B78) arm64 with an editable column and a data source
+        // that implements setObjectValue: (probe 659, "editable columns; inside column 0, row 1 (control); click count
+        // 2": `action(clickedRow=1,clickedColumn=0,selectedRow=1)` then
+        // `doubleAction(clickedRow=1,clickedColumn=0,selectedRow=1)`, `editedRow=-1` at 0.1 s and at 0.5 s).
+        // Test: test_double_click_with_a_double_action_starts_no_edit in tests/appkit-table-click-beside-columns.m
+        if ([clickedColumnObject isEditable] && [self doubleAction] == NULL) {
+            id binder = [clickedColumnObject _binderForBinding: @"value"
+                                                        create: NO];
             if ([self dataSourceCanSetObjectValue] ||
                 [binder allowsEditingForRow: NS_EXTRA(NSTableView, self)->_clickedRow]) {
                 if (NS_EXTRA(NSTableView, self)->_clickedColumn != -1 && NS_EXTRA(NSTableView, self)->_clickedRow != -1) {
@@ -2672,6 +2828,16 @@ static CGFloat rowHeightAtIndex(NSTableView *self, NSInteger index) {
         if (!interpretedAsEdit)
             [self sendAction: [self doubleAction] to: [self target]];
     }
+    forgetClickedCell(self);
+}
+
+// A click on a column header that was not a column drag or a divider grab. The click is in no row, and the
+// action and double action read the column.
+- (void) _sendActionForClickInHeaderOfColumn: (NSInteger) column clickCount: (NSInteger) clickCount {
+    NS_EXTRA(NSTableView, self)->_clickedColumn = column;
+    NS_EXTRA(NSTableView, self)->_clickedRow = -1;
+    sendClickAction(self, clickCount);
+    forgetClickedCell(self);
 }
 
 // The width a column needs for its header and the contents of its cells.
@@ -3405,6 +3571,7 @@ static NSNumber *CellViewKey(NSInteger row, NSInteger column, BOOL group) {
     [rowView setFrame: frame];
     [rowView setGroupRowStyle: [self _isGroupRow: row]];
     [rowView setSelectionHighlightStyle: [self selectionHighlightStyle]];
+    [rowView setEmphasized: [self _selectionIsEmphasized]];
     [rowView setSelected: [self isRowSelected: row]];
     [NS_EXTRA(NSTableView, self)->_rowViews setObject: rowView forKey: key];
     [self addSubview: rowView];

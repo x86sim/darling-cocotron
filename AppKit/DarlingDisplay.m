@@ -19,6 +19,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
 #import "private-include/AppKit/DarlingDisplay.h"
 #import <AppKit/NSColor.h>
+#import <CoreGraphics/CoreGraphicsPrivate.h>
 #import <AppKit/NSApplication.h>
 #import <AppKit/NSGraphicsContext.h>
 #import <AppKit/NSImage.h>
@@ -30,6 +31,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 #import <AppKit/NSOpenPanel.h>
 #import <Onyx2D/O2Font_freetype.h>
 #import <fontconfig/fontconfig.h>
+
+@interface NSApplication (DarlingWindowIcon)
+// See NSApplication.m: the image the window-system backends use for window icons.
+- (NSImage *) _windowApplicationIconImage;
+@end
 
 void NSColorSetCatalogColor(NSColorListName catalogName, NSColorName colorName, NSColor *color);
 
@@ -54,7 +60,7 @@ void NSColorSetCatalogColor(NSColorListName catalogName, NSColorName colorName, 
     NSData *cached = [_applicationIconPixels objectForKey: key];
     if (cached != nil)
         return cached;
-    NSImage *image = [NSApp applicationIconImage];
+    NSImage *image = [NSApp _windowApplicationIconImage];
     if (image == nil || [image size].width <= 0 || [image size].height <= 0)
         return nil;
 
@@ -379,7 +385,7 @@ static int compareFontPatterns(const void *a, const void *b) {
 }
 
 - (CGFloat) doubleClickInterval {
-    return 1.0;
+    return _CGSDoubleClickInterval();
 }
 
 - (int) runModalPageLayoutWithPrintInfo: (NSPrintInfo *) printInfo {

@@ -18,6 +18,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
 #import <AppKit/NSWindow.h>
+#import <AppKit/NSDisplay.h>
 
 @class CGWindow;
 
@@ -33,6 +34,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 // window, or a resizable one in a program built against an SDK older than
 // 10.7 (see the QUIRK in NSWindow.m).
 - (BOOL) _hasTitlebarForStyleMask: (NSUInteger) styleMask;
+// The CGSToplevelTitlebarKind of the window, and telling the platform window of it.
+- (int) _titlebarKindForStyleMask: (NSUInteger) styleMask;
+- (void) _updatePlatformTitlebarKindForStyleMask: (NSUInteger) styleMask;
 // What the window is to the window system: a DarlingWindowPresentation (see
 // DarlingWindowPresentation.h), decided from the window's current state.
 - (int) _windowPresentation;
@@ -104,6 +108,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (void) sizeLimitsChanged;
 @end
 
+// Sent by NSWindow when the color space of its content changes.
+@interface NSObject (NSWindow_colorSpace)
+- (void) colorSpaceChanged;
+@end
+
 @interface NSApplication (NSApplication_private)
 // Posts NSApplicationDidChangeOcclusionStateNotification when -occlusionState changed.
 - (void) _updateOcclusionState;
@@ -118,6 +127,23 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 @interface NSWindow (NSStateRestoration)
 // Whether the window was closed and not ordered in since.
 - (BOOL) _isClosedForRestoration;
+// The name this window has in the window-system session. Setting it before the native window
+// exists takes effect when the native window is created. A restoring name is used only if it can
+// be sent before the first commit; backends fall back to adding a new session entry otherwise.
+- (void) _setSessionToplevelName: (NSString *) name restoring: (BOOL) restoring;
+- (NSString *) _sessionToplevelName;
+- (BOOL) _isRestoringSessionToplevel;
+@end
+
+@interface NSDisplay (NSSessionRestoration)
+// Starts the window-system session before restored windows are mapped. A backend without sessions
+// ignores this. The identifier is the one the compositor gave the previous session.
+- (void) beginWindowSessionWithReason: (NSUInteger) reason identifier: (NSString *) identifier;
+// The identifier of the current session, for saving with the application state; nil if none.
+- (NSString *) windowSessionIdentifier;
+// Whether the window system offers sessions. The marker file of a running application (see
+// NSStateRestoration.m) is only written and read where it does.
+- (BOOL) supportsWindowSessions;
 @end
 
 // Persistent window state restoration, in NSStateRestoration.m.
@@ -130,6 +156,11 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 - (void) _extendStateRestoration;
 - (void) _completeStateRestoration;
 - (BOOL) _restorableStateUsesSecureCoding;
+// A marker left while the application is running lets the next launch distinguish a clean
+// exit from a crash, and carries the session identifier when no saved state was written. It exists
+// only where the window system has sessions (-[NSDisplay supportsWindowSessions]).
+- (void) _writeWindowSessionMarkerWithIdentifier: (NSString *) identifier;
+- (void) _removeWindowSessionMarker;
 @end
 
 // Defined in NSView.m.

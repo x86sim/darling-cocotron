@@ -10,11 +10,14 @@
 #import <IOSurface/IOSurface.h>
 #import <Onyx2D/O2Image.h>
 #import "CAKeyedCoding.h"
+#import <QuartzCore/CATransactionPrivate.h>
 #import "CALayerInternal.h"
+#import "CAPresentationModifier.h"
 
 NSString *const kCAFilterLinear = @"linear";
 NSString *const kCAFilterNearest = @"nearest";
 NSString *const kCAFilterTrilinear = @"trilinear";
+NSString *const kCAFilterBox = @"box";
 
 NSString *const kCAGravityResizeAspect = @"resizeAspect";
 NSString *const kCAGravityResizeAspectFill = @"resizeAspectFill";
@@ -39,7 +42,14 @@ NSString *const kCATransition = @"transition";
 NSString *const kCAContentsFormatRGBA8Uint = @"RGBA8";
 NSString *const kCAContentsFormatRGBA16Float = @"RGBAh";
 NSString *const kCAContentsFormatGray8Uint = @"Gray8";
+NSString *const kCAContentsFormatA8 = @"A8";
 NSString *const kCAContentsFormatAutomatic = @"Automatic";
+
+NSString *const kCAContentsScalingRepeat = @"repeat";
+NSString *const kCAContentsScalingStretch = @"stretch";
+
+NSString *const kCALayerContentsSwizzleAAAA = @"AAAA";
+NSString *const kCALayerContentsSwizzleRGBA = @"RGBA";
 
 NSString *const CADynamicRangeAutomatic = @"automatic";
 NSString *const CADynamicRangeStandard = @"standard";
@@ -52,7 +62,7 @@ NSString *const CAToneMapModeIfSupported = @"ifSupported";
 
 @implementation CALayer
 
-+ layer {
++ (instancetype) layer {
     return [[[self alloc] init] autorelease];
 }
 
@@ -180,6 +190,7 @@ NSString *const CAToneMapModeIfSupported = @"ifSupported";
 
     CAAnimation *animation = [self animationForKey: @"position"];
 
+    [CATransaction _openImplicitTransactionIfNeeded];
     if (animation == nil && ![CATransaction disableActions]) {
         id<CAAction> action = [self actionForKey: @"position"];
 
@@ -200,6 +211,7 @@ NSString *const CAToneMapModeIfSupported = @"ifSupported";
 
     CAAnimation *animation = [self animationForKey: @"bounds"];
 
+    [CATransaction _openImplicitTransactionIfNeeded];
     if (animation == nil && ![CATransaction disableActions]) {
         id<CAAction> action = [self actionForKey: @"bounds"];
 
@@ -396,6 +408,7 @@ static BOOL CALayerTransformIsAffine(CATransform3D t) {
 
     CAAnimation *animation = [self animationForKey: @"opacity"];
 
+    [CATransaction _openImplicitTransactionIfNeeded];
     if (animation == nil && ![CATransaction disableActions]) {
         id<CAAction> action = [self actionForKey: @"opacity"];
 
@@ -407,6 +420,18 @@ static BOOL CALayerTransformIsAffine(CATransform3D t) {
 
 - (BOOL) isOpaque {
     return NS_EXTRA(CALayer, self)->_opaque;
+}
+
+// SPI. Whether the layer's contents are known to be fully opaque, a hint kept apart from
+// opaque. Observed on macOS 26.7.3: NO by default, independent of opaque in both directions,
+// readable through key-value coding, and without an implicit action. Darling's renderer does
+// not use the hint. Test: tests/quartzcore-contents-opaque.m.
+- (BOOL) contentsOpaque {
+    return NS_EXTRA(CALayer, self)->_contentsOpaque;
+}
+
+- (void) setContentsOpaque: (BOOL) value {
+    NS_EXTRA(CALayer, self)->_contentsOpaque = value;
 }
 
 - (void) setOpaque: (BOOL) value {
@@ -621,6 +646,14 @@ static BOOL contentsUnchanged(CALayer *layer, id value) {
     NS_EXTRA(CALayer, self)->_minificationFilter = kCAFilterLinear;
     NS_EXTRA(CALayer, self)->_magnificationFilter = kCAFilterLinear;
     NS_EXTRA(CALayer, self)->_animations = [[NSMutableDictionary alloc] init];
+    NS_EXTRA(CALayer, self)->_speed = 1;
+    NS_EXTRA(CALayer, self)->_fillMode = [kCAFillModeRemoved copy];
+    // QUIRK: a new layer has contentsSwizzle "RGBA", contentsScaling "stretch" and a white
+    // contentsMultiplyColor. These SPI properties are not documented. Evidence: black-box observation on
+    // macOS 26.7.3 (tier 2). Test: tests/quartzcore-swiftui-layer-spis.m
+    NS_EXTRA(CALayer, self)->_contentsSwizzle = [kCALayerContentsSwizzleRGBA copy];
+    NS_EXTRA(CALayer, self)->_contentsScaling = [kCAContentsScalingStretch copy];
+    NS_EXTRA(CALayer, self)->_contentsMultiplyColor = CGColorCreateGenericRGB(1, 1, 1, 1);
 }
 
 - init {
@@ -940,6 +973,7 @@ static BOOL isOpaqueBlack(CGColorRef color) {
         NS_EXTRA(CALayer, layer)->_superlayer = nil;
     [NS_EXTRA(CALayer, self)->_sublayers release];
     [NS_EXTRA(CALayer, self)->_name release];
+    [NS_EXTRA(CALayer, self)->_fillMode release];
     [NS_EXTRA(CALayer, self)->_layoutManager release];
     [NS_EXTRA(CALayer, self)->_constraints release];
     [NS_EXTRA(CALayer, self)->_animations release];
@@ -966,6 +1000,11 @@ static BOOL isOpaqueBlack(CGColorRef color) {
         CGColorRelease(NS_EXTRA(CALayer, self)->_borderColor);
     [NS_EXTRA(CALayer, self)->_contents release];
     [NS_EXTRA(CALayer, self)->_textureContents release];
+    [NS_EXTRA(CALayer, self)->_contentsSwizzle release];
+    [NS_EXTRA(CALayer, self)->_contentsScaling release];
+    if (NS_EXTRA(CALayer, self)->_contentsMultiplyColor)
+        CGColorRelease(NS_EXTRA(CALayer, self)->_contentsMultiplyColor);
+    [NS_EXTRA(CALayer, self)->_presentationModifiers release];
     NS_EXTRA_FREE(CALayer, self);
     [super dealloc];
 }
@@ -1598,6 +1637,108 @@ static CGRect applyToRect(CATransform3D m, CGRect rect) {
 - (CGRect) convertRect: (CGRect) rect toLayer: (CALayer *) layer {
     return applyToRect(transformBetweenLayers(self, layer), rect);
 }
+// CAMediaTiming: a layer's local time is (parent time - beginTime) * speed +
+// timeOffset, and the root layer's parent time is the absolute time
+// (CACurrentMediaTime). A layer whose speed is 0 holds its local time at
+// timeOffset, so its parent's time for it is taken to be its beginTime.
+static CFTimeInterval localTimeToParent(CALayer *layer, CFTimeInterval time) {
+    float speed = NS_EXTRA(CALayer, layer)->_speed;
+    CFTimeInterval begin = NS_EXTRA(CALayer, layer)->_beginTime;
+    if (speed == 0)
+        return begin;
+    return (time - NS_EXTRA(CALayer, layer)->_timeOffset) / speed + begin;
+}
+
+static CFTimeInterval parentTimeToLocal(CALayer *layer, CFTimeInterval time) {
+    return (time - NS_EXTRA(CALayer, layer)->_beginTime) * NS_EXTRA(CALayer, layer)->_speed
+        + NS_EXTRA(CALayer, layer)->_timeOffset;
+}
+
+static CFTimeInterval absoluteTimeFromLayer(CALayer *layer, CFTimeInterval time) {
+    for (; layer != nil; layer = NS_EXTRA(CALayer, layer)->_superlayer)
+        time = localTimeToParent(layer, time);
+    return time;
+}
+
+static CFTimeInterval layerTimeFromAbsolute(CALayer *layer, CFTimeInterval time) {
+    if (layer == nil)
+        return time;
+    return parentTimeToLocal(layer, layerTimeFromAbsolute(NS_EXTRA(CALayer, layer)->_superlayer, time));
+}
+
+- (CFTimeInterval) convertTime: (CFTimeInterval) time fromLayer: (CALayer *) layer {
+    return layerTimeFromAbsolute(self, absoluteTimeFromLayer(layer, time));
+}
+
+- (CFTimeInterval) convertTime: (CFTimeInterval) time toLayer: (CALayer *) layer {
+    return layerTimeFromAbsolute(layer, absoluteTimeFromLayer(self, time));
+}
+
+- (CFTimeInterval) beginTime {
+    return NS_EXTRA(CALayer, self)->_beginTime;
+}
+
+- (void) setBeginTime: (CFTimeInterval) value {
+    NS_EXTRA(CALayer, self)->_beginTime = value;
+}
+
+- (CFTimeInterval) duration {
+    return NS_EXTRA(CALayer, self)->_duration;
+}
+
+- (void) setDuration: (CFTimeInterval) value {
+    NS_EXTRA(CALayer, self)->_duration = value;
+}
+
+- (CFTimeInterval) timeOffset {
+    return NS_EXTRA(CALayer, self)->_timeOffset;
+}
+
+- (void) setTimeOffset: (CFTimeInterval) value {
+    NS_EXTRA(CALayer, self)->_timeOffset = value;
+}
+
+- (CFTimeInterval) repeatDuration {
+    return NS_EXTRA(CALayer, self)->_repeatDuration;
+}
+
+- (void) setRepeatDuration: (CFTimeInterval) value {
+    NS_EXTRA(CALayer, self)->_repeatDuration = value;
+}
+
+- (float) speed {
+    return NS_EXTRA(CALayer, self)->_speed;
+}
+
+- (void) setSpeed: (float) value {
+    NS_EXTRA(CALayer, self)->_speed = value;
+}
+
+- (float) repeatCount {
+    return NS_EXTRA(CALayer, self)->_repeatCount;
+}
+
+- (void) setRepeatCount: (float) value {
+    NS_EXTRA(CALayer, self)->_repeatCount = value;
+}
+
+- (BOOL) autoreverses {
+    return NS_EXTRA(CALayer, self)->_autoreverses;
+}
+
+- (void) setAutoreverses: (BOOL) value {
+    NS_EXTRA(CALayer, self)->_autoreverses = value;
+}
+
+- (CAMediaTimingFillMode) fillMode {
+    return NS_EXTRA(CALayer, self)->_fillMode;
+}
+
+- (void) setFillMode: (CAMediaTimingFillMode) value {
+    value = [value copy];
+    [NS_EXTRA(CALayer, self)->_fillMode release];
+    NS_EXTRA(CALayer, self)->_fillMode = value;
+}
 
 // The part of the layer's bounds that shows through the scroll layers above it
 // (a layer outside any scroll layer shows all of its bounds; clipping by
@@ -1673,8 +1814,11 @@ static CGRect applyToRect(CATransform3D m, CGRect rect) {
     return [NS_EXTRA(CALayer, self)->_animations allKeys];
 }
 
-// A layer is a key-value coding container: it keeps a value for any key it has no property for
-// (Core Animation Programming Guide, "Key-Value Coding Extensions").
+// A layer is a key-value coding container: it keeps a value for any key it has no property for, and
+// such a key reads as nil until then (Core Animation Programming Guide, "Key-Value Coding
+// Extensions"). Observed on macOS 26.7.3: setting nil removes the value, +defaultValueForKey: is
+// not consulted for such keys, and neither -initWithLayer: nor archiving carries them over.
+// Test: tests/quartzcore-kvc-arbitrary-keys.m.
 static char CALayerUndefinedValuesKey;
 
 - (void) setValue: (id) value forUndefinedKey: (NSString *) key {
@@ -1914,6 +2058,58 @@ static id<CAAction> actionInStyle(NSDictionary *style, NSString *key) {
     return nil;
 }
 
+// The default value of each property whose default is not zero or nil; YES/NO properties answer
+// their default either way, and anything else gives nil. Values observed on macOS 26.7.3.
+// Test: tests/quartzcore-kvc-arbitrary-keys.m.
++ (id) defaultValueForKey: (NSString *) key {
+    static NSDictionary *defaults;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CGColorRef black = CGColorCreateGenericRGB(0, 0, 0, 1);
+        defaults = [@{
+            @"opacity" : @1.0f,
+            @"anchorPoint" : [NSValue valueWithPoint: NSMakePoint(0.5, 0.5)],
+            @"borderColor" : (id) black,
+            @"shadowColor" : (id) black,
+            @"shadowOffset" : [NSValue valueWithSize: NSMakeSize(0, -3)],
+            @"shadowRadius" : @3.0,
+            @"contentsRect" : [NSValue valueWithRect: NSMakeRect(0, 0, 1, 1)],
+            @"contentsCenter" : [NSValue valueWithRect: NSMakeRect(0, 0, 1, 1)],
+            @"contentsScale" : @1.0,
+            @"contentsGravity" : kCAGravityResize,
+            @"contentsFormat" : kCAContentsFormatRGBA8Uint,
+            @"minificationFilter" : kCAFilterLinear,
+            @"magnificationFilter" : kCAFilterLinear,
+            @"rasterizationScale" : @1.0,
+            @"edgeAntialiasingMask" : @15,
+            @"cornerCurve" : kCACornerCurveCircular,
+            @"maskedCorners" : @15,
+            @"speed" : @1.0f,
+            @"duration" : @(INFINITY),
+            @"fillMode" : kCAFillModeRemoved,
+            @"hidden" : @NO,
+            @"masksToBounds" : @NO,
+            @"doubleSided" : @YES,
+            @"geometryFlipped" : @NO,
+            @"opaque" : @NO,
+            @"contentsOpaque" : @NO,
+            @"needsDisplayOnBoundsChange" : @NO,
+            @"drawsAsynchronously" : @NO,
+            @"allowsEdgeAntialiasing" : @YES,
+            @"allowsGroupOpacity" : @YES,
+            @"shouldRasterize" : @NO,
+            @"wantsExtendedDynamicRangeContent" : @NO,
+        } retain];
+        CGColorRelease(black);
+    });
+    return [defaults objectForKey: key];
+}
+
+// Whether a change of the property needs the layer redrawn; none of CALayer's own do.
++ (BOOL) needsDisplayForKey: (NSString *) key {
+    return NO;
+}
+
 + (id<CAAction>) defaultActionForKey: (NSString *) key {
     return nil;
 }
@@ -1987,6 +2183,74 @@ static id<CAAction> actionInStyle(NSDictionary *style, NSString *key) {
 
 - (BOOL) _drawLayerContents: (CGRect) bounds opacity: (float) opacity {
     return NO;
+}
+
+- (NSString *) contentsSwizzle {
+    return NS_EXTRA(CALayer, self)->_contentsSwizzle;
+}
+
+- (void) setContentsSwizzle: (NSString *) value {
+    value = [value copy];
+    [NS_EXTRA(CALayer, self)->_contentsSwizzle release];
+    NS_EXTRA(CALayer, self)->_contentsSwizzle = value;
+}
+
+- (NSString *) contentsScaling {
+    return NS_EXTRA(CALayer, self)->_contentsScaling;
+}
+
+- (void) setContentsScaling: (NSString *) value {
+    value = [value copy];
+    [NS_EXTRA(CALayer, self)->_contentsScaling release];
+    NS_EXTRA(CALayer, self)->_contentsScaling = value;
+}
+
+- (CGColorRef) contentsMultiplyColor {
+    return NS_EXTRA(CALayer, self)->_contentsMultiplyColor;
+}
+
+- (void) setContentsMultiplyColor: (CGColorRef) value {
+    replaceColor(&NS_EXTRA(CALayer, self)->_contentsMultiplyColor, value);
+}
+
+- (BOOL) wantsExtendedDynamicRangeContent {
+    return NS_EXTRA(CALayer, self)->_layerWantsExtendedDynamicRangeContent;
+}
+
+- (void) setWantsExtendedDynamicRangeContent: (BOOL) value {
+    NS_EXTRA(CALayer, self)->_layerWantsExtendedDynamicRangeContent = value;
+}
+
+- (CGFloat) contentsMaximumDesiredEDR {
+    return NS_EXTRA(CALayer, self)->_contentsMaximumDesiredEDR;
+}
+
+- (void) setContentsMaximumDesiredEDR: (CGFloat) value {
+    NS_EXTRA(CALayer, self)->_contentsMaximumDesiredEDR = value;
+}
+
+- (NSArray *) presentationModifiers {
+    NSMutableArray *mods = NS_EXTRA(CALayer, self)->_presentationModifiers;
+    return mods != nil ? [[mods copy] autorelease] : nil;
+}
+
+- (void) setPresentationModifiers: (NSArray *) modifiers {
+    [NS_EXTRA(CALayer, self)->_presentationModifiers release];
+    NS_EXTRA(CALayer, self)->_presentationModifiers = modifiers != nil ? [modifiers mutableCopy] : nil;
+}
+
+- (void) addPresentationModifier: (CAPresentationModifier *) modifier {
+    if (modifier == nil)
+        return;
+    if (NS_EXTRA(CALayer, self)->_presentationModifiers == nil)
+        NS_EXTRA(CALayer, self)->_presentationModifiers = [[NSMutableArray alloc] init];
+    [NS_EXTRA(CALayer, self)->_presentationModifiers addObject: modifier];
+}
+
+- (void) removePresentationModifier: (CAPresentationModifier *) modifier {
+    if (modifier == nil)
+        return;
+    [NS_EXTRA(CALayer, self)->_presentationModifiers removeObject: modifier];
 }
 
 @end

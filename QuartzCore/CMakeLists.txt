@@ -70,11 +70,13 @@ set(QuartzCore_sources
 	CAReplicatorLayer.m
 	CAScrollLayer.m
 	CAOpenGLLayer.m
+	CAPresentationModifier.m
 	CAMetalLayer.mm
 	CAEAGLLayer.m
 	CAMetalDrawable.mm
 	CASpringAnimation.m
 	CATransformLayer.m
+	CAChameleonLayer.m
 )
 
 #set_source_files_properties(${QuartzCore_sources} LANGUAGE C)

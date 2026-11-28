@@ -18,6 +18,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
 #import <CoreGraphics/CGImage.h>
+#import <CoreGraphics/CoreGraphicsPrivate.h>
 #import <Foundation/NSString.h>
 #import <Onyx2D/O2Image.h>
 
@@ -138,6 +139,19 @@ float CGImageCalculateContentHeadroom(CGImageRef image) {
     return CGImageGetContentHeadroom(image);
 }
 
+// The same headroom CGImageGetContentHeadroom reports, 1.0 for an SDR image; false and 0 when it is not known (NULL
+// image, extended range image without a headroom).
+// QUIRK: private function with this signature; macOS 26.7.3 returns true and 1.0 for an 8-bit RGBA bitmap image
+// and false and 0 for NULL. Not documented. Evidence: black-box observation (tier 2).
+// Test: tests/coregraphics-image-headroom-dataprovider-url.m
+bool CGImageGetHeadroom(CGImageRef image, float *headroom) {
+    float value = CGImageGetContentHeadroom(image);
+
+    if (headroom != NULL)
+        *headroom = value;
+    return value > 0.0f;
+}
+
 CGImageRef
 CGImageCreateWithJPEGDataProvider(CGDataProviderRef jpegProvider,
                                   const CGFloat *decode, bool interpolate,
@@ -229,4 +243,12 @@ bool CGImageIsMask(CGImageRef self) {
 
 CGImageAlphaInfo CGImageGetAlphaInfo(CGImageRef self) {
     return O2ImageGetAlphaInfo((O2ImageRef)self);
+}
+
+void CGImageSetCachingFlags(CGImageRef image, CGImageCachingFlags flags) {
+    O2ImageSetCachingFlags((O2ImageRef)image, flags);
+}
+
+CGImageCachingFlags CGImageGetCachingFlags(CGImageRef image) {
+    return O2ImageGetCachingFlags((O2ImageRef)image);
 }

@@ -50,10 +50,12 @@ typedef NS_ENUM(NSInteger, NSPrintRenderingQuality) {
     int _type;
     BOOL _showsPrintProgressPanel;
     NSString *_jobTitle;
+    BOOL _printCorePageOpen;
     NS_SIDE_IVARS_END(NSPrintOperation)
 }
 
-+ (NSPrintOperation *) currentOperation;
+// The operation running on the calling thread.
+@property(class, retain) NSPrintOperation *currentOperation;
 
 + (NSPrintOperation *) printOperationWithView: (NSView *) view;
 + (NSPrintOperation *) printOperationWithView: (NSView *) view
